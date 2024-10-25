@@ -1,0 +1,270 @@
+//! Get and establish cluster mappings.
+
+use super::*;
+
+impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
+    /// Get the given range’s mapping information.
+    ///
+    /// Underlying implementation for [`Qcow2::get_mapping()`].
+    pub(super) async fn do_get_mapping(
+        &self,
+        offset: GuestOffset,
+        max_length: u64,
+    ) -> io::Result<(Mapping<'_, S>, u64)> {
+        let cb = self.header.cluster_bits();
+
+        let Some(l2_table) = self.get_l2(offset).await? else {
+            let len = cmp::min(offset.remaining_in_l2_table(cb), max_length);
+            let mapping = if let Some(backing) = self.backing.as_ref() {
+                Mapping::Indirect {
+                    format: backing.unwrap(),
+                    offset: offset.raw_offset(cb),
+                    writable: false,
+                }
+            } else {
+                Mapping::Zero
+            };
+            return Ok((mapping, len));
+        };
+
+        // Get mapping at `offset`
+        let first_mapping = l2_table.get_mapping(offset.cluster())?;
+        let return_mapping = match first_mapping {
+            L2Mapping::DataFile {
+                host_cluster,
+                copied,
+            } => Mapping::Raw {
+                storage: self.storage(),
+                offset: host_cluster.relative_offset(offset, cb).0,
+                writable: copied,
+            },
+
+            L2Mapping::Backing { backing_offset } => {
+                if let Some(backing) = self.backing.as_ref() {
+                    Mapping::Indirect {
+                        format: backing.unwrap(),
+                        offset: backing_offset + offset.in_cluster_offset as u64,
+                        writable: false,
+                    }
+                } else {
+                    Mapping::Zero
+                }
+            }
+
+            L2Mapping::Zero {
+                host_cluster: _,
+                copied: _,
+            } => Mapping::Zero,
+
+            L2Mapping::Compressed {
+                host_offset: _,
+                length: _,
+            } => Mapping::Special {
+                offset: offset.raw_offset(cb),
+            },
+        };
+
+        // Find out how long this consecutive mapping is, but only within the current L2 table
+        let mut consecutive_length = offset.remaining_in_cluster(cb);
+        let mut preceding_mapping = first_mapping;
+        let mut current_guest_cluster = offset.cluster();
+        while consecutive_length < max_length {
+            let Some(next) = current_guest_cluster.next_in_l2(cb) else {
+                break;
+            };
+            current_guest_cluster = next;
+
+            let mapping = l2_table.get_mapping(current_guest_cluster)?;
+            if !mapping.is_consecutive(&preceding_mapping, cb) {
+                break;
+            }
+
+            preceding_mapping = mapping;
+            consecutive_length += self.header.cluster_size() as u64;
+        }
+
+        consecutive_length = cmp::min(consecutive_length, max_length);
+        Ok((return_mapping, consecutive_length))
+    }
+
+    /// Make the given range be mapped by data clusters.
+    ///
+    /// Underlying implementation for [`Qcow2::ensure_data_mapping()`].
+    pub(super) async fn do_ensure_data_mapping(
+        &self,
+        offset: GuestOffset,
+        length: u64,
+        overwrite: bool,
+    ) -> io::Result<(&'_ S, u64, u64)> {
+        let mut leaked_allocations = Vec::<(HostCluster, ClusterCount)>::new();
+        let mut l2_table = self.ensure_l2(offset).await?;
+
+        let res = self
+            .ensure_data_mapping_no_cleanup(
+                offset,
+                length,
+                overwrite,
+                &mut l2_table,
+                &mut leaked_allocations,
+            )
+            .await;
+        if l2_table.is_modified() {
+            // TODO: What to do on error?  Currently, we just accept that clusters will be leaked
+            // and we will have to reload the table from disk.
+            l2_table.write(&self.metadata).await?;
+        }
+        for alloc in leaked_allocations {
+            self.free_data_clusters(alloc.0, alloc.1).await;
+        }
+        let (host_offset, length) = res?;
+
+        Ok((self.storage(), host_offset, length))
+    }
+
+    /// Load the L2 table in `l2_cluster`.
+    async fn load_l2(&self, l2_cluster: HostCluster) -> io::Result<L2Table> {
+        L2Table::load(
+            &self.metadata,
+            &self.header,
+            l2_cluster,
+            self.header.l2_entries(),
+        )
+        .await
+    }
+
+    /// Get the L2 table referenced by the given L1 table index, if any.
+    ///
+    /// If the L1 table index does not point to any L2 table, return `Ok(None)`.
+    pub(super) async fn get_l2(&self, offset: GuestOffset) -> io::Result<Option<L2Table>> {
+        // TODO: Cache L2s
+        let l1_entry = self.l1_table.read().await.get(offset.l1_index);
+        if let Some(l2_offset) = l1_entry.l2_offset() {
+            let cb = self.header.cluster_bits();
+            let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"),
+                )
+            })?;
+            self.load_l2(l2_cluster).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a L2 table for the given L1 table index.
+    ///
+    /// If there already is an L2 table at that index, return it.  Otherwise, create one and hook
+    /// it up.
+    pub(super) async fn ensure_l2(&self, offset: GuestOffset) -> io::Result<L2Table> {
+        if let Some(l2) = self.get_l2(offset).await? {
+            return Ok(l2);
+        }
+
+        self.need_writable()?;
+
+        let mut l1_locked = self.l1_table.write().await;
+        let l1_entry = l1_locked.get(offset.l1_index);
+        if let Some(l2_offset) = l1_entry.l2_offset() {
+            drop(l1_locked);
+
+            let cb = self.header.cluster_bits();
+            let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"),
+                )
+            })?;
+
+            return self.load_l2(l2_cluster).await;
+        }
+
+        let l2_cluster = self.allocate_meta_cluster().await?;
+        let mut l2_table = L2Table::new_cleared(&self.header);
+        l2_table.set_cluster(l2_cluster);
+        l2_table.write(&self.metadata).await?;
+
+        l1_locked.enter_l2_table(offset.l1_index, &l2_table)?;
+        l1_locked
+            .write_entry(&self.metadata, offset.l1_index)
+            .await?;
+
+        Ok(l2_table)
+    }
+
+    /// Inner implementation for [`Qcow2::do_ensure_data_mapping()`].
+    ///
+    /// Does not do any clean-up: The L2 table will probably be modified, but not written to disk.
+    /// Any existing allocations that have been removed from it (and are thus leaked) are entered
+    /// into `leaked_allocations`, but not freed.
+    ///
+    /// The caller must do both, ensuring it is done both in case of success and in case of error.
+    async fn ensure_data_mapping_no_cleanup(
+        &self,
+        offset: GuestOffset,
+        length: u64,
+        overwrite: bool,
+        l2_table: &mut L2Table,
+        leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
+    ) -> io::Result<(u64, u64)> {
+        let cb = self.header.cluster_bits();
+
+        let partial_skip_cow = overwrite.then(|| {
+            let start = offset.in_cluster_offset;
+            let end = cmp::min(start as u64 + length, 1 << cb) as usize;
+            start..end
+        });
+
+        // Without a mandatory host offset, this should never return `Ok(None)`
+        let host_cluster = self
+            .cow_cluster(
+                offset.cluster(),
+                None,
+                partial_skip_cow,
+                l2_table,
+                leaked_allocations,
+            )
+            .await?
+            .ok_or_else(|| io::Error::other("Internal allocation error"))?;
+
+        let host_offset_start = host_cluster.relative_offset(offset, cb);
+        let mut alloc_length = offset.remaining_in_cluster(cb);
+        let mut current_guest_cluster = offset.cluster();
+        let mut current_host_cluster = host_cluster;
+
+        while alloc_length < length {
+            let Some(next) = current_guest_cluster.next_in_l2(cb) else {
+                break;
+            };
+            current_guest_cluster = next;
+
+            let partial_skip_cow = overwrite.then(|| {
+                // Full cluster or less if `length` is no longer big enough
+                let end = cmp::min(alloc_length - length, 1 << cb) as usize;
+                0..end
+            });
+
+            let next_host_cluster = current_host_cluster + ClusterCount(1);
+            let host_cluster = self
+                .cow_cluster(
+                    current_guest_cluster,
+                    Some(next_host_cluster),
+                    partial_skip_cow,
+                    l2_table,
+                    leaked_allocations,
+                )
+                .await?;
+
+            let Some(host_cluster) = host_cluster else {
+                // Cannot continue continuous mapping range
+                break;
+            };
+            assert!(host_cluster == next_host_cluster);
+            current_host_cluster = host_cluster;
+
+            alloc_length += self.header.cluster_size() as u64;
+        }
+
+        Ok((host_offset_start.0, alloc_length))
+    }
+}
