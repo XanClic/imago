@@ -1,6 +1,7 @@
 //! Get and establish cluster mappings.
 
 use super::*;
+use tokio::sync::RwLockWriteGuard;
 
 impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Get the given range’s mapping information.
@@ -164,6 +165,10 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         self.need_writable()?;
 
         let mut l1_locked = self.l1_table.write().await;
+        if !l1_locked.in_bounds(offset.l1_index) {
+            l1_locked = self.grow_l1_table(l1_locked, offset.l1_index).await?;
+        }
+
         let l1_entry = l1_locked.get(offset.l1_index);
         if let Some(l2_offset) = l1_entry.l2_offset() {
             drop(l1_locked);
@@ -190,6 +195,39 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .await?;
 
         Ok(l2_table)
+    }
+
+    /// Create a new L1 table covering at least `at_least_index`.
+    ///
+    /// Create a new L1 table of the required size with all the entries of the previous L1 table.
+    async fn grow_l1_table<'a>(
+        &self,
+        mut l1_locked: RwLockWriteGuard<'a, L1Table>,
+        at_least_index: usize,
+    ) -> io::Result<RwLockWriteGuard<'a, L1Table>> {
+        let cb = self.header.cluster_bits();
+
+        let mut new_l1 = l1_locked.clone_and_grow(at_least_index, &self.header);
+
+        let l1_start = self
+            .allocate_meta_clusters(new_l1.cluster_count(cb))
+            .await?;
+
+        new_l1.set_cluster(l1_start);
+        new_l1.write(&self.metadata).await?;
+
+        self.header.set_l1_table(&new_l1)?;
+        self.header.write_l1_table_pointer(&self.metadata).await?;
+
+        if let Some(old_l1_cluster) = l1_locked.get_cluster() {
+            let old_l1_size = l1_locked.cluster_count(cb);
+            l1_locked.unset_cluster();
+            self.free_meta_clusters(old_l1_cluster, old_l1_size).await;
+        }
+
+        *l1_locked = new_l1;
+
+        Ok(l1_locked)
     }
 
     /// Inner implementation for [`Qcow2::do_ensure_data_mapping()`].

@@ -67,11 +67,11 @@ struct V2Header {
     crypt_method: u32,
 
     /// Number of entries in the active L1 table.
-    l1_size: u32,
+    l1_size: AtomicU32,
 
     /// Offset into the image file at which the active L1 table starts.  Must be aligned to a
     /// cluster boundary.
-    l1_table_offset: u64,
+    l1_table_offset: AtomicU64,
 
     /// Offset into the image file at which the refcount table starts.  Must be aligned to a
     /// cluster boundary.
@@ -550,23 +550,35 @@ impl Header {
 
     /// Offset of the L1 table.
     pub fn l1_table_offset(&self) -> HostOffset {
-        HostOffset(self.v2.l1_table_offset)
+        HostOffset(self.v2.l1_table_offset.load(Ordering::Relaxed))
     }
 
     /// Number of entries in the L1 table.
     pub fn l1_table_entries(&self) -> usize {
-        self.v2.l1_size as usize
+        self.v2.l1_size.load(Ordering::Relaxed) as usize
     }
 
     /// Enter a new L1 table in the image header.
-    pub fn set_l1_table(&mut self, offset: u64, entries: usize) -> io::Result<()> {
-        self.v2.l1_size = entries.try_into().map_err(|err| {
+    pub fn set_l1_table(&self, l1_table: &L1Table) -> io::Result<()> {
+        let offset = l1_table.get_offset().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "New L1 table has no assigned offset",
+            )
+        })?;
+
+        let entries = l1_table.entries();
+        let entries = entries.try_into().map_err(|err| {
             io::Error::new(
                 InvalidData,
                 format!("Too many L1 entries ({entries}): {err}"),
             )
         })?;
-        self.v2.l1_table_offset = offset;
+
+        self.v2.l1_table_offset.store(offset.0, Ordering::Relaxed);
+
+        self.v2.l1_size.store(entries, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -597,11 +609,11 @@ impl Header {
             )
         })?;
 
-        let clusters = reftable.cluster_count(cb).0.try_into().map_err(|err| {
-            let count = reftable.cluster_count(cb);
+        let clusters = reftable.cluster_count(cb);
+        let clusters = clusters.0.try_into().map_err(|err| {
             io::Error::new(
                 InvalidData,
-                format!("Too many reftable clusters ({count}): {err}"),
+                format!("Too many reftable clusters ({clusters}): {err}"),
             )
         })?;
 
@@ -698,9 +710,8 @@ impl Header {
         Ok(result)
     }
 
-    /// Write the refcount table pointer (offset and size) to disk.
-    pub async fn write_reftable_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
-        // TODO: Just write the reftable offset and size
+    /// Helper for functions that just need to change little bits in the v2 header part.
+    async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
         let bincode = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_big_endian();
@@ -710,6 +721,18 @@ impl Header {
             .map_err(|err| io::Error::new(InvalidData, err))?;
 
         image.write(&v2_header, 0).await
+    }
+
+    /// Write the refcount table pointer (offset and size) to disk.
+    pub async fn write_reftable_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
+        // TODO: Just write the reftable offset and size
+        self.write_v2_header(image).await
+    }
+
+    /// Write the L1 table pointer (offset and size) to disk.
+    pub async fn write_l1_table_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
+        // TODO: Just write the L1 table offset and size
+        self.write_v2_header(image).await
     }
 }
 
@@ -983,6 +1006,10 @@ impl Table for L1Table {
     fn set_cluster(&mut self, cluster: HostCluster) {
         self.cluster = Some(cluster);
         self.modified.store(true, Ordering::Relaxed);
+    }
+
+    fn unset_cluster(&mut self) {
+        self.cluster = None;
     }
 
     fn is_modified(&self) -> bool {
@@ -1476,6 +1503,10 @@ impl Table for L2Table {
         self.modified.store(true, Ordering::Relaxed);
     }
 
+    fn unset_cluster(&mut self) {
+        self.cluster = None;
+    }
+
     fn is_modified(&self) -> bool {
         self.modified.load(Ordering::Relaxed)
     }
@@ -1669,6 +1700,10 @@ impl Table for RefTable {
         self.modified.store(true, Ordering::Relaxed);
     }
 
+    fn unset_cluster(&mut self) {
+        self.cluster = None;
+    }
+
     fn is_modified(&self) -> bool {
         self.modified.load(Ordering::Relaxed)
     }
@@ -1796,6 +1831,11 @@ impl RefBlock {
     pub fn set_cluster(&mut self, cluster: HostCluster) {
         self.cluster = Some(cluster);
         self.modified.store(true, Ordering::Relaxed);
+    }
+
+    /// Remove the block’s association with any cluster in the image file.
+    pub fn unset_cluster(&mut self) {
+        self.cluster = None;
     }
 
     /// Get the given cluster’s refcount.
@@ -1988,6 +2028,8 @@ pub trait Table: Sized {
     fn get_offset(&self) -> Option<HostOffset>;
     /// Set this table’s (first) cluster in the image file (for writing).
     fn set_cluster(&mut self, cluster: HostCluster);
+    /// Remove the table’s association with any cluster in the image file.
+    fn unset_cluster(&mut self);
 
     /// Check whether this table has been modified since it was last written.
     fn is_modified(&self) -> bool;
