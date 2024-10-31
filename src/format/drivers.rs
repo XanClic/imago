@@ -98,17 +98,17 @@ pub enum Mapping<'a, S: Storage> {
     /// Data lives in a different disk image (e.g. a backing file).
     Indirect {
         /// Format instance where this data can be obtained.
-        format: &'a FormatAccess<S>,
+        layer: &'a FormatAccess<S>,
 
-        /// Offset in `format` where this data can be obtained.
+        /// Offset in `layer` where this data can be obtained.
         offset: u64,
 
         /// Whether this mapping may be written to.
         ///
-        /// If `true`, you can directly write to `offset` on `format` to change the disk image’s
+        /// If `true`, you can directly write to `offset` on `layer` to change the disk image’s
         /// data accordingly.
         ///
-        /// If `false`, the disk image format does not allow writing to `offset` on `format`; a new
+        /// If `false`, the disk image format does not allow writing to `offset` on `layer`; a new
         /// mapping must be allocated first.
         writable: bool,
     },

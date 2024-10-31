@@ -61,9 +61,9 @@ pub enum Mapping<'a, S: Storage> {
     /// Such data cannot be accessed directly, but must be interpreted by the image format driver.
     Special {
         /// Format layer where this special data was encountered.
-        format: &'a FormatAccess<S>,
+        layer: &'a FormatAccess<S>,
 
-        /// Original (“guest”) offset on `format` to pass to `readv_special()`.
+        /// Original (“guest”) offset on `layer` to pass to `readv_special()`.
         offset: u64,
     },
 }
@@ -166,7 +166,7 @@ impl<S: Storage> FormatAccess<S> {
             // information in `Mapping::Special` wouldn’t fully fix it, though: If concurrent
             // writes change the low-level cluster type, and the driver then tries to e.g.
             // decompress the data that was there, that may well fail.)
-            Mapping::Special { format, offset } => format.inner.readv_special(bufv, offset).await,
+            Mapping::Special { layer, offset } => layer.inner.readv_special(bufv, offset).await,
         }
     }
 
@@ -203,11 +203,11 @@ impl<S: Storage> FormatAccess<S> {
                 }
 
                 drivers::Mapping::Indirect {
-                    format: recurse_format,
+                    layer: recurse_layer,
                     offset: recurse_offset,
                     writable: recurse_writable,
                 } => {
-                    format_layer = recurse_format;
+                    format_layer = recurse_layer;
                     offset = recurse_offset;
                     writable_gate = recurse_writable;
                     max_length = length;
@@ -220,7 +220,7 @@ impl<S: Storage> FormatAccess<S> {
                 drivers::Mapping::Special { offset } => {
                     return Ok((
                         Mapping::Special {
-                            format: format_layer,
+                            layer: format_layer,
                             offset,
                         },
                         length,
