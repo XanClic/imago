@@ -210,7 +210,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
     /// Wrap `file` in the `Raw` format.  Helper for [`Qcow2::implicit_backing_file()`].
     async fn open_raw_backing_file(&self, file: S) -> io::Result<F> {
-        let raw = Raw::new(file)?;
+        let raw = Raw::open_image(file, false).await?;
         Ok(F::wrap(FormatAccess::new(raw)))
     }
 

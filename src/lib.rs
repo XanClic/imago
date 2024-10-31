@@ -47,7 +47,7 @@
 //!         .await?;
 //!
 //! let backing_storage: Box<dyn DynStorage> = Box::new(Null::new(0));
-//! let backing = Raw::new(backing_storage)?;
+//! let backing = Raw::open_image(backing_storage, false).await?;
 //! let backing = Arc::new(FormatAccess::new(backing));
 //! qcow2.set_backing(Some(Arc::clone(&backing)));
 //!

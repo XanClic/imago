@@ -22,7 +22,7 @@
 //!
 //! let inner_storage = Null::new(disk_size);
 //! let annotated_storage = Annotated::new(inner_storage, test_tag);
-//! let image = Raw::new(annotated_storage)?;
+//! let image = Raw::open_image(annotated_storage, false).await?;
 //! let image = FormatAccess::new(image);
 //!
 //! let mapping = image.get_mapping(test_offset, 1).await?.0;

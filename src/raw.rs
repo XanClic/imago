@@ -3,14 +3,18 @@
 //! Allows accessing generic storage objects (`Storage`) as images (i.e. `FormatAccess`).
 
 use crate::format::drivers::{FormatDriverInstance, Mapping};
-use crate::Storage;
+use crate::{Storage, StorageOpenOptions};
 use async_trait::async_trait;
 use std::io;
+use std::path::Path;
 
 /// Wraps a storage object without any translation.
 pub struct Raw<S: Storage> {
     /// Wrapped storage object.
     inner: S,
+
+    /// Whether this image may be modified.
+    writable: bool,
 
     /// Disk size, which is the file size when this object was created.
     size: u64,
@@ -18,9 +22,38 @@ pub struct Raw<S: Storage> {
 
 impl<S: Storage> Raw<S> {
     /// Wrap `inner`, allowing it to be used as a disk image in raw format.
-    pub fn new(inner: S) -> io::Result<Self> {
+    pub async fn open_image(inner: S, writable: bool) -> io::Result<Self> {
         let size = inner.size()?;
-        Ok(Raw { inner, size })
+        Ok(Raw {
+            inner,
+            writable,
+            size,
+        })
+    }
+
+    /// Open the given path as a storage object, and wrap it in `Raw`.
+    pub async fn open_path<P: AsRef<Path>>(path: P, writable: bool) -> io::Result<Self> {
+        let storage_opts = StorageOpenOptions::new().write(writable).filename(path);
+        let inner = S::open(storage_opts).await?;
+        Self::open_image(inner, writable).await
+    }
+
+    /// Wrap `inner`, allowing it to be used as a disk image in raw format.
+    #[cfg(feature = "sync-wrappers")]
+    pub fn open_image_sync(inner: S, writable: bool) -> io::Result<Self> {
+        let size = inner.size()?;
+        Ok(Raw {
+            inner,
+            writable,
+            size,
+        })
+    }
+
+    /// Synchronous wrapper around [`Raw::open_path()`].
+    pub fn open_path_sync<P: AsRef<Path>>(path: P, writable: bool) -> io::Result<Self> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(Self::open_path(path, writable))
     }
 }
 
@@ -37,8 +70,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
     }
 
     fn writable(&self) -> bool {
-        // TODO: Query from `inner`
-        true
+        self.writable
     }
 
     async fn get_mapping(&self, offset: u64, max_length: u64) -> io::Result<(Mapping<'_, S>, u64)> {
