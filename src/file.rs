@@ -4,8 +4,12 @@ use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::{Storage, StorageOpenOptions};
 use std::fs;
 use std::io::{self, Seek, SeekFrom};
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::FileExt;
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::sync::RwLock;
@@ -37,6 +41,7 @@ impl Storage for File {
 
         let mut file_opts = fs::OpenOptions::new();
         file_opts.read(true).write(opts.writable);
+        #[cfg(not(target_os = "macos"))]
         if opts.direct {
             file_opts.custom_flags(
                 #[cfg(unix)]
@@ -45,7 +50,22 @@ impl Storage for File {
                 windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING,
             );
         }
+
         let file = file_opts.open(filename)?;
+
+        #[cfg(target_os = "macos")]
+        if opts.direct {
+            // Safe: We check the return value.
+            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("Failed to disable host cache: {err}"),
+                ));
+            }
+        }
+
         Ok(file.into())
     }
 
