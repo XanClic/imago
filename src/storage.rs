@@ -4,6 +4,7 @@
 //! different kinds of storage objects.  Such objects are abstracted behind the `Storage` trait.
 
 use crate::io_buffers::{IoBuffer, IoVector, IoVectorBounceBuffers, IoVectorMut};
+use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -24,7 +25,7 @@ pub struct StorageOpenOptions {
 }
 
 /// Provides access to generic storage objects.
-pub trait Storage: Sized {
+pub trait Storage: Debug + Display + Sized {
     /// Open a storage object.
     ///
     /// Different storage implementations may require different options.
@@ -191,7 +192,7 @@ pub trait StorageExt: Storage {
 ///
 /// Async functions in `DynStorage` return boxed futures (`Pin<Box<dyn Future>>`), which makes them
 /// slighly less efficient than async functions in `Storage`, hence the distinction.
-pub trait DynStorage {
+pub trait DynStorage: Debug + Display {
     /// Wrapper around [`Storage::mem_align()`].
     fn mem_align(&self) -> usize;
 

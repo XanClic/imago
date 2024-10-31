@@ -5,10 +5,12 @@
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::{Storage, StorageOpenOptions};
 use async_trait::async_trait;
+use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::path::Path;
 
 /// Wraps a storage object without any translation.
+#[derive(Debug)]
 pub struct Raw<S: Storage> {
     /// Wrapped storage object.
     inner: S,
@@ -103,5 +105,11 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         }
 
         Ok((&self.inner, offset, length))
+    }
+}
+
+impl<S: Storage> Display for Raw<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "raw[{}]", self.inner)
     }
 }

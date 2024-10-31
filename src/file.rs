@@ -2,6 +2,7 @@
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::{Storage, StorageOpenOptions};
+use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::{self, Seek, SeekFrom};
 #[cfg(target_os = "macos")]
@@ -12,15 +13,20 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 /// Use a plain file as storage objects.
+#[derive(Debug)]
 pub struct File {
     /// The file.
     file: RwLock<fs::File>,
 
     /// Whether we are using direct I/O.
     direct_io: bool,
+
+    /// For debug purposes.
+    filename: PathBuf,
 }
 
 impl From<fs::File> for File {
@@ -29,6 +35,7 @@ impl From<fs::File> for File {
             file: RwLock::new(file),
             // TODO: Find out, or better yet, drop `direct_io` and just probe the alignment.
             direct_io: false,
+            filename: PathBuf::new(),
         }
     }
 }
@@ -51,6 +58,7 @@ impl Storage for File {
             );
         }
 
+        let filename_owned = filename.to_owned();
         let file = file_opts.open(filename)?;
 
         #[cfg(target_os = "macos")]
@@ -66,7 +74,11 @@ impl Storage for File {
             }
         }
 
-        Ok(file.into())
+        Ok(File {
+            file: RwLock::new(file),
+            direct_io: opts.direct,
+            filename: filename_owned,
+        })
     }
 
     fn mem_align(&self) -> usize {
@@ -149,5 +161,11 @@ impl Storage for File {
             }
         }
         Ok(())
+    }
+}
+
+impl Display for File {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "file:{}", self.filename.to_string_lossy())
     }
 }

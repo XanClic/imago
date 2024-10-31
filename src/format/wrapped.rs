@@ -6,13 +6,14 @@
 //! wrapped in such containers or not.
 
 use crate::{FormatAccess, Storage};
+use std::fmt::{Debug, Display};
 use std::ops::Deref;
 
 /// Represents [`FormatAccess`] wrapped in e.g. `Arc`, `Box`, or nothing at all.
 ///
 /// This struct is necessary so that we can reference format instances regardless of whether the
 /// user decides to wrap them or not.
-pub trait WrappedFormat<S: Storage> {
+pub trait WrappedFormat<S: Storage>: Debug + Display {
     /// Construct this `WrappedFormat`.
     fn wrap(inner: FormatAccess<S>) -> Self;
 
@@ -20,8 +21,8 @@ pub trait WrappedFormat<S: Storage> {
     fn unwrap(&self) -> &FormatAccess<S>;
 }
 
-impl<S: Storage, D: Deref<Target = FormatAccess<S>> + From<FormatAccess<S>>> WrappedFormat<S>
-    for D
+impl<S: Storage, D: Deref<Target = FormatAccess<S>> + Debug + Display + From<FormatAccess<S>>>
+    WrappedFormat<S> for D
 {
     fn wrap(inner: FormatAccess<S>) -> Self {
         Self::from(inner)

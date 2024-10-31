@@ -4,6 +4,7 @@
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::Storage;
+use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -11,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// Reading from this will always return zeroes, writing to it does nothing (except to potentially
 /// grow its virtual “file length”).
+#[derive(Debug)]
 pub struct Null {
     /// Virtual “file length”.
     size: AtomicU64,
@@ -49,5 +51,11 @@ impl Storage for Null {
 
         self.size.fetch_max(end, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+impl Display for Null {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "null:[{}B]", self.size.load(Ordering::Relaxed))
     }
 }

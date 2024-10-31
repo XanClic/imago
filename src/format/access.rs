@@ -6,9 +6,11 @@ use super::drivers::{self, FormatDriverInstance};
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::vector_select::FutureVector;
 use crate::{Storage, StorageExt};
+use std::fmt::{self, Display, Formatter};
 use std::{cmp, io};
 
 /// Provides access to a disk image.
+#[derive(Debug)]
 pub struct FormatAccess<S: Storage> {
     /// Image format driver.
     inner: Box<dyn FormatDriverInstance<Storage = S>>,
@@ -26,6 +28,7 @@ pub struct FormatAccess<S: Storage> {
 /// Fully recursive mapping information.
 ///
 /// Mapping information that resolves down to the storage object layer (except for special data).
+#[derive(Debug)]
 pub enum Mapping<'a, S: Storage> {
     /// Raw data.
     Raw {
@@ -358,5 +361,30 @@ impl<S: Storage> Mapping<'_, S> {
     /// Return `true` if and only if this mapping signifies the end of file.
     pub fn is_eof(&self) -> bool {
         matches!(self, Mapping::Eof)
+    }
+}
+
+impl<S: Storage> Display for FormatAccess<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<S: Storage> Display for Mapping<'_, S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Mapping::Raw { storage, offset, writable } => {
+                let writable = if *writable { "rw" } else { "ro" };
+                write!(f, "{}:0x{:x}/{}", storage, offset, writable)
+            }
+
+            Mapping::Zero => write!(f, "<zero>"),
+
+            Mapping::Eof => write!(f, "<eof>"),
+
+            Mapping::Special { layer, offset } => {
+                write!(f, "<special:{}:0x{:x}>", layer, offset)
+            }
+        }
     }
 }

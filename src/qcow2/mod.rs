@@ -18,6 +18,7 @@ use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
 use metadata::*;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -344,5 +345,23 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         let offset = self.split_guest_offset(offset);
         self.do_readv_special(bufv, offset).await
+    }
+}
+
+impl<S: Storage + 'static, F: WrappedFormat<S>> Debug for Qcow2<S, F> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Qcow2")
+            .field("metadata", &self.metadata)
+            .field("storage_set", &self.storage_set)
+            .field("storage", &self.storage)
+            .field("backing_set", &self.backing_set)
+            .field("backing", &self.backing)
+            .finish()
+    }
+}
+
+impl<S: Storage + 'static, F: WrappedFormat<S>> Display for Qcow2<S, F> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "qcow2[{}]", self.metadata)
     }
 }

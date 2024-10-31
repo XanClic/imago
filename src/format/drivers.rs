@@ -6,11 +6,12 @@
 use crate::io_buffers::IoVectorMut;
 use crate::{FormatAccess, Storage};
 use async_trait::async_trait;
+use std::fmt::{Debug, Display};
 use std::io;
 
 /// Implementation of a disk image format.
 #[async_trait(?Send)]
-pub trait FormatDriverInstance {
+pub trait FormatDriverInstance: Debug + Display {
     /// Type of storage used.
     type Storage: Storage;
 
