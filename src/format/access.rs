@@ -314,7 +314,7 @@ impl<S: Storage> FormatAccess<S> {
         if offset >= disk_size {
             return Ok(());
         }
-        if disk_size - offset > bufv.len() {
+        if bufv.len() > disk_size - offset {
             bufv = bufv.split_at(disk_size - offset).0;
         }
 
