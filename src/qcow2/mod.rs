@@ -63,6 +63,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     ///
     /// `metadata` is the file containing the qcow2 metadata.  If `writable` is not set, no
     /// modifications are permitted.
+    ///
+    /// This will not open any other storage objects needed, i.e. no backing image, no external
+    /// data file.  If you want to handle those manually, check whether an external data file is
+    /// needed via [`Qcow2::requires_external_data_file()`], and, if necessary, assign one via
+    /// [`Qcow2::set_data_file()`]; and assign a backing image via [`Qcow2::set_backing()`].
+    ///
+    /// If you want to use the implicit references given in the image header, use
+    /// [`Qcow2::open_implicit_dependencies()`].
     pub async fn open_image(metadata: S, writable: bool) -> io::Result<Self> {
         let header = Arc::new(Header::load(&metadata, writable).await?);
 
@@ -106,6 +114,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     ///
     /// Open the file as a storage object via [`Storage::open()`], with write access if specified,
     /// then pass that object to [`Qcow2::open_image()`].
+    ///
+    /// This will not open any other storage objects needed, i.e. no backing image, no external
+    /// data file.  If you want to handle those manually, check whether an external data file is
+    /// needed via [`Qcow2::requires_external_data_file()`], and, if necessary, assign one via
+    /// [`Qcow2::set_data_file()`]; and assign a backing image via [`Qcow2::set_backing()`].
+    ///
+    /// If you want to use the implicit references given in the image header, use
+    /// [`Qcow2::open_implicit_dependencies()`].
     pub async fn open_path<P: AsRef<Path>>(path: P, writable: bool) -> io::Result<Self> {
         let storage_opts = StorageOpenOptions::new().write(writable).filename(path);
         let metadata = S::open(storage_opts).await?;
