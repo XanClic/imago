@@ -434,7 +434,14 @@ impl Allocator {
         self.header.set_reftable(&new_rt)?;
         self.header.write_reftable_pointer(image).await?;
 
+        // Must set new reftable before calling `free_clusters()`
         self.reftable = new_rt;
+        if let Some(old_rt_cluster) = self.reftable.get_cluster() {
+            let old_rt_size = self.reftable.cluster_count(cb);
+            self.reftable.unset_cluster();
+            self.free_clusters(image, old_rt_cluster, old_rt_size).await;
+        }
+
         Ok(())
     }
 
