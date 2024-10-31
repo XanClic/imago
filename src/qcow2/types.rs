@@ -221,7 +221,7 @@ impl Sub<HostCluster> for HostCluster {
     type Output = ClusterCount;
 
     fn sub(self, rhs: Self) -> ClusterCount {
-        ClusterCount((rhs.0 - self.0) as usize)
+        ClusterCount((self.0 - rhs.0) as usize)
     }
 }
 

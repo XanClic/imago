@@ -240,7 +240,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     async fn ensure_data_mapping_no_cleanup(
         &self,
         offset: GuestOffset,
-        length: u64,
+        full_length: u64,
         overwrite: bool,
         l2_table: &mut L2Table,
         leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
@@ -249,7 +249,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let partial_skip_cow = overwrite.then(|| {
             let start = offset.in_cluster_offset;
-            let end = cmp::min(start as u64 + length, 1 << cb) as usize;
+            let end = cmp::min(start as u64 + full_length, 1 << cb) as usize;
             start..end
         });
 
@@ -266,21 +266,18 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .ok_or_else(|| io::Error::other("Internal allocation error"))?;
 
         let host_offset_start = host_cluster.relative_offset(offset, cb);
-        let mut alloc_length = offset.remaining_in_cluster(cb);
+        let mut allocated_length = offset.remaining_in_cluster(cb);
         let mut current_guest_cluster = offset.cluster();
         let mut current_host_cluster = host_cluster;
 
-        while alloc_length < length {
+        while allocated_length < full_length {
             let Some(next) = current_guest_cluster.next_in_l2(cb) else {
                 break;
             };
             current_guest_cluster = next;
 
-            let partial_skip_cow = overwrite.then(|| {
-                // Full cluster or less if `length` is no longer big enough
-                let end = cmp::min(alloc_length - length, 1 << cb) as usize;
-                0..end
-            });
+            let chunk_length = cmp::min(full_length - allocated_length, 1 << cb) as usize;
+            let partial_skip_cow = overwrite.then(|| 0..chunk_length);
 
             let next_host_cluster = current_host_cluster + ClusterCount(1);
             let host_cluster = self
@@ -300,9 +297,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             assert!(host_cluster == next_host_cluster);
             current_host_cluster = host_cluster;
 
-            alloc_length += self.header.cluster_size() as u64;
+            allocated_length += chunk_length as u64;
         }
 
-        Ok((host_offset_start.0, alloc_length))
+        Ok((host_offset_start.0, allocated_length))
     }
 }
