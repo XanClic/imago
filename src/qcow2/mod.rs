@@ -57,6 +57,14 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     ///
     /// Is `None` for read-only images.
     allocator: Option<Mutex<Allocator>>,
+
+    /// Taken while performing COW requests.
+    ///
+    /// While reading an L2 table, read-lock this.  While modifying an L2 table (i.e. from the
+    /// start of COW until the L2 table is actually modified), write-lock this.
+    ///
+    /// FIXME: Put this lock around the actual L2 tables in the eventual L2 table cache.
+    cow_lock: RwLock<()>,
 }
 
 impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
@@ -108,6 +116,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             l1_table: RwLock::new(l1_table),
 
             allocator,
+
+            cow_lock: RwLock::new(()),
         })
     }
 

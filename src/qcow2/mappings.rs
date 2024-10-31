@@ -12,9 +12,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         offset: GuestOffset,
         max_length: u64,
     ) -> io::Result<(Mapping<'_, S>, u64)> {
-        let cb = self.header.cluster_bits();
-
         let Some(l2_table) = self.get_l2(offset).await? else {
+            let cb = self.header.cluster_bits();
             let len = cmp::min(offset.remaining_in_l2_table(cb), max_length);
             let mapping = if let Some(backing) = self.backing.as_ref() {
                 Mapping::Indirect {
@@ -27,6 +26,21 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             };
             return Ok((mapping, len));
         };
+
+        self.do_get_mapping_with_l2(offset, max_length, &l2_table).await
+    }
+
+    /// Get the given range’s mapping information, when we already have the L2 table.
+    pub(super) async fn do_get_mapping_with_l2(
+        &self,
+        offset: GuestOffset,
+        max_length: u64,
+        l2_table: &L2Table,
+    ) -> io::Result<(Mapping<'_, S>, u64)> {
+        let cb = self.header.cluster_bits();
+
+        // FIXME
+        let _cow_lock = self.cow_lock.read().await;
 
         // Get mapping at `offset`
         let first_mapping = l2_table.get_mapping(offset.cluster())?;
@@ -97,8 +111,21 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&'_ S, u64, u64)> {
-        let mut leaked_allocations = Vec::<(HostCluster, ClusterCount)>::new();
         let mut l2_table = self.ensure_l2(offset).await?;
+
+        // TODO: Is there a more optimized way?
+        // We do not want to write-lock the COW guard until we need to.  But upgrading the COW lock
+        // from Read to Write is not possible; so once we drop the Read variant, we will need to
+        // re-check the whole table anyway.
+        // FWIW, this is a fast path for already-present allocations, so not too terrible.
+        let existing = self.do_get_mapping_with_l2(offset, length, &l2_table).await?;
+        if let Mapping::Raw { storage, offset, writable: true } = existing.0 {
+            return Ok((storage, offset, existing.1));
+        }
+
+        // FIXME
+        let cow_lock = self.cow_lock.write().await;
+        let mut leaked_allocations = Vec::<(HostCluster, ClusterCount)>::new();
 
         let res = self
             .ensure_data_mapping_no_cleanup(
@@ -109,11 +136,14 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 &mut leaked_allocations,
             )
             .await;
+
         if l2_table.is_modified() {
             // TODO: What to do on error?  Currently, we just accept that clusters will be leaked
             // and we will have to reload the table from disk.
             l2_table.write(&self.metadata).await?;
         }
+        drop(cow_lock);
+
         for alloc in leaked_allocations {
             self.free_data_clusters(alloc.0, alloc.1).await;
         }
