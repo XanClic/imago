@@ -5,6 +5,7 @@
 
 use super::*;
 use tokio::sync::MutexGuard;
+use tracing::{event, Level};
 
 /// Central facility for cluster allocation.
 pub(super) struct Allocator {
@@ -462,18 +463,24 @@ impl Allocator {
                 Ok(Some(mut rb)) => {
                     for i in rb_index..(rb_index + in_rb_count) {
                         if let Err(err) = rb.decrement(i) {
-                            eprintln!("Warning: Failed to free cluster: {err}");
+                            event!(Level::WARN, "Failed to free cluster: {err}");
                         }
                     }
                     if let Err(err) = rb.write(image).await {
-                        eprintln!("Warning: Failed to commit {in_rb_count} freed clusters: {err}");
+                        event!(
+                            Level::WARN,
+                            "Failed to commit {in_rb_count} freed clusters: {err}"
+                        );
                     }
                 }
 
                 Ok(None) => {
-                    eprintln!("Warning: Failed to free {in_rb_count} clusters: Not allocated")
+                    event!(
+                        Level::WARN,
+                        "Failed to free {in_rb_count} clusters: Not allocated"
+                    )
                 }
-                Err(err) => eprintln!("Warning: Failed to free {in_rb_count} clusters: {err}"),
+                Err(err) => event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}"),
             }
 
             count -= ClusterCount(in_rb_count);
