@@ -68,6 +68,7 @@
 //!   these build a `tokio` runtime in which they run the `async` functions, so using the `async`
 //!   interface is definitely preferred.
 
+pub mod annotated;
 pub mod file;
 pub mod format;
 pub mod io_buffers;
