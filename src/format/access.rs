@@ -373,7 +373,11 @@ impl<S: Storage> Display for FormatAccess<S> {
 impl<S: Storage> Display for Mapping<'_, S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Mapping::Raw { storage, offset, writable } => {
+            Mapping::Raw {
+                storage,
+                offset,
+                writable,
+            } => {
                 let writable = if *writable { "rw" } else { "ro" };
                 write!(f, "{}:0x{:x}/{}", storage, offset, writable)
             }

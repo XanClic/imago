@@ -27,7 +27,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             return Ok((mapping, len));
         };
 
-        self.do_get_mapping_with_l2(offset, max_length, &l2_table).await
+        self.do_get_mapping_with_l2(offset, max_length, &l2_table)
+            .await
     }
 
     /// Get the given range’s mapping information, when we already have the L2 table.
@@ -118,8 +119,15 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         // from Read to Write is not possible; so once we drop the Read variant, we will need to
         // re-check the whole table anyway.
         // FWIW, this is a fast path for already-present allocations, so not too terrible.
-        let existing = self.do_get_mapping_with_l2(offset, length, &l2_table).await?;
-        if let Mapping::Raw { storage, offset, writable: true } = existing.0 {
+        let existing = self
+            .do_get_mapping_with_l2(offset, length, &l2_table)
+            .await?;
+        if let Mapping::Raw {
+            storage,
+            offset,
+            writable: true,
+        } = existing.0
+        {
             return Ok((storage, offset, existing.1));
         }
 
