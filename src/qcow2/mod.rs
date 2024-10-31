@@ -217,7 +217,9 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
     /// Wrap `file` in the `Qcow2` format.  Helper for [`Qcow2::implicit_backing_file()`].
     async fn open_qcow2_backing_file(&self, file: S) -> io::Result<F> {
-        let qcow2 = Self::open_image(file, false).await?;
+        let mut qcow2 = Self::open_image(file, false).await?;
+        // Recursive, so needs to be boxed
+        Box::pin(qcow2.open_implicit_dependencies()).await?;
         Ok(F::wrap(FormatAccess::new(qcow2)))
     }
 
