@@ -3,7 +3,7 @@
 //! Discard all written data, and return zeroes when read.
 
 use crate::io_buffers::{IoVector, IoVectorMut};
-use crate::{Storage, StorageOpenOptions};
+use crate::Storage;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,13 +24,6 @@ impl Null {
 }
 
 impl Storage for Null {
-    async fn open(_opts: StorageOpenOptions) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Cannot open null storage",
-        ))
-    }
-
     fn size(&self) -> io::Result<u64> {
         Ok(self.size.load(Ordering::Relaxed))
     }

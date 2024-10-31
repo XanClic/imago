@@ -29,7 +29,15 @@ pub trait Storage: Sized {
     ///
     /// Different storage implementations may require different options.
     #[allow(async_fn_in_trait)] // No need for Send
-    async fn open(_opts: StorageOpenOptions) -> io::Result<Self>;
+    async fn open(_opts: StorageOpenOptions) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Cannot open storage objects of type {}",
+                std::any::type_name::<Self>()
+            ),
+        ))
+    }
 
     /// Minimum required alignment for memory buffers.
     fn mem_align(&self) -> usize {
@@ -218,13 +226,6 @@ pub trait DynStorage {
 impl<S: Storage> StorageExt for S {}
 
 impl<S: Storage> Storage for &S {
-    async fn open(_opts: StorageOpenOptions) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Cannot open storage instances as their references",
-        ))
-    }
-
     fn mem_align(&self) -> usize {
         (*self).mem_align()
     }
