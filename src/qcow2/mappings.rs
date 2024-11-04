@@ -18,7 +18,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             let mapping = if let Some(backing) = self.backing.as_ref() {
                 Mapping::Indirect {
                     layer: backing.unwrap(),
-                    offset: offset.raw_offset(cb),
+                    offset: offset.0,
                     writable: false,
                 }
             } else {
@@ -44,7 +44,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let _cow_lock = self.cow_lock.read().await;
 
         // Get mapping at `offset`
-        let first_mapping = l2_table.get_mapping(offset.cluster())?;
+        let mut current_guest_cluster = offset.cluster(cb);
+        let first_mapping = l2_table.get_mapping(current_guest_cluster)?;
         let return_mapping = match first_mapping {
             L2Mapping::DataFile {
                 host_cluster,
@@ -59,7 +60,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 if let Some(backing) = self.backing.as_ref() {
                     Mapping::Indirect {
                         layer: backing.unwrap(),
-                        offset: backing_offset + offset.in_cluster_offset as u64,
+                        offset: backing_offset + offset.in_cluster_offset(cb) as u64,
                         writable: false,
                     }
                 } else {
@@ -75,15 +76,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             L2Mapping::Compressed {
                 host_offset: _,
                 length: _,
-            } => Mapping::Special {
-                offset: offset.raw_offset(cb),
-            },
+            } => Mapping::Special { offset: offset.0 },
         };
 
         // Find out how long this consecutive mapping is, but only within the current L2 table
         let mut consecutive_length = offset.remaining_in_cluster(cb);
         let mut preceding_mapping = first_mapping;
-        let mut current_guest_cluster = offset.cluster();
         while consecutive_length < max_length {
             let Some(next) = current_guest_cluster.next_in_l2(cb) else {
                 break;
@@ -175,10 +173,11 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// If the L1 table index does not point to any L2 table, return `Ok(None)`.
     pub(super) async fn get_l2(&self, offset: GuestOffset) -> io::Result<Option<L2Table>> {
+        let cb = self.header.cluster_bits();
+
         // TODO: Cache L2s
-        let l1_entry = self.l1_table.read().await.get(offset.l1_index);
+        let l1_entry = self.l1_table.read().await.get(offset.l1_index(cb));
         if let Some(l2_offset) = l1_entry.l2_offset() {
-            let cb = self.header.cluster_bits();
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -196,6 +195,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// If there already is an L2 table at that index, return it.  Otherwise, create one and hook
     /// it up.
     pub(super) async fn ensure_l2(&self, offset: GuestOffset) -> io::Result<L2Table> {
+        let cb = self.header.cluster_bits();
+
         if let Some(l2) = self.get_l2(offset).await? {
             return Ok(l2);
         }
@@ -203,15 +204,15 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         self.need_writable()?;
 
         let mut l1_locked = self.l1_table.write().await;
-        if !l1_locked.in_bounds(offset.l1_index) {
-            l1_locked = self.grow_l1_table(l1_locked, offset.l1_index).await?;
+        let l1_index = offset.l1_index(cb);
+        if !l1_locked.in_bounds(l1_index) {
+            l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
         }
 
-        let l1_entry = l1_locked.get(offset.l1_index);
+        let l1_entry = l1_locked.get(l1_index);
         if let Some(l2_offset) = l1_entry.l2_offset() {
             drop(l1_locked);
 
-            let cb = self.header.cluster_bits();
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -227,10 +228,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         l2_table.set_cluster(l2_cluster);
         l2_table.write(&self.metadata).await?;
 
-        l1_locked.enter_l2_table(offset.l1_index, &l2_table)?;
-        l1_locked
-            .write_entry(&self.metadata, offset.l1_index)
-            .await?;
+        l1_locked.enter_l2_table(l1_index, &l2_table)?;
+        l1_locked.write_entry(&self.metadata, l1_index).await?;
 
         Ok(l2_table)
     }
@@ -286,15 +285,17 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let cb = self.header.cluster_bits();
 
         let partial_skip_cow = overwrite.then(|| {
-            let start = offset.in_cluster_offset;
+            let start = offset.in_cluster_offset(cb);
             let end = cmp::min(start as u64 + full_length, 1 << cb) as usize;
             start..end
         });
 
+        let mut current_guest_cluster = offset.cluster(cb);
+
         // Without a mandatory host offset, this should never return `Ok(None)`
         let host_cluster = self
             .cow_cluster(
-                offset.cluster(),
+                current_guest_cluster,
                 None,
                 partial_skip_cow,
                 l2_table,
@@ -305,7 +306,6 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         let host_offset_start = host_cluster.relative_offset(offset, cb);
         let mut allocated_length = offset.remaining_in_cluster(cb);
-        let mut current_guest_cluster = offset.cluster();
         let mut current_host_cluster = host_cluster;
 
         while allocated_length < full_length {

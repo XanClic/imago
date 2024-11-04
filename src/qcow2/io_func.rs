@@ -34,7 +34,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
             let mut bounce_buffer_and_chunk = None;
             let need_bounce_buffer = chunk.buffer_count() != 1
-                || offset.in_cluster_offset != 0
+                || offset.in_cluster_offset(cb) != 0
                 || chunk.len() != self.header.cluster_size() as u64;
 
             let slice = if need_bounce_buffer {
@@ -45,7 +45,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 chunk.into_inner().pop().unwrap().into()
             };
 
-            match l2_table.get_mapping(offset.cluster())? {
+            let guest_cluster = offset.cluster(cb);
+            match l2_table.get_mapping(guest_cluster)? {
                 L2Mapping::Compressed {
                     host_offset,
                     length,
@@ -58,18 +59,18 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             }
 
             if let Some((bounce_buffer, mut chunk)) = bounce_buffer_and_chunk {
-                let ofs = offset.in_cluster_offset;
+                let ofs = offset.in_cluster_offset(cb);
                 let end = ofs + chunk.len() as usize;
                 chunk.copy_from_slice(bounce_buffer.as_ref_range(ofs..end).into_slice());
             }
 
-            let next_cluster = if let Some(next) = offset.cluster().next_in_l2(cb) {
+            let next_cluster = if let Some(next) = guest_cluster.next_in_l2(cb) {
                 next
             } else {
                 saved_l2_table.take();
-                offset.cluster().first_in_next_l2()
+                guest_cluster.first_in_next_l2(cb)
             };
-            offset = next_cluster.offset();
+            offset = next_cluster.offset(cb);
         }
 
         Ok(())

@@ -1179,11 +1179,11 @@ impl L2Entry {
 
     /// Return the high-level `L2Mapping` representation.
     ///
-    /// `guest_addr` is the guest address being accessed, `cluster_bits` is log2 of the cluster
+    /// `guest_cluster` is the guest cluster being accessed, `cluster_bits` is log2 of the cluster
     /// size.
     pub fn into_mapping(
         self,
-        guest_addr: GuestCluster,
+        guest_cluster: GuestCluster,
         cluster_bits: u32,
     ) -> io::Result<L2Mapping> {
         let mapping = if let Some((offset, length)) = self.compressed_range(cluster_bits) {
@@ -1196,8 +1196,9 @@ impl L2Entry {
                 .cluster_offset()
                 .map(|ofs| {
                     ofs.checked_cluster(cluster_bits).ok_or_else(|| {
+                        let offset = guest_cluster.offset(cluster_bits);
                         io::Error::other(format!(
-                            "Unaligned pre-allocated zero cluster at {guest_addr:?}; L2 entry: {self:?}"
+                            "Unaligned pre-allocated zero cluster at {offset}; L2 entry: {self:?}"
                         ))
                     })
                 })
@@ -1209,8 +1210,9 @@ impl L2Entry {
             }
         } else if let Some(host_offset) = self.cluster_offset() {
             let host_cluster = host_offset.checked_cluster(cluster_bits).ok_or_else(|| {
+                let offset = guest_cluster.offset(cluster_bits);
                 io::Error::other(format!(
-                    "Unaligned data cluster at {guest_addr:?}; L2 entry: {self:?}"
+                    "Unaligned data cluster at {offset}; L2 entry: {self:?}"
                 ))
             })?;
 
@@ -1220,7 +1222,7 @@ impl L2Entry {
             }
         } else {
             L2Mapping::Backing {
-                backing_offset: guest_addr.raw_offset(cluster_bits),
+                backing_offset: guest_cluster.offset(cluster_bits).0,
             }
         };
 
@@ -1421,9 +1423,9 @@ impl L2Table {
     }
 
     /// Look up a cluster mapping.
-    pub fn get_mapping(&self, lookup_addr: GuestCluster) -> io::Result<L2Mapping> {
-        self.get(lookup_addr.l2_index)
-            .into_mapping(lookup_addr, self.cluster_bits)
+    pub fn get_mapping(&self, lookup_cluster: GuestCluster) -> io::Result<L2Mapping> {
+        self.get(lookup_cluster.l2_index(self.cluster_bits))
+            .into_mapping(lookup_cluster, self.cluster_bits)
     }
 
     /// Enter the given raw data cluster mapping into the L2 table.

@@ -330,7 +330,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         };
 
         let max_length = cmp::min(max_length, length_until_eof);
-        let offset = self.split_guest_offset(offset);
+        let offset = GuestOffset(offset);
         self.do_get_mapping(offset, max_length).await
     }
 
@@ -350,12 +350,12 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         }
 
         self.need_writable()?;
-        let offset = self.split_guest_offset(offset);
+        let offset = GuestOffset(offset);
         self.do_ensure_data_mapping(offset, length, overwrite).await
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
-        let offset = self.split_guest_offset(offset);
+        let offset = GuestOffset(offset);
         self.do_readv_special(bufv, offset).await
     }
 }

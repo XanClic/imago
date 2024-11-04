@@ -65,9 +65,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         guest_cluster: GuestCluster,
     ) -> io::Result<HostCluster> {
         if self.header.external_data_file() {
-            Ok(HostCluster(
-                guest_cluster.raw_index(self.header.cluster_bits()),
-            ))
+            Ok(HostCluster(guest_cluster.0))
         } else {
             self.allocator()
                 .await?
@@ -93,8 +91,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         };
 
         if self.header.external_data_file() {
-            let cb = self.header.cluster_bits();
-            let cluster = HostCluster(guest_cluster.raw_index(cb));
+            let cluster = HostCluster(guest_cluster.0);
             Ok((cluster == mandatory_host_cluster).then_some(cluster))
         } else {
             let cluster = self

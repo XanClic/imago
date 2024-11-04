@@ -7,25 +7,13 @@ use super::*;
 use std::fmt::{self, Display, Formatter};
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
-/// Guest offset split into its components.
+/// Guest offset.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct GuestOffset {
-    /// Index in the L1 table.
-    pub l1_index: usize,
-    /// Index in the L2 table.
-    pub l2_index: usize,
-    /// Offset in the cluster.
-    pub in_cluster_offset: usize,
-}
+pub(super) struct GuestOffset(pub u64);
 
 /// Guest cluster index.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct GuestCluster {
-    /// Index in the L1 table.
-    pub l1_index: usize,
-    /// Index in the L2 table.
-    pub l2_index: usize,
-}
+pub(super) struct GuestCluster(pub u64);
 
 /// Host cluster offset.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -39,76 +27,64 @@ pub(super) struct HostCluster(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct ClusterCount(pub usize);
 
-impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
-    /// Split the given `offset` into its components.
-    pub(super) fn split_guest_offset(&self, offset: u64) -> GuestOffset {
-        GuestOffset::from_raw_offset(offset, self.header.cluster_bits())
-    }
-}
-
 impl GuestOffset {
-    /// Create a `GuestOffset` from its raw `u64` value.
-    pub fn from_raw_offset(offset: u64, cluster_bits: u32) -> Self {
-        let cluster_size = 1 << cluster_bits;
-        let in_cluster_offset = (offset % cluster_size) as usize;
-        let cluster_index = offset / cluster_size;
-        let l2_entries = 1 << (cluster_bits - 3);
-        let l2_index = (cluster_index % l2_entries) as usize;
-        let l1_index = (cluster_index / l2_entries) as usize;
+    /// Return the offset from the start of the containing guest clusters.
+    pub fn in_cluster_offset(self, cluster_bits: u32) -> usize {
+        (self.0 % (1 << cluster_bits)) as usize
+    }
 
-        GuestOffset {
-            l1_index,
-            l2_index,
-            in_cluster_offset,
-        }
+    /// Return the containing cluster’s index in its L2 table.
+    pub fn l2_index(self, cluster_bits: u32) -> usize {
+        self.cluster(cluster_bits).l2_index(cluster_bits)
+    }
+
+    /// Return the containing cluster’s L2 table’s index in the L1 table.
+    pub fn l1_index(self, cluster_bits: u32) -> usize {
+        self.cluster(cluster_bits).l1_index(cluster_bits)
     }
 
     /// Return the containing cluster’s index.
-    pub fn cluster(self) -> GuestCluster {
-        GuestCluster {
-            l1_index: self.l1_index,
-            l2_index: self.l2_index,
-        }
+    pub fn cluster(self, cluster_bits: u32) -> GuestCluster {
+        GuestCluster(self.0 >> cluster_bits)
     }
 
     /// How many bytes remain in this cluster after this offset.
     pub fn remaining_in_cluster(self, cluster_bits: u32) -> u64 {
-        ((1 << cluster_bits) - self.in_cluster_offset) as u64
+        ((1 << cluster_bits) - self.in_cluster_offset(cluster_bits)) as u64
     }
 
     /// How many bytes remain in this L2 table after this offset.
     pub fn remaining_in_l2_table(self, cluster_bits: u32) -> u64 {
         // See `Header::l2_entries()`
         let l2_entries = 1 << (cluster_bits - 3);
-        let after_this = ((l2_entries - (self.l2_index + 1)) as u64) << cluster_bits;
+        let after_this = ((l2_entries - (self.l2_index(cluster_bits) + 1)) as u64) << cluster_bits;
         self.remaining_in_cluster(cluster_bits) + after_this
-    }
-
-    /// Turn this strongly typed offset into its raw `u64` value.
-    pub fn raw_offset(self, cluster_bits: u32) -> u64 {
-        let cluster_index = ((self.l1_index as u64) << (cluster_bits - 3)) + self.l2_index as u64;
-        (cluster_index << cluster_bits) + self.in_cluster_offset as u64
     }
 }
 
 impl GuestCluster {
     /// Return this cluster’s offset.
-    pub fn offset(self) -> GuestOffset {
-        GuestOffset {
-            l1_index: self.l1_index,
-            l2_index: self.l2_index,
-            in_cluster_offset: 0,
-        }
+    pub fn offset(self, cluster_bits: u32) -> GuestOffset {
+        GuestOffset(self.0 << cluster_bits)
     }
 
-    /// Turn this strongly typed index into its raw `u64` value.
-    pub fn raw_index(self, cluster_bits: u32) -> u64 {
-        ((self.l1_index as u64) << (cluster_bits - 3)) + self.l2_index as u64
+    /// Return this cluster’s index in its L2 table.
+    pub fn l2_index(self, cluster_bits: u32) -> usize {
+        // See `Header::l2_entries()`
+        let l2_entries = 1 << (cluster_bits - 3);
+        (self.0 % l2_entries) as usize
     }
 
-    /// Return this cluster’s offset in its raw `u64` form.
-    pub fn raw_offset(self, cluster_bits: u32) -> u64 {
-        self.raw_index(cluster_bits) << cluster_bits
+    /// Return this cluster’s L2 table’s index in the L1 table.
+    pub fn l1_index(self, cluster_bits: u32) -> usize {
+        let l2_entries_shift = cluster_bits - 3;
+        (self.0 >> l2_entries_shift) as usize
+    }
+
+    /// Return the cluster at the given L1 and L2 table indices.
+    pub fn from_l1_l2_indices(l1_index: usize, l2_index: usize, cluster_bits: u32) -> Self {
+        let l2_entries_shift = cluster_bits - 3;
+        GuestCluster(((l1_index as u64) << l2_entries_shift) + l2_index as u64)
     }
 
     /// Return the next cluster in this L2 table, if any.
@@ -117,23 +93,24 @@ impl GuestCluster {
     pub fn next_in_l2(self, cluster_bits: u32) -> Option<GuestCluster> {
         // See `Header::l2_entries()`
         let l2_entries = 1 << (cluster_bits - 3);
-        let l2_index = self.l2_index.checked_add(1)?;
+        let l1_index = self.l1_index(cluster_bits);
+        let l2_index = self.l2_index(cluster_bits);
+        let l2_index = l2_index.checked_add(1)?;
         if l2_index >= l2_entries {
             None
         } else {
-            Some(GuestCluster {
-                l1_index: self.l1_index,
+            Some(GuestCluster::from_l1_l2_indices(
+                l1_index,
                 l2_index,
-            })
+                cluster_bits,
+            ))
         }
     }
 
     /// Return the first cluster in the next L2 table.
-    pub fn first_in_next_l2(self) -> GuestCluster {
-        GuestCluster {
-            l1_index: self.l1_index + 1,
-            l2_index: 0,
-        }
+    pub fn first_in_next_l2(self, cluster_bits: u32) -> GuestCluster {
+        let l2_entries = 1 << (cluster_bits - 3);
+        GuestCluster((self.0 + 1).next_multiple_of(l2_entries))
     }
 }
 
@@ -171,7 +148,7 @@ impl HostCluster {
     ///
     /// Same as `self.offset(cb) + guest_offset.in_cluster_offset`.
     pub fn relative_offset(self, guest_offset: GuestOffset, cluster_bits: u32) -> HostOffset {
-        self.offset(cluster_bits) + guest_offset.in_cluster_offset
+        self.offset(cluster_bits) + guest_offset.in_cluster_offset(cluster_bits)
     }
 }
 
@@ -274,6 +251,12 @@ impl Sub<HostOffset> for HostOffset {
 
     fn sub(self, rhs: Self) -> usize {
         (self.0 - rhs.0).try_into().unwrap()
+    }
+}
+
+impl Display for GuestOffset {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{:x}", self.0)
     }
 }
 
