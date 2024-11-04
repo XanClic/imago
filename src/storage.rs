@@ -25,7 +25,7 @@ pub struct StorageOpenOptions {
 }
 
 /// Provides access to generic storage objects.
-pub trait Storage: Debug + Display + Sized {
+pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// Open a storage object.
     ///
     /// Different storage implementations may require different options.
@@ -217,7 +217,7 @@ pub trait StorageExt: Storage {
 ///
 /// Async functions in `DynStorage` return boxed futures (`Pin<Box<dyn Future>>`), which makes them
 /// slighly less efficient than async functions in `Storage`, hence the distinction.
-pub trait DynStorage: Debug + Display {
+pub trait DynStorage: Debug + Display + Send + Sync {
     /// Wrapper around [`Storage::mem_align()`].
     fn mem_align(&self) -> usize;
 

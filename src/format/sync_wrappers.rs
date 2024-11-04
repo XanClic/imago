@@ -22,11 +22,6 @@ impl<S: Storage> SyncFormatAccess<S> {
         FormatAccess::new(inner).try_into()
     }
 
-    /// Return the contained async [`FormatAccess`] object.
-    pub fn unwrap(self) -> FormatAccess<S> {
-        self.inner
-    }
-
     /// Get a reference to the contained async [`FormatAccess`] object.
     pub fn inner(&self) -> &'_ FormatAccess<S> {
         &self.inner
@@ -177,5 +172,15 @@ impl<S: Storage> TryFrom<FormatAccess<S>> for SyncFormatAccess<S> {
             inner: async_access,
             runtime,
         })
+    }
+}
+
+// #[cfg(not(feature = "async-drop"))]
+impl<S: Storage> Drop for SyncFormatAccess<S> {
+    fn drop(&mut self) {
+        if let Err(err) = self.flush() {
+            let inner = &self.inner;
+            tracing::error!("Failed to flush {inner}: {err}");
+        }
     }
 }

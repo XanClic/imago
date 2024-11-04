@@ -8,19 +8,19 @@ use std::fmt::{self, Display, Formatter};
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 /// Guest offset.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct GuestOffset(pub u64);
 
 /// Guest cluster index.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct GuestCluster(pub u64);
 
 /// Host cluster offset.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct HostOffset(pub u64);
 
 /// Host cluster index.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct HostCluster(pub u64);
 
 /// Cluster count.

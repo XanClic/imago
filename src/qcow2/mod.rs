@@ -1,6 +1,7 @@
 //! Qcow2 implementation.
 
 mod allocation;
+mod cache;
 mod compressed;
 mod cow;
 mod io_func;
@@ -10,6 +11,7 @@ mod metadata;
 mod sync_wrappers;
 mod types;
 
+use crate::async_lru_cache::AsyncLruCache;
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::wrapped::WrappedFormat;
 use crate::io_buffers::IoVectorMut;
@@ -17,6 +19,7 @@ use crate::raw::Raw;
 use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
+use cache::L2CacheBackend;
 use metadata::*;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
@@ -34,7 +37,7 @@ use types::*;
 /// - Backing image `WrappedFormat<S>`: A backing disk image in any format
 pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAccess<S>> {
     /// Image file (which contains the qcow2 metadata).
-    metadata: S,
+    metadata: Arc<S>,
 
     /// Whether this image may be modified.
     writable: bool,
@@ -53,18 +56,13 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     /// L1 table.
     l1_table: RwLock<L1Table>,
 
+    /// L2 table cache.
+    l2_cache: AsyncLruCache<HostCluster, L2Table, L2CacheBackend<S>>,
+
     /// Allocates clusters.
     ///
     /// Is `None` for read-only images.
-    allocator: Option<Mutex<Allocator>>,
-
-    /// Taken while performing COW requests.
-    ///
-    /// While reading an L2 table, read-lock this.  While modifying an L2 table (i.e. from the
-    /// start of COW until the L2 table is actually modified), write-lock this.
-    ///
-    /// FIXME: Put this lock around the actual L2 tables in the eventual L2 table cache.
-    cow_lock: RwLock<()>,
+    allocator: Option<Mutex<Allocator<S>>>,
 }
 
 impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
@@ -95,12 +93,17 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         let l1_table =
             L1Table::load(&metadata, &header, l1_cluster, header.l1_table_entries()).await?;
 
+        let metadata = Arc::new(metadata);
+
         let allocator = if writable {
-            let allocator = Allocator::new(&metadata, Arc::clone(&header)).await?;
+            let allocator = Allocator::new(Arc::clone(&metadata), Arc::clone(&header)).await?;
             Some(Mutex::new(allocator))
         } else {
             None
         };
+
+        let l2_cache_backend = L2CacheBackend::new(Arc::clone(&metadata), Arc::clone(&header));
+        let l2_cache = AsyncLruCache::new(l2_cache_backend, 128);
 
         Ok(Qcow2 {
             metadata,
@@ -115,9 +118,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             header,
             l1_table: RwLock::new(l1_table),
 
+            l2_cache,
             allocator,
-
-            cow_lock: RwLock::new(()),
         })
     }
 
@@ -360,7 +362,8 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn flush(&self) -> io::Result<()> {
-        // No internal buffers to flush yet.
+        self.l2_cache.flush().await?;
+
         self.metadata.flush().await?;
         if let Some(storage) = self.storage.as_ref() {
             storage.flush().await?;

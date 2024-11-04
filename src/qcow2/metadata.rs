@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::ErrorKind::InvalidData;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::num::TryFromIntError;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::{cmp, io};
+use tokio::sync::{Mutex, MutexGuard};
+use tracing::error;
 
 /// Qcow header magic ("QFI\xfb").
 const MAGIC: u32 = 0x51_46_49_fb;
@@ -901,7 +904,7 @@ impl TableEntry for L1Entry {
         Ok(entry)
     }
 
-    fn into_plain(self) -> u64 {
+    fn to_plain(&self) -> u64 {
         self.0
     }
 }
@@ -964,13 +967,15 @@ impl L1Table {
 
         let l1entry = L1Entry((1 << 63) | l2_offset.0);
         debug_assert!(l1entry.reserved_bits() == 0);
-        self.set(index, l1entry);
+        self.data[index] = l1entry;
+        self.modified.store(true, Ordering::Relaxed);
 
         Ok(())
     }
 }
 
 impl Table for L1Table {
+    type InternalEntry = L1Entry;
     type Entry = L1Entry;
 
     fn from_data(data: Box<[L1Entry]>, header: &Header) -> Self {
@@ -986,13 +991,12 @@ impl Table for L1Table {
         self.data.len()
     }
 
-    fn get(&self, index: usize) -> L1Entry {
-        self.data.get(index).copied().unwrap_or(L1Entry(0))
+    fn get_ref(&self, index: usize) -> &L1Entry {
+        self.data.get(index).unwrap()
     }
 
-    fn set(&mut self, index: usize, l1_entry: L1Entry) {
-        self.data[index] = l1_entry;
-        self.modified.store(true, Ordering::Relaxed);
+    fn get(&self, index: usize) -> L1Entry {
+        self.data.get(index).copied().unwrap_or(L1Entry(0))
     }
 
     fn get_cluster(&self) -> Option<HostCluster> {
@@ -1058,6 +1062,12 @@ impl Table for L1Table {
 ///   compressed cluster.
 #[derive(Copy, Clone, Default, Debug)]
 pub(super) struct L2Entry(u64);
+
+/// Internal actual type of L2 entries.
+///
+/// Using atomic allows flushing L2 tables from the cache while they are write-locked.
+#[derive(Default, Debug)]
+pub(super) struct AtomicL2Entry(AtomicU64);
 
 /// High-level representation of an L2 entry.
 #[derive(Debug, Clone)]
@@ -1283,7 +1293,36 @@ impl L2Entry {
     }
 }
 
-impl TableEntry for L2Entry {
+impl AtomicL2Entry {
+    /// Get the contained value.
+    fn get(&self) -> L2Entry {
+        L2Entry(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Set the contained value.
+    ///
+    /// # Safety
+    /// Caller must ensure that:
+    /// (1) No reader sees invalid intermediate states.
+    /// (2) Updates are done atomically (do not depend on prior state of the L2 table), or there is
+    ///     only one writer at a time
+    unsafe fn set(&self, l2e: L2Entry) {
+        self.0.store(l2e.0, Ordering::Relaxed)
+    }
+
+    /// Exchange the contained value.
+    ///
+    /// # Safety
+    /// Caller must ensure that:
+    /// (1) No reader sees invalid intermediate states.
+    /// (2) Updates are done atomically (do not depend on prior state of the L2 table), or there is
+    ///     only one writer at a time.
+    unsafe fn swap(&self, l2e: L2Entry) -> L2Entry {
+        L2Entry(self.0.swap(l2e.0, Ordering::Relaxed))
+    }
+}
+
+impl TableEntry for AtomicL2Entry {
     fn try_from_plain(value: u64, header: &Header) -> io::Result<Self> {
         let entry = L2Entry(value);
 
@@ -1312,11 +1351,11 @@ impl TableEntry for L2Entry {
             }
         }
 
-        Ok(entry)
+        Ok(AtomicL2Entry(AtomicU64::new(entry.0)))
     }
 
-    fn into_plain(self) -> u64 {
-        self.0
+    fn to_plain(&self) -> u64 {
+        self.get().0
     }
 }
 
@@ -1400,25 +1439,40 @@ pub(super) struct L2Table {
     cluster: Option<HostCluster>,
 
     /// Table data.
-    data: Box<[L2Entry]>,
+    data: Box<[AtomicL2Entry]>,
 
     /// log2 of the cluster size.
     cluster_bits: u32,
 
     /// Whether this table has been modified since it was last written.
     modified: AtomicBool,
+
+    /// Lock for creating `L2TableWriteGuard`.
+    writer_lock: Mutex<()>,
+}
+
+/// Write guard for an L2 table.
+#[derive(Debug)]
+pub(super) struct L2TableWriteGuard<'a> {
+    /// Referenced L2 table.
+    table: &'a L2Table,
+
+    /// Held guard mutex on that L2 table.
+    lock: MutexGuard<'a, ()>,
 }
 
 impl L2Table {
     /// Create a new zeroed L2 table.
     pub fn new_cleared(header: &Header) -> Self {
-        let data = vec![L2Entry(0u64); header.l2_entries()].into_boxed_slice();
+        let mut data = Vec::with_capacity(header.cluster_size());
+        data.resize_with(header.l2_entries(), Default::default);
 
         L2Table {
             cluster: None,
-            data,
+            data: data.into_boxed_slice(),
             cluster_bits: header.cluster_bits(),
             modified: true.into(),
+            writer_lock: Default::default(),
         }
     }
 
@@ -1426,6 +1480,23 @@ impl L2Table {
     pub fn get_mapping(&self, lookup_cluster: GuestCluster) -> io::Result<L2Mapping> {
         self.get(lookup_cluster.l2_index(self.cluster_bits))
             .into_mapping(lookup_cluster, self.cluster_bits)
+    }
+
+    /// Allow modifying this L2 table.
+    ///
+    /// Note that readers are allowed to exist while modifications are happening.
+    pub async fn lock_write(&self) -> L2TableWriteGuard<'_> {
+        L2TableWriteGuard {
+            table: self,
+            lock: self.writer_lock.lock().await,
+        }
+    }
+}
+
+impl L2TableWriteGuard<'_> {
+    /// Look up a cluster mapping.
+    pub fn get_mapping(&self, lookup_cluster: GuestCluster) -> io::Result<L2Mapping> {
+        self.table.get_mapping(lookup_cluster)
     }
 
     /// Enter the given raw data cluster mapping into the L2 table.
@@ -1442,17 +1513,19 @@ impl L2Table {
         index: usize,
         host_cluster: HostCluster,
     ) -> Option<(HostCluster, ClusterCount)> {
-        let allocation = self.data[index].allocation(self.cluster_bits);
-
-        self.data[index] = L2Entry::from_mapping(
+        let new = L2Entry::from_mapping(
             L2Mapping::DataFile {
                 host_cluster,
                 copied: true,
             },
-            self.cluster_bits,
+            self.table.cluster_bits,
         );
-        self.modified.store(true, Ordering::Relaxed);
+        // Safe: We set a full valid mapping, and there is only one writer (thanks to
+        // `L2TableWriteGuard`).
+        let l2e = unsafe { self.table.data[index].swap(new) };
+        self.table.modified.store(true, Ordering::Relaxed);
 
+        let allocation = l2e.allocation(self.table.cluster_bits);
         if let Some((a_cluster, a_count)) = allocation {
             if a_cluster == host_cluster && a_count == ClusterCount(1) {
                 None
@@ -1466,9 +1539,10 @@ impl L2Table {
 }
 
 impl Table for L2Table {
+    type InternalEntry = AtomicL2Entry;
     type Entry = L2Entry;
 
-    fn from_data(data: Box<[L2Entry]>, header: &Header) -> Self {
+    fn from_data(data: Box<[AtomicL2Entry]>, header: &Header) -> Self {
         assert!(data.len() == header.l2_entries());
 
         Self {
@@ -1476,6 +1550,7 @@ impl Table for L2Table {
             data,
             cluster_bits: header.cluster_bits(),
             modified: true.into(),
+            writer_lock: Default::default(),
         }
     }
 
@@ -1483,13 +1558,15 @@ impl Table for L2Table {
         self.data.len()
     }
 
-    fn get(&self, index: usize) -> L2Entry {
-        self.data.get(index).copied().unwrap_or(L2Entry(0))
+    fn get_ref(&self, index: usize) -> &AtomicL2Entry {
+        self.data.get(index).unwrap()
     }
 
-    fn set(&mut self, index: usize, l2_entry: L2Entry) {
-        self.data[index] = l2_entry;
-        self.modified.store(true, Ordering::Relaxed);
+    fn get(&self, index: usize) -> L2Entry {
+        self.data
+            .get(index)
+            .map(|l2e| l2e.get())
+            .unwrap_or(L2Entry(0))
     }
 
     fn get_cluster(&self) -> Option<HostCluster> {
@@ -1519,6 +1596,14 @@ impl Table for L2Table {
 
     fn set_modified(&self) {
         self.modified.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for L2Table {
+    fn drop(&mut self) {
+        if self.is_modified() {
+            error!("L2 table dropped while modified; was the image closed before being flushed?");
+        }
     }
 }
 
@@ -1575,7 +1660,7 @@ impl TableEntry for RefTableEntry {
         Ok(entry)
     }
 
-    fn into_plain(self) -> u64 {
+    fn to_plain(&self) -> u64 {
         self.0
     }
 }
@@ -1658,13 +1743,15 @@ impl RefTable {
 
         let rt_entry = RefTableEntry(rb_offset.0);
         debug_assert!(rt_entry.reserved_bits() == 0);
-        self.set(index, rt_entry);
+        self.data[index] = rt_entry;
+        self.modified.store(true, Ordering::Relaxed);
 
         Ok(())
     }
 }
 
 impl Table for RefTable {
+    type InternalEntry = RefTableEntry;
     type Entry = RefTableEntry;
 
     fn from_data(data: Box<[RefTableEntry]>, header: &Header) -> Self {
@@ -1680,13 +1767,12 @@ impl Table for RefTable {
         self.data.len()
     }
 
-    fn get(&self, index: usize) -> RefTableEntry {
-        self.data.get(index).copied().unwrap_or(RefTableEntry(0))
+    fn get_ref(&self, index: usize) -> &RefTableEntry {
+        self.data.get(index).unwrap()
     }
 
-    fn set(&mut self, index: usize, rt_entry: RefTableEntry) {
-        self.data[index] = rt_entry;
-        self.modified.store(true, Ordering::Relaxed);
+    fn get(&self, index: usize) -> RefTableEntry {
+        self.data.get(index).copied().unwrap_or(RefTableEntry(0))
     }
 
     fn get_cluster(&self) -> Option<HostCluster> {
@@ -1735,6 +1821,18 @@ pub(super) struct RefBlock {
 
     /// Whether this block has been modified since it was last written.
     modified: AtomicBool,
+
+    /// Lock for creating `RefBlockWriteGuard`.
+    writer_lock: Mutex<()>,
+}
+
+/// Write guard for a refblock.
+pub(super) struct RefBlockWriteGuard<'a> {
+    /// Referenced refblock.
+    rb: &'a RefBlock,
+
+    /// Held guard mutex on that refblock.
+    lock: MutexGuard<'a, ()>,
 }
 
 impl RefBlock {
@@ -1749,6 +1847,7 @@ impl RefBlock {
             refcount_order: header.refcount_order(),
             cluster_bits: header.cluster_bits(),
             modified: true.into(),
+            writer_lock: Default::default(),
         })
     }
 
@@ -1768,7 +1867,8 @@ impl RefBlock {
             raw_data,
             refcount_order: header.refcount_order(),
             cluster_bits: header.cluster_bits(),
-            modified: true.into(),
+            modified: false.into(),
+            writer_lock: Default::default(),
         })
     }
 
@@ -1846,140 +1946,80 @@ impl RefBlock {
             // refcount_bits == 1
             0 => {
                 let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u8>() };
-                ((raw_data_slice[index / 8] >> (index % 8)) & 0b0000_0001) as u64
+                let atomic = unsafe {
+                    AtomicU8::from_ptr(&raw_data_slice[index / 8] as *const u8 as *mut u8)
+                };
+                let byte = atomic.load(Ordering::Relaxed);
+                ((byte >> (index % 8)) & 0b0000_0001) as u64
             }
 
             // refcount_bits == 2
             1 => {
                 let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u8>() };
-                ((raw_data_slice[index / 4] >> (index % 4)) & 0b0000_0011) as u64
+                let atomic = unsafe {
+                    AtomicU8::from_ptr(&raw_data_slice[index / 4] as *const u8 as *mut u8)
+                };
+                let byte = atomic.load(Ordering::Relaxed);
+                ((byte >> (index % 4)) & 0b0000_0011) as u64
             }
 
             // refcount_bits == 4
             2 => {
                 let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u8>() };
-                ((raw_data_slice[index / 2] >> (index % 2)) & 0b0000_1111) as u64
+                let atomic = unsafe {
+                    AtomicU8::from_ptr(&raw_data_slice[index / 2] as *const u8 as *mut u8)
+                };
+                let byte = atomic.load(Ordering::Relaxed);
+                ((byte >> (index % 2)) & 0b0000_1111) as u64
             }
 
             // refcount_bits == 8
             3 => {
                 let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u8>() };
-                raw_data_slice[index] as u64
+                let atomic =
+                    unsafe { AtomicU8::from_ptr(&raw_data_slice[index] as *const u8 as *mut u8) };
+                atomic.load(Ordering::Relaxed) as u64
             }
 
             // refcount_bits == 16
             4 => {
                 let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u16>() };
-                u16::from_be(raw_data_slice[index]) as u64
+                let atomic = unsafe {
+                    AtomicU16::from_ptr(&raw_data_slice[index] as *const u16 as *mut u16)
+                };
+                u16::from_be(atomic.load(Ordering::Relaxed)) as u64
             }
 
             // refcount_bits == 32
             5 => {
                 let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u32>() };
-                u32::from_be(raw_data_slice[index]) as u64
+                let atomic = unsafe {
+                    AtomicU32::from_ptr(&raw_data_slice[index] as *const u32 as *mut u32)
+                };
+                u32::from_be(atomic.load(Ordering::Relaxed)) as u64
             }
 
             // refcount_bits == 64
             6 => {
                 let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u64>() };
-                u64::from_be(raw_data_slice[index])
+                let atomic = unsafe {
+                    AtomicU64::from_ptr(&raw_data_slice[index] as *const u64 as *mut u64)
+                };
+                u64::from_be(atomic.load(Ordering::Relaxed))
             }
 
             _ => unreachable!(),
         }
     }
 
-    /// Set the given cluster’s refcount.
-    fn set(&mut self, index: usize, value: u64) -> io::Result<()> {
-        let bits = 1 << self.refcount_order;
-        if let Some(max_value) = 1u64.checked_shl(bits) {
-            if value > max_value {
-                return Err(io::Error::new(
-                    InvalidData,
-                    format!("Cannot increase refcount to {value} beyond {max_value} with refcount_bits={bits}"),
-                ));
-            }
+    /// Allow modifying this refcount block.
+    ///
+    /// Note that readers are allowed to exist while modifications are happening.
+    pub async fn lock_write(&self) -> RefBlockWriteGuard<'_> {
+        RefBlockWriteGuard {
+            rb: self,
+            lock: self.writer_lock.lock().await,
         }
-
-        match self.refcount_order {
-            // refcount_bits == 1
-            0 => {
-                let raw_data_slice = unsafe { self.raw_data.as_mut().into_typed_slice::<u8>() };
-                raw_data_slice[index / 8] = (raw_data_slice[index / 8]
-                    & !(0b0000_0001 << (index % 8)))
-                    | ((value as u8) << (index % 8));
-            }
-
-            // refcount_bits == 2
-            1 => {
-                let raw_data_slice = unsafe { self.raw_data.as_mut().into_typed_slice::<u8>() };
-                raw_data_slice[index / 4] = (raw_data_slice[index / 4]
-                    & !(0b0000_0011 << (index % 4)))
-                    | ((value as u8) << (index % 4));
-            }
-
-            // refcount_bits == 4
-            2 => {
-                let raw_data_slice = unsafe { self.raw_data.as_mut().into_typed_slice::<u8>() };
-                raw_data_slice[index / 2] = (raw_data_slice[index / 2]
-                    & !(0b0000_1111 << (index % 2)))
-                    | ((value as u8) << (index % 2));
-            }
-
-            // refcount_bits == 8
-            3 => {
-                let raw_data_slice = unsafe { self.raw_data.as_mut().into_typed_slice::<u8>() };
-                raw_data_slice[index] = value as u8;
-            }
-
-            // refcount_bits == 16
-            4 => {
-                let raw_data_slice = unsafe { self.raw_data.as_mut().into_typed_slice::<u16>() };
-                raw_data_slice[index] = (value as u16).to_be();
-            }
-
-            // refcount_bits == 32
-            5 => {
-                let raw_data_slice = unsafe { self.raw_data.as_mut().into_typed_slice::<u32>() };
-                raw_data_slice[index] = (value as u32).to_be();
-            }
-
-            // refcount_bits == 64
-            6 => {
-                let raw_data_slice = unsafe { self.raw_data.as_mut().into_typed_slice::<u64>() };
-                raw_data_slice[index] = value.to_be();
-            }
-
-            _ => unreachable!(),
-        }
-
-        self.modified.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Check whether the given cluster’s refcount is 0.
-    pub fn is_zero(&self, index: usize) -> bool {
-        self.get(index) == 0
-    }
-
-    /// Increment the given cluster’s refcount.
-    pub fn increment(&mut self, index: usize) -> io::Result<()> {
-        let val = self.get(index).checked_add(1).ok_or_else(|| {
-            io::Error::new(
-                InvalidData,
-                format!("Cannot increase refcount beyond {}", u64::MAX),
-            )
-        })?;
-        self.set(index, val)
-    }
-
-    /// Decrement the given cluster’s refcount.
-    pub fn decrement(&mut self, index: usize) -> io::Result<()> {
-        let val = self
-            .get(index)
-            .checked_sub(1)
-            .ok_or_else(|| io::Error::new(InvalidData, "Cannot decrease refcount below 0"))?;
-        self.set(index, val)
     }
 
     /// Check whether this block has been modified since it was last written.
@@ -1996,34 +2036,279 @@ impl RefBlock {
     pub fn set_modified(&self) {
         self.modified.store(true, Ordering::Relaxed);
     }
+
+    /// Check whether the given cluster’s refcount is 0.
+    pub fn is_zero(&self, index: usize) -> bool {
+        self.get(index) == 0
+    }
+}
+
+impl RefBlockWriteGuard<'_> {
+    /// # Safety
+    /// Caller must ensure there are no concurrent writers.
+    unsafe fn fetch_update_bitset(
+        bitset: &AtomicU8,
+        change: i64,
+        base_mask: u8,
+        shift: usize,
+    ) -> io::Result<u64> {
+        let mask = base_mask << shift;
+
+        // load + store is OK without concurrent writers
+        let full = bitset.load(Ordering::Relaxed);
+        let old = (full & mask) >> shift;
+        let new = if change > 0 {
+            let change = change.try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Requested refcount change of {change} is too big for the image’s refcount width"),
+                )
+            })?;
+            old.checked_add(change)
+        } else {
+            let change = (-change).try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Requested refcount change of {change} is too big for the image’s refcount width"),
+                )
+            })?;
+            old.checked_add(change)
+        };
+        let new = new.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Changing refcount from {old} by {change} would overflow"),
+            )
+        })?;
+        if new > mask {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Changing refcount from {old} to {new} (by {change}) would overflow"),
+            ));
+        }
+
+        let full = (full & !mask) | (new << shift);
+        bitset.store(full, Ordering::Relaxed);
+        Ok(old as u64)
+    }
+
+    /// # Safety
+    /// Caller must ensure there are no concurrent writers.
+    unsafe fn fetch_update_full<
+        T,
+        L: FnOnce(&T) -> u64,
+        S: FnOnce(&T, u64) -> Result<(), TryFromIntError>,
+    >(
+        atomic: &T,
+        change: i64,
+        load: L,
+        store: S,
+    ) -> io::Result<u64> {
+        // load + store is OK without concurrent writers
+        let old = load(atomic);
+
+        let new = if change > 0 {
+            old.checked_add(change as u64)
+        } else {
+            old.checked_sub(-change as u64)
+        };
+        let new = new.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Changing refcount from {old} by {change} would overflow"),
+            )
+        })?;
+
+        store(atomic, new).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Changing refcount from {old} to {new} (by {change}) would overflow"),
+            )
+        })?;
+
+        Ok(old)
+    }
+
+    /// Modify the given cluster’s refcount.
+    fn modify(&mut self, index: usize, change: i64) -> io::Result<u64> {
+        let result = match self.rb.refcount_order {
+            // refcount_bits == 1
+            0 => {
+                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u8>() };
+                let atomic = unsafe {
+                    AtomicU8::from_ptr(&raw_data_slice[index / 8] as *const u8 as *mut u8)
+                };
+                // Safe: `RefBlockWriteGuard` ensures there are no concurrent writers.
+                unsafe { Self::fetch_update_bitset(atomic, change, 0b1, index % 8) }
+            }
+
+            // refcount_bits == 2
+            1 => {
+                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u8>() };
+                let atomic = unsafe {
+                    AtomicU8::from_ptr(&raw_data_slice[index / 4] as *const u8 as *mut u8)
+                };
+                // Safe: `RefBlockWriteGuard` ensures there are no concurrent writers.
+                unsafe { Self::fetch_update_bitset(atomic, change, 0b11, index % 4) }
+            }
+
+            // refcount_bits == 4
+            2 => {
+                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u8>() };
+                let atomic = unsafe {
+                    AtomicU8::from_ptr(&raw_data_slice[index / 2] as *const u8 as *mut u8)
+                };
+                // Safe: `RefBlockWriteGuard` ensures there are no concurrent writers.
+                unsafe { Self::fetch_update_bitset(atomic, change, 0b1111, index % 2) }
+            }
+
+            // refcount_bits == 8
+            3 => {
+                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u8>() };
+                let atomic =
+                    unsafe { AtomicU8::from_ptr(&raw_data_slice[index] as *const u8 as *mut u8) };
+                // Safe: `RefBlockWriteGuard` ensures there are no concurrent writers.
+                unsafe {
+                    Self::fetch_update_full(
+                        atomic,
+                        change,
+                        |a| a.load(Ordering::Relaxed) as u64,
+                        |a, v| {
+                            a.store(v.try_into()?, Ordering::Relaxed);
+                            Ok(())
+                        },
+                    )
+                }
+            }
+
+            // refcount_bits == 16
+            4 => {
+                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u16>() };
+                let atomic = unsafe {
+                    AtomicU16::from_ptr(&raw_data_slice[index] as *const u16 as *mut u16)
+                };
+                unsafe {
+                    Self::fetch_update_full(
+                        atomic,
+                        change,
+                        |a| u16::from_be(a.load(Ordering::Relaxed)) as u64,
+                        |a, v| {
+                            a.store(u16::try_from(v)?.to_be(), Ordering::Relaxed);
+                            Ok(())
+                        },
+                    )
+                }
+            }
+
+            // refcount_bits == 32
+            5 => {
+                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u32>() };
+                let atomic = unsafe {
+                    AtomicU32::from_ptr(&raw_data_slice[index] as *const u32 as *mut u32)
+                };
+                unsafe {
+                    Self::fetch_update_full(
+                        atomic,
+                        change,
+                        |a| u32::from_be(a.load(Ordering::Relaxed)) as u64,
+                        |a, v| {
+                            a.store(u32::try_from(v)?.to_be(), Ordering::Relaxed);
+                            Ok(())
+                        },
+                    )
+                }
+            }
+
+            // refcount_bits == 64
+            6 => {
+                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u64>() };
+                let atomic = unsafe {
+                    AtomicU64::from_ptr(&raw_data_slice[index] as *const u64 as *mut u64)
+                };
+                unsafe {
+                    Self::fetch_update_full(
+                        atomic,
+                        change,
+                        |a| u64::from_be(a.load(Ordering::Relaxed)),
+                        |a, v| {
+                            a.store(v.to_be(), Ordering::Relaxed);
+                            Ok(())
+                        },
+                    )
+                }
+            }
+
+            _ => unreachable!(),
+        };
+
+        let result = result?;
+        self.rb.modified.store(true, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    /// Increment the given cluster’s refcount.
+    ///
+    /// Returns the old value.
+    pub fn increment(&mut self, index: usize) -> io::Result<u64> {
+        self.modify(index, 1)
+    }
+
+    /// Decrement the given cluster’s refcount.
+    ///
+    /// Returns the old value.
+    pub fn decrement(&mut self, index: usize) -> io::Result<u64> {
+        self.modify(index, -1)
+    }
+
+    /// Get the given cluster’s refcount.
+    pub fn get(&self, index: usize) -> u64 {
+        self.rb.get(index)
+    }
+
+    /// Check whether the given cluster’s refcount is 0.
+    pub fn is_zero(&self, index: usize) -> bool {
+        self.rb.is_zero(index)
+    }
+}
+
+impl Drop for RefBlock {
+    fn drop(&mut self) {
+        if self.is_modified() {
+            error!(
+                "Refcount block dropped while modified; was the image closed before being flushed?"
+            );
+        }
+    }
 }
 
 /// Generic trait for qcow2 table entries (L1, L2, refcount table).
 pub trait TableEntry
 where
-    Self: Copy + Sized,
+    Self: Sized,
 {
     /// Load the given raw value, checking it for validity.
     fn try_from_plain(value: u64, header: &Header) -> io::Result<Self>;
 
     /// Return the contained raw value.
-    fn into_plain(self) -> u64;
+    fn to_plain(&self) -> u64;
 }
 
 /// Generic trait for qcow2 metadata tables (L1, L2, refcount table).
 pub trait Table: Sized {
-    /// Type for each table entry.
-    type Entry: TableEntry;
+    /// Internal type for each table entry.
+    type InternalEntry: TableEntry;
+    /// Externally visible type for each table entry.
+    type Entry: Copy;
 
     /// Create a new table with the given contents
-    fn from_data(data: Box<[Self::Entry]>, header: &Header) -> Self;
+    fn from_data(data: Box<[Self::InternalEntry]>, header: &Header) -> Self;
 
     /// Number of entries.
     fn entries(&self) -> usize;
-    /// Get the given entry.
+    /// Get the given entry (as reference).
+    fn get_ref(&self, index: usize) -> &Self::InternalEntry;
+    /// Get the given entry (copied).
     fn get(&self, index: usize) -> Self::Entry;
-    /// Modify the given entry.
-    fn set(&mut self, index: usize, value: Self::Entry);
     /// Get this table’s (first) cluster in the image file.
     fn get_cluster(&self) -> Option<HostCluster>;
     /// Get this table’s offset in the image file.
@@ -2066,9 +2351,9 @@ pub trait Table: Sized {
         // Safe because `u64` is a plain type, and the alignment fits
         let raw_table = unsafe { buffer.as_ref().into_typed_slice::<u64>() };
 
-        let mut table = Vec::<Self::Entry>::with_capacity(entries);
+        let mut table = Vec::<Self::InternalEntry>::with_capacity(entries);
         for be_value in raw_table {
-            table.push(Self::Entry::try_from_plain(
+            table.push(Self::InternalEntry::try_from_plain(
                 u64::from_be(*be_value),
                 header,
             )?)
@@ -2094,7 +2379,7 @@ pub trait Table: Sized {
         // Safe because we have just allocated this, and it fits the alignment
         let raw_table = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
         for (i, be_value) in raw_table.iter_mut().enumerate() {
-            *be_value = self.get(i).into_plain().to_be();
+            *be_value = self.get_ref(i).to_plain().to_be();
         }
 
         image.write(&buffer, offset.0).await?;
@@ -2135,7 +2420,7 @@ pub trait Table: Sized {
         let first_index = (index / alignment_in_entries) * alignment_in_entries;
         #[allow(clippy::needless_range_loop)]
         for i in 0..alignment_in_entries {
-            raw_entries[i] = self.get(first_index + i).into_plain().to_be();
+            raw_entries[i] = self.get_ref(first_index + i).to_plain().to_be();
         }
 
         image

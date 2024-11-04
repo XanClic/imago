@@ -54,7 +54,7 @@ use std::ops::{Deref, DerefMut};
 // implemented, though, but return an error if it is not.  Doing that probably requires
 // specialization, though.
 #[derive(Debug)]
-pub struct Annotated<Tag: Debug + Default + Display, S: Storage> {
+pub struct Annotated<Tag: Debug + Default + Display + Send + Sync, S: Storage> {
     /// Wrapped storage object.
     inner: S,
 
@@ -62,7 +62,7 @@ pub struct Annotated<Tag: Debug + Default + Display, S: Storage> {
     tag: Tag,
 }
 
-impl<T: Debug + Default + Display, S: Storage> Annotated<T, S> {
+impl<T: Debug + Default + Display + Send + Sync, S: Storage> Annotated<T, S> {
     /// Wrap `storage`, adding the tag `tag`.
     pub fn new(storage: S, tag: T) -> Self {
         Annotated {
@@ -82,13 +82,13 @@ impl<T: Debug + Default + Display, S: Storage> Annotated<T, S> {
     }
 }
 
-impl<T: Debug + Default + Display, S: Storage> From<S> for Annotated<T, S> {
+impl<T: Debug + Default + Display + Send + Sync, S: Storage> From<S> for Annotated<T, S> {
     fn from(storage: S) -> Self {
         Self::new(storage, T::default())
     }
 }
 
-impl<T: Debug + Default + Display, S: Storage> Storage for Annotated<T, S> {
+impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotated<T, S> {
     async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
         Ok(S::open(opts).await?.into())
     }
@@ -126,7 +126,7 @@ impl<T: Debug + Default + Display, S: Storage> Storage for Annotated<T, S> {
     }
 }
 
-impl<T: Debug + Default + Display, S: Storage> Deref for Annotated<T, S> {
+impl<T: Debug + Default + Display + Send + Sync, S: Storage> Deref for Annotated<T, S> {
     type Target = S;
 
     fn deref(&self) -> &S {
@@ -134,13 +134,13 @@ impl<T: Debug + Default + Display, S: Storage> Deref for Annotated<T, S> {
     }
 }
 
-impl<T: Debug + Default + Display, S: Storage> DerefMut for Annotated<T, S> {
+impl<T: Debug + Default + Display + Send + Sync, S: Storage> DerefMut for Annotated<T, S> {
     fn deref_mut(&mut self) -> &mut S {
         &mut self.inner
     }
 }
 
-impl<T: Debug + Default + Display, S: Storage> Display for Annotated<T, S> {
+impl<T: Debug + Default + Display + Send + Sync, S: Storage> Display for Annotated<T, S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "annotated({})[{}]", self.tag, self.inner)
     }

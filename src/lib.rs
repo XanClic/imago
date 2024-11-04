@@ -1,3 +1,4 @@
+// #![feature(async_drop)] -- enable with async-drop
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
@@ -58,9 +59,20 @@
 //!
 //! let mut buf = vec![0u8; 512];
 //! qcow2.read(&mut buf, 0).await?;
+//!
+//! qcow2.flush().await?;
 //! # Ok::<(), std::io::Error>(())
 //! # };
 //! ```
+//!
+//! # Flushing
+//!
+//! Given that `AsyncDrop` is not stable yet (and probably will not be stable for a long time),
+//! callers must ensure that images are properly flushed before dropping them, i.e. call
+//! `.flush().await` on any image that is not read-only.
+//!
+//! (The synchronous wrapper [`SyncFormatAccess`] does perform a synchronous flush in its `Drop`
+//! implementation.)
 //!
 //! # Features
 //!
@@ -69,6 +81,7 @@
 //!   interface is definitely preferred.
 
 pub mod annotated;
+mod async_lru_cache;
 pub mod file;
 pub mod format;
 pub mod io_buffers;

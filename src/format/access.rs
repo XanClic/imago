@@ -356,10 +356,13 @@ impl<S: Storage> FormatAccess<S> {
         self.writev(buf.into(), offset).await
     }
 
-    /// Flush internal buffers.
+    /// Flush internal buffers.  Always call this before drop!
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
     /// you want to call `sync()` afterwards.
+    ///
+    /// Because of the current lack of stable `async_drop`, you must manually call this before
+    /// dropping a `FormatAccess` instance!  (Not necessarily for read-only images, though.)
     #[allow(async_fn_in_trait)] // No need for Send
     pub async fn flush(&self) -> io::Result<()> {
         self.inner.flush().await
@@ -410,3 +413,19 @@ impl<S: Storage> Display for Mapping<'_, S> {
         }
     }
 }
+
+/*
+#[cfg(feature = "async-drop")]
+impl<S: Storage> std::future::AsyncDrop for FormatAccess<S> {
+    type Dropper<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> where S: 'a;
+
+    fn async_drop(self: std::pin::Pin<&mut Self>) -> Self::Dropper<'_> {
+        Box::pin(async move {
+            if let Err(err) = self.flush().await {
+                let inner = &self.inner;
+                tracing::error!("Failed to flush {inner}: {err}");
+            }
+        })
+    }
+}
+*/

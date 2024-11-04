@@ -16,7 +16,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         mut bufv: IoVectorMut<'_>,
         mut offset: GuestOffset,
     ) -> io::Result<()> {
-        let mut saved_l2_table = None;
+        let mut saved_l2_table: Option<Arc<L2Table>> = None;
         let cb = self.header.cluster_bits();
 
         // Do everything cluster by cluster.

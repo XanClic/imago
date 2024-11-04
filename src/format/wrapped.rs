@@ -13,7 +13,7 @@ use std::ops::Deref;
 ///
 /// This struct is necessary so that we can reference format instances regardless of whether the
 /// user decides to wrap them or not.
-pub trait WrappedFormat<S: Storage>: Debug + Display {
+pub trait WrappedFormat<S: Storage>: Debug + Display + Send + Sync {
     /// Construct this `WrappedFormat`.
     fn wrap(inner: FormatAccess<S>) -> Self;
 
@@ -21,8 +21,10 @@ pub trait WrappedFormat<S: Storage>: Debug + Display {
     fn unwrap(&self) -> &FormatAccess<S>;
 }
 
-impl<S: Storage, D: Deref<Target = FormatAccess<S>> + Debug + Display + From<FormatAccess<S>>>
-    WrappedFormat<S> for D
+impl<
+        S: Storage,
+        D: Deref<Target = FormatAccess<S>> + Debug + Display + From<FormatAccess<S>> + Send + Sync,
+    > WrappedFormat<S> for D
 {
     fn wrap(inner: FormatAccess<S>) -> Self {
         Self::from(inner)

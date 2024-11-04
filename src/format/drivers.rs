@@ -11,7 +11,7 @@ use std::io;
 
 /// Implementation of a disk image format.
 #[async_trait(?Send)]
-pub trait FormatDriverInstance: Debug + Display {
+pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// Type of storage used.
     type Storage: Storage;
 

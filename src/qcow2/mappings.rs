@@ -40,9 +40,6 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ) -> io::Result<(Mapping<'_, S>, u64)> {
         let cb = self.header.cluster_bits();
 
-        // FIXME
-        let _cow_lock = self.cow_lock.read().await;
-
         // Get mapping at `offset`
         let mut current_guest_cluster = offset.cluster(cb);
         let first_mapping = l2_table.get_mapping(current_guest_cluster)?;
@@ -110,12 +107,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&'_ S, u64, u64)> {
-        let mut l2_table = self.ensure_l2(offset).await?;
+        let l2_table = self.ensure_l2(offset).await?;
 
         // TODO: Is there a more optimized way?
-        // We do not want to write-lock the COW guard until we need to.  But upgrading the COW lock
-        // from Read to Write is not possible; so once we drop the Read variant, we will need to
-        // re-check the whole table anyway.
+        // We do not want to write-lock the L2 table until we need to.  But getting a Write lock
+        // that would ensure no modifications happened since we checked last (while not having a
+        // lock yet) is not possible.
         // FWIW, this is a fast path for already-present allocations, so not too terrible.
         let existing = self
             .do_get_mapping_with_l2(offset, length, &l2_table)
@@ -129,8 +126,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             return Ok((storage, offset, existing.1));
         }
 
-        // FIXME
-        let cow_lock = self.cow_lock.write().await;
+        let l2_table = l2_table.lock_write().await;
         let mut leaked_allocations = Vec::<(HostCluster, ClusterCount)>::new();
 
         let res = self
@@ -138,17 +134,10 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 offset,
                 length,
                 overwrite,
-                &mut l2_table,
+                l2_table,
                 &mut leaked_allocations,
             )
             .await;
-
-        if l2_table.is_modified() {
-            // TODO: What to do on error?  Currently, we just accept that clusters will be leaked
-            // and we will have to reload the table from disk.
-            l2_table.write(&self.metadata).await?;
-        }
-        drop(cow_lock);
 
         for alloc in leaked_allocations {
             self.free_data_clusters(alloc.0, alloc.1).await;
@@ -158,24 +147,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         Ok((self.storage(), host_offset, length))
     }
 
-    /// Load the L2 table in `l2_cluster`.
-    async fn load_l2(&self, l2_cluster: HostCluster) -> io::Result<L2Table> {
-        L2Table::load(
-            &self.metadata,
-            &self.header,
-            l2_cluster,
-            self.header.l2_entries(),
-        )
-        .await
-    }
-
     /// Get the L2 table referenced by the given L1 table index, if any.
     ///
     /// If the L1 table index does not point to any L2 table, return `Ok(None)`.
-    pub(super) async fn get_l2(&self, offset: GuestOffset) -> io::Result<Option<L2Table>> {
+    pub(super) async fn get_l2(&self, offset: GuestOffset) -> io::Result<Option<Arc<L2Table>>> {
         let cb = self.header.cluster_bits();
 
-        // TODO: Cache L2s
         let l1_entry = self.l1_table.read().await.get(offset.l1_index(cb));
         if let Some(l2_offset) = l1_entry.l2_offset() {
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
@@ -184,7 +161,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     format!("Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"),
                 )
             })?;
-            self.load_l2(l2_cluster).await.map(Some)
+
+            self.l2_cache.get_or_insert(l2_cluster).await.map(Some)
         } else {
             Ok(None)
         }
@@ -194,7 +172,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// If there already is an L2 table at that index, return it.  Otherwise, create one and hook
     /// it up.
-    pub(super) async fn ensure_l2(&self, offset: GuestOffset) -> io::Result<L2Table> {
+    pub(super) async fn ensure_l2(&self, offset: GuestOffset) -> io::Result<Arc<L2Table>> {
         let cb = self.header.cluster_bits();
 
         if let Some(l2) = self.get_l2(offset).await? {
@@ -220,17 +198,23 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 )
             })?;
 
-            return self.load_l2(l2_cluster).await;
+            return self.l2_cache.get_or_insert(l2_cluster).await;
         }
 
         let l2_cluster = self.allocate_meta_cluster().await?;
         let mut l2_table = L2Table::new_cleared(&self.header);
         l2_table.set_cluster(l2_cluster);
-        l2_table.write(&self.metadata).await?;
+        l2_table.write(self.metadata.as_ref()).await?;
 
         l1_locked.enter_l2_table(l1_index, &l2_table)?;
-        l1_locked.write_entry(&self.metadata, l1_index).await?;
+        l1_locked
+            .write_entry(self.metadata.as_ref(), l1_index)
+            .await?;
 
+        let l2_table = Arc::new(l2_table);
+        self.l2_cache
+            .insert(l2_cluster, Arc::clone(&l2_table))
+            .await?;
         Ok(l2_table)
     }
 
@@ -251,10 +235,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .await?;
 
         new_l1.set_cluster(l1_start);
-        new_l1.write(&self.metadata).await?;
+        new_l1.write(self.metadata.as_ref()).await?;
 
         self.header.set_l1_table(&new_l1)?;
-        self.header.write_l1_table_pointer(&self.metadata).await?;
+        self.header
+            .write_l1_table_pointer(self.metadata.as_ref())
+            .await?;
 
         if let Some(old_l1_cluster) = l1_locked.get_cluster() {
             let old_l1_size = l1_locked.cluster_count(cb);
@@ -279,7 +265,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         offset: GuestOffset,
         full_length: u64,
         overwrite: bool,
-        l2_table: &mut L2Table,
+        mut l2_table: L2TableWriteGuard<'_>,
         leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
     ) -> io::Result<(u64, u64)> {
         let cb = self.header.cluster_bits();
@@ -298,7 +284,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 current_guest_cluster,
                 None,
                 partial_skip_cow,
-                l2_table,
+                &mut l2_table,
                 leaked_allocations,
             )
             .await?
@@ -323,7 +309,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     current_guest_cluster,
                     Some(next_host_cluster),
                     partial_skip_cow,
-                    l2_table,
+                    &mut l2_table,
                     leaked_allocations,
                 )
                 .await?;

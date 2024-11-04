@@ -40,7 +40,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         cluster: GuestCluster,
         mandatory_host_cluster: Option<HostCluster>,
         partial_skip_cow: Option<Range<usize>>,
-        l2_table: &mut L2Table,
+        l2_table: &mut L2TableWriteGuard<'_>,
         leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
     ) -> io::Result<Option<HostCluster>> {
         // No need to do COW when writing the full cluster

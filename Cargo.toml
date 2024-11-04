@@ -26,4 +26,5 @@ windows-sys = { version = "0.59", features = [
 
 [features]
 default = []
+# async-drop = []
 sync-wrappers = []
