@@ -149,21 +149,6 @@ impl Allocator {
         })
     }
 
-    /// Get `cluster`’s index in its refcount block.
-    fn cluster_to_rb_index(&self, cluster: HostCluster) -> usize {
-        (cluster.0 % (self.header.rb_entries() as u64)) as usize
-    }
-
-    /// Get the refcount table entry index covering `cluster`.
-    fn cluster_to_rt_index(&self, cluster: HostCluster) -> usize {
-        (cluster.0 >> self.header.rb_bits()) as usize
-    }
-
-    /// Construct a cluster index from its reftable and refblock indices.
-    fn cluster_from_ref_indices(&self, rt_index: usize, rb_index: usize) -> HostCluster {
-        HostCluster(((rt_index as u64) << self.header.rb_bits()) + rb_index as u64)
-    }
-
     /// Allocate clusters in the image file.
     async fn allocate_clusters<S: Storage>(
         &mut self,
@@ -234,8 +219,8 @@ impl Allocator {
         image: &S,
         index: HostCluster,
     ) -> io::Result<bool> {
-        let rt_index = self.cluster_to_rt_index(index);
-        let rb_index = self.cluster_to_rb_index(index);
+        let rb_bits = self.header.rb_bits();
+        let (rt_index, rb_index) = index.rt_rb_indices(rb_bits);
 
         let mut rb = self.ensure_rb(image, rt_index).await?;
         if !rb.is_zero(rb_index) {
@@ -300,7 +285,11 @@ impl Allocator {
 
         // When allocating new refblocks, we always place them such that they describe themselves.
         // TODO: There may be more efficient ways, this is just quite an easy one.
-        rb.set_cluster(self.cluster_from_ref_indices(rt_index, 0));
+        rb.set_cluster(HostCluster::from_ref_indices(
+            rt_index,
+            0,
+            self.header.rb_bits(),
+        ));
         rb.increment(0)?;
         rb.write(image).await?;
 
@@ -321,13 +310,14 @@ impl Allocator {
         at_least_index: usize,
     ) -> io::Result<()> {
         let cb = self.header.cluster_bits();
+        let rb_bits = self.header.rb_bits();
+        let rb_entries = 1 << rb_bits;
 
         let mut new_rt = self.reftable.clone_and_grow(&self.header, at_least_index);
         let rt_clusters = ClusterCount::from_byte_size(self.reftable.byte_size(), cb);
 
         // Find free range
-        let mut rt_index = self.cluster_to_rt_index(self.first_free_cluster);
-        let mut rb_index = self.cluster_to_rb_index(self.first_free_cluster);
+        let (mut rt_index, mut rb_index) = self.first_free_cluster.rt_rb_indices(rb_bits);
         let mut free_cluster_index: Option<HostCluster> = None;
         let mut free_cluster_count = ClusterCount(0);
 
@@ -341,9 +331,9 @@ impl Allocator {
 
             let rt_entry = new_rt.get(rt_index);
             let Some(rb_offset) = rt_entry.refblock_offset() else {
-                let start_index = self.cluster_from_ref_indices(rt_index, 0);
+                let start_index = HostCluster::from_ref_indices(rt_index, 0, rb_bits);
                 free_cluster_index.get_or_insert(start_index);
-                free_cluster_count += ClusterCount(self.header.rb_entries());
+                free_cluster_count += ClusterCount(rb_entries);
                 // Need to allocate this RB
                 required_clusters += ClusterCount(1);
                 continue;
@@ -357,9 +347,9 @@ impl Allocator {
             })?;
 
             let rb = self.load_rb(image, rb_cluster).await?;
-            for i in rb_index..self.header.rb_entries() {
+            for i in rb_index..rb_entries {
                 if rb.is_zero(i) {
-                    let index = self.cluster_from_ref_indices(rt_index, i);
+                    let index = HostCluster::from_ref_indices(rt_index, i, rb_bits);
                     free_cluster_index.get_or_insert(index);
                     free_cluster_count += ClusterCount(1);
 
@@ -381,8 +371,8 @@ impl Allocator {
         let mut count = required_clusters;
 
         // Put refblocks first
-        let rt_index_start = self.cluster_to_rt_index(index);
-        let rt_index_end = (index + count).0.div_ceil(self.header.rb_entries() as u64) as usize;
+        let rt_index_start = index.rt_index(rb_bits);
+        let rt_index_end = (index + count).0.div_ceil(rb_entries as u64) as usize;
 
         let mut refblocks = Vec::<RefBlock>::new();
         for rt_i in rt_index_start..rt_index_end {
@@ -411,13 +401,12 @@ impl Allocator {
 
         for index in start_index.0..end_index.0 {
             let index = HostCluster(index);
+            let (rt_i, rb_i) = index.rt_rb_indices(rb_bits);
 
             // `refblocks[0]` is for `rt_index_start`
-            let rb_vec_i = self.cluster_to_rt_index(index) - rt_index_start;
+            let rb_vec_i = rt_i - rt_index_start;
             // Incrementing from 0 to 1 must succeed
-            refblocks[rb_vec_i]
-                .increment(self.cluster_to_rb_index(index))
-                .unwrap();
+            refblocks[rb_vec_i].increment(rb_i).unwrap();
         }
 
         // Any errors from here on may lead to leaked clusters if there are refblocks in
@@ -456,9 +445,9 @@ impl Allocator {
             self.first_free_cluster = start;
         }
 
-        let rb_entries = self.header.rb_entries();
-        let mut rb_index = self.cluster_to_rb_index(start);
-        let mut rt_index = self.cluster_to_rt_index(start);
+        let rb_bits = self.header.rb_bits();
+        let rb_entries = 1 << rb_bits;
+        let (mut rt_index, mut rb_index) = start.rt_rb_indices(rb_bits);
 
         while count > ClusterCount(0) {
             let in_rb_count = cmp::min(rb_entries - rb_index, count.0);

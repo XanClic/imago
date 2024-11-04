@@ -141,6 +141,27 @@ impl HostCluster {
         HostOffset(self.0 << cluster_bits)
     }
 
+    /// Get this cluster’s index in its refcount block.
+    pub fn rb_index(self, rb_bits: u32) -> usize {
+        let rb_entries = 1 << rb_bits;
+        (self.0 % rb_entries) as usize
+    }
+
+    /// Get this cluster’s refcount block’s index in the refcount table.
+    pub fn rt_index(self, rb_bits: u32) -> usize {
+        (self.0 >> rb_bits) as usize
+    }
+
+    /// Get both the reftable and refblock indices for this cluster.
+    pub fn rt_rb_indices(self, rb_bits: u32) -> (usize, usize) {
+        (self.rt_index(rb_bits), self.rb_index(rb_bits))
+    }
+
+    /// Construct a cluster index from its reftable and refblock indices.
+    pub fn from_ref_indices(rt_index: usize, rb_index: usize, rb_bits: u32) -> Self {
+        HostCluster(((rt_index as u64) << rb_bits) + rb_index as u64)
+    }
+
     /// Returns the host offset corresponding to `guest_offset`.
     ///
     /// Assuming `guest_offset.cluster()` is mapped to `self`, return the exact host offset
