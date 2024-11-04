@@ -143,6 +143,22 @@ impl<S: Storage> SyncFormatAccess<S> {
     pub fn write<'a>(&'a self, buf: impl Into<IoVector<'a>>, offset: u64) -> io::Result<()> {
         self.writev(buf.into(), offset)
     }
+
+    /// Flush internal buffers.
+    ///
+    /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
+    /// you want to call `sync()` afterwards.
+    pub fn flush(&self) -> io::Result<()> {
+        self.runtime.block_on(self.inner.flush())
+    }
+
+    /// Sync data already written to the storage hardware.
+    ///
+    /// This does not necessarily include flushing internal buffers, i.e. `flush`.  When using
+    /// `sync()`, consider whether you want to call `flush()` before it.
+    pub fn sync(&self) -> io::Result<()> {
+        self.runtime.block_on(self.inner.sync())
+    }
 }
 
 impl<S: Storage> TryFrom<FormatAccess<S>> for SyncFormatAccess<S> {

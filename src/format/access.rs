@@ -355,6 +355,24 @@ impl<S: Storage> FormatAccess<S> {
     pub async fn write(&self, buf: impl Into<IoVector<'_>>, offset: u64) -> io::Result<()> {
         self.writev(buf.into(), offset).await
     }
+
+    /// Flush internal buffers.
+    ///
+    /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
+    /// you want to call `sync()` afterwards.
+    #[allow(async_fn_in_trait)] // No need for Send
+    pub async fn flush(&self) -> io::Result<()> {
+        self.inner.flush().await
+    }
+
+    /// Sync data already written to the storage hardware.
+    ///
+    /// This does not necessarily include flushing internal buffers, i.e. `flush`.  When using
+    /// `sync()`, consider whether you want to call `flush()` before it.
+    #[allow(async_fn_in_trait)] // No need for Send
+    pub async fn sync(&self) -> io::Result<()> {
+        self.inner.sync().await
+    }
 }
 
 impl<S: Storage> Mapping<'_, S> {

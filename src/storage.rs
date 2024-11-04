@@ -101,6 +101,20 @@ pub trait Storage: Debug + Display + Sized {
     async fn discard(&self, _offset: u64, _length: u64) -> io::Result<()> {
         Ok(())
     }
+
+    /// Flush internal buffers.
+    ///
+    /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
+    /// you want to call `sync()` afterwards.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn flush(&self) -> io::Result<()>;
+
+    /// Sync data already written to the storage hardware.
+    ///
+    /// This does not necessarily include flushing internal buffers, i.e. `flush`.  When using
+    /// `sync()`, consider whether you want to call `flush()` before it.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn sync(&self) -> io::Result<()>;
 }
 
 /// Helper methods for storage objects.
@@ -240,6 +254,12 @@ pub trait DynStorage: Debug + Display {
         offset: u64,
         length: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
+    /// Object-safe wrapper around [`Storage::flush()`].
+    fn flush(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
+    /// Object-safe wrapper around [`Storage::sync()`].
+    fn sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 }
 
 impl<S: Storage> StorageExt for S {}
@@ -271,6 +291,14 @@ impl<S: Storage> Storage for &S {
 
     async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
         (*self).discard(offset, length).await
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        (*self).flush().await
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        (*self).sync().await
     }
 }
 
@@ -318,6 +346,14 @@ impl<S: Storage> DynStorage for S {
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
         Box::pin(S::discard(self, offset, length))
     }
+
+    fn flush(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(S::flush(self))
+    }
+
+    fn sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(S::sync(self))
+    }
 }
 
 impl Storage for Box<dyn DynStorage> {
@@ -355,6 +391,14 @@ impl Storage for Box<dyn DynStorage> {
     async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
         <Self as DynStorage>::discard(self, offset, length).await
     }
+
+    async fn flush(&self) -> io::Result<()> {
+        <Self as DynStorage>::flush(self).await
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        <Self as DynStorage>::sync(self).await
+    }
 }
 
 impl Storage for Arc<dyn DynStorage> {
@@ -391,6 +435,14 @@ impl Storage for Arc<dyn DynStorage> {
 
     async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
         <Self as DynStorage>::discard(self, offset, length).await
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        <Self as DynStorage>::flush(self).await
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        <Self as DynStorage>::sync(self).await
     }
 }
 

@@ -4,7 +4,7 @@ use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::{Storage, StorageOpenOptions};
 use std::fmt::{self, Display, Formatter};
 use std::fs;
-use std::io::{self, Seek, SeekFrom};
+use std::io::{self, Seek, SeekFrom, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -271,6 +271,14 @@ impl Storage for File {
         }
 
         Ok(())
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        self.file.write().unwrap().flush()
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        self.file.write().unwrap().sync_all()
     }
 }
 

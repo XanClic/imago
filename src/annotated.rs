@@ -116,6 +116,14 @@ impl<T: Debug + Default + Display, S: Storage> Storage for Annotated<T, S> {
     async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         self.inner.write_zeroes(offset, length).await
     }
+
+    async fn flush(&self) -> io::Result<()> {
+        self.inner.flush().await
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        self.inner.sync().await
+    }
 }
 
 impl<T: Debug + Default + Display, S: Storage> Deref for Annotated<T, S> {

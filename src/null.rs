@@ -52,6 +52,16 @@ impl Storage for Null {
         self.size.fetch_max(end, Ordering::Relaxed);
         Ok(())
     }
+
+    async fn flush(&self) -> io::Result<()> {
+        // Nothing to do, there are no buffers
+        Ok(())
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        // Nothing to do, there is no hardware
+        Ok(())
+    }
 }
 
 impl Display for Null {

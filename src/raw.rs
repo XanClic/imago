@@ -106,6 +106,15 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
 
         Ok((&self.inner, offset, length))
     }
+
+    async fn flush(&self) -> io::Result<()> {
+        // No internal buffers to flush
+        self.inner.flush().await
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        self.inner.sync().await
+    }
 }
 
 impl<S: Storage> Display for Raw<S> {

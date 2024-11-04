@@ -70,6 +70,17 @@ pub trait FormatDriverInstance: Debug + Display {
     async fn readv_special(&self, _bufv: IoVectorMut<'_>, _offset: u64) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
+
+    /// Flush internal buffers.
+    ///
+    /// Does not need to ensure those buffers are synced to disk (hardware).
+    async fn flush(&self) -> io::Result<()>;
+
+    /// Sync data already written to the storage hardware.
+    ///
+    /// Does not need to ensure internal buffers are written, i.e. should generally just be passed
+    /// through to `Storage::sync()` for all underlying storage objects.
+    async fn sync(&self) -> io::Result<()>;
 }
 
 /// Non-recursive mapping information.

@@ -358,6 +358,25 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         let offset = GuestOffset(offset);
         self.do_readv_special(bufv, offset).await
     }
+
+    async fn flush(&self) -> io::Result<()> {
+        // No internal buffers to flush yet.
+        self.metadata.flush().await?;
+        if let Some(storage) = self.storage.as_ref() {
+            storage.flush().await?;
+        }
+        // Backing file is read-only, so need not be flushed from us.
+        Ok(())
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        self.metadata.sync().await?;
+        if let Some(storage) = self.storage.as_ref() {
+            storage.sync().await?;
+        }
+        // Backing file is read-only, so need not be synced from us.
+        Ok(())
+    }
 }
 
 impl<S: Storage + 'static, F: WrappedFormat<S>> Debug for Qcow2<S, F> {
