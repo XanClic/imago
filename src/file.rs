@@ -5,7 +5,7 @@ use crate::{Storage, StorageOpenOptions};
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::{self, Seek, SeekFrom};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -13,8 +13,14 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::sync::RwLock;
+#[cfg(windows)]
+use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// Use a plain file as storage objects.
 #[derive(Debug)]
@@ -161,6 +167,142 @@ impl Storage for File {
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.try_discard_by_truncate(offset, length)? {
+            return Ok(());
+        }
+
+        // If offset or length are too big, just skip discarding.
+        let Ok(offset) = libc::off_t::try_from(offset) else {
+            return Ok(());
+        };
+        let Ok(length) = libc::off_t::try_from(length) else {
+            return Ok(());
+        };
+
+        let file = self.file.read().unwrap();
+        // Safe: File descriptor is valid, and the rest are simple integer parameters.
+        let ret = unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset,
+                length,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.try_discard_by_truncate(offset, length)? {
+            return Ok(());
+        }
+
+        // If offset or length are too big, just skip discarding.
+        let Ok(offset) = i64::try_from(offset) else {
+            return Ok(());
+        };
+        let Ok(length) = i64::try_from(length) else {
+            return Ok(());
+        };
+
+        let end = offset.saturating_add(length).saturating_add(1);
+        let params = FILE_ZERO_DATA_INFORMATION {
+            FileOffset: offset,
+            BeyondFinalZero: end,
+        };
+        let mut _returned = 0;
+        let file = self.file.read().unwrap();
+        // Safe: File handle is valid, mandatory pointers (input, returned length) are passed and
+        // valid, the parameter type matches the call, and the input size matches the object
+        // passed.
+        let ret = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_SET_ZERO_DATA,
+                (&params as *const FILE_ZERO_DATA_INFORMATION).cast::<std::ffi::c_void>(),
+                size_of_val(&params) as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut _returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.try_discard_by_truncate(offset, length)? {
+            return Ok(());
+        }
+
+        // If offset or length are too big, just skip discarding.
+        let Ok(offset) = libc::off_t::try_from(offset) else {
+            return Ok(());
+        };
+        let Ok(length) = libc::off_t::try_from(length) else {
+            return Ok(());
+        };
+
+        let params = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: offset,
+            fp_length: length,
+        };
+        let file = self.file.read().unwrap();
+        // Safe: FD is valid, passed pointer is valid and its type matches the call.
+        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+}
+
+impl File {
+    /// Attempt to discard range by truncating the file.
+    ///
+    /// If the given range is at the end of the file, discard it by simply truncating the file.
+    /// Return `true` on success.
+    ///
+    /// If the range is not at the end of the file, i.e. another method of discarding is needed,
+    /// return `false`.
+    fn try_discard_by_truncate(&self, offset: u64, length: u64) -> io::Result<bool> {
+        let mut file = self.file.write().unwrap();
+        let Ok(size) = file.seek(SeekFrom::End(0)) else {
+            // Failed to get length?  Try normal discard.
+            return Ok(false);
+        };
+
+        if offset >= size {
+            // Nothing to do
+            return Ok(true);
+        }
+
+        // If `offset + length` overflows, we can just assume it ends at `size`.  (Anything past
+        // `size is irrelevant anyway.)
+        let end = offset.checked_add(length).unwrap_or(size);
+        if end < size {
+            return Ok(false);
+        }
+
+        file.set_len(offset)?;
+        Ok(true)
     }
 }
 

@@ -90,6 +90,17 @@ pub trait Storage: Debug + Display + Sized {
 
         Ok(())
     }
+
+    /// Discard the given range, with undefined contents when read back.
+    ///
+    /// Tell the storage layer this range is no longer needed and need not be backed by actual
+    /// storage.  When read back, the data read will be undefined, i.e. not necessarily zeroes.
+    ///
+    /// No-op implementations therefore explicitly fulfill the interface contract.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn discard(&self, _offset: u64, _length: u64) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Helper methods for storage objects.
@@ -222,6 +233,13 @@ pub trait DynStorage: Debug + Display {
         offset: u64,
         length: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
+    /// Object-safe wrapper around [`Storage::discard()`].
+    fn discard(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 }
 
 impl<S: Storage> StorageExt for S {}
@@ -249,6 +267,10 @@ impl<S: Storage> Storage for &S {
 
     async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         (*self).write_zeroes(offset, length).await
+    }
+
+    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        (*self).discard(offset, length).await
     }
 }
 
@@ -288,6 +310,14 @@ impl<S: Storage> DynStorage for S {
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
         Box::pin(S::write_zeroes(self, offset, length))
     }
+
+    fn discard(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(S::discard(self, offset, length))
+    }
 }
 
 impl Storage for Box<dyn DynStorage> {
@@ -321,6 +351,10 @@ impl Storage for Box<dyn DynStorage> {
     async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         <Self as DynStorage>::write_zeroes(self, offset, length).await
     }
+
+    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        <Self as DynStorage>::discard(self, offset, length).await
+    }
 }
 
 impl Storage for Arc<dyn DynStorage> {
@@ -353,6 +387,10 @@ impl Storage for Arc<dyn DynStorage> {
 
     async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         <Self as DynStorage>::write_zeroes(self, offset, length).await
+    }
+
+    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        <Self as DynStorage>::discard(self, offset, length).await
     }
 }
 
