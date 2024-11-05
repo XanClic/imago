@@ -120,6 +120,36 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     async fn sync(&self) -> io::Result<()>;
 }
 
+/// Check whether the given request is aligned.
+fn is_aligned<V: IoVectorTrait>(
+    bufv: &V,
+    offset: u64,
+    mem_align: usize,
+    req_align: usize,
+    size: Option<u64>,
+) -> io::Result<bool> {
+    debug_assert!(mem_align.is_power_of_two() && req_align.is_power_of_two());
+
+    let req_align_mask = req_align as u64 - 1;
+
+    Ok(if offset & req_align_mask != 0 {
+        false
+    } else if bufv.len() & req_align_mask == 0 {
+        bufv.is_aligned(mem_align, req_align, false)
+    } else if bufv.is_aligned(mem_align, req_align, true) {
+        if let Some(size) = size {
+            let end = offset
+                .checked_add(bufv.len())
+                .ok_or_else(|| io::Error::other("Write wrap-around"))?;
+            end == size
+        } else {
+            false
+        }
+    } else {
+        false
+    })
+}
+
 /// Helper methods for storage objects.
 ///
 /// Provides some simpler methods for accessing storage objects.
@@ -141,21 +171,24 @@ pub trait StorageExt: Storage {
 
         let mem_align = self.mem_align();
         let req_align = self.req_align();
-        let req_align_mask = req_align as u64 - 1;
 
-        debug_assert!(mem_align.is_power_of_two() && req_align.is_power_of_two());
-
-        if offset & req_align_mask == 0
-            && bufv.len() & req_align_mask == 0
-            && bufv.is_aligned(mem_align, req_align)
-        {
+        if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
             return self.readv(bufv, offset).await;
         }
 
-        trace!("Unaligned read: 0x{:x} + {}", offset, bufv.len());
+        let req_align_mask = req_align as u64 - 1;
+
+        trace!(
+            "Unaligned read: 0x{:x} + {} (size: {:#x})",
+            offset,
+            bufv.len(),
+            self.size().unwrap()
+        );
 
         let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !req_align_mask;
+        // This will over-align at the end of file (aligning to exactly the end of file would be
+        // sufficient), but it is easier this way.
         let padded_end = (unpadded_end + req_align_mask) & !req_align_mask;
 
         trace!(
@@ -198,14 +231,8 @@ pub trait StorageExt: Storage {
 
         let mem_align = self.mem_align();
         let req_align = self.req_align();
-        let req_align_mask = req_align as u64 - 1;
 
-        debug_assert!(mem_align.is_power_of_two() && req_align.is_power_of_two());
-
-        if offset & req_align_mask == 0
-            && bufv.len() & req_align_mask == 0
-            && bufv.is_aligned(mem_align, req_align)
-        {
+        if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
             return self.writev(bufv, offset).await;
         }
 

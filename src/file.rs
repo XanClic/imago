@@ -16,6 +16,7 @@ use std::os::windows::fs::{FileExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 #[cfg(windows)]
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
@@ -33,16 +34,26 @@ pub struct File {
 
     /// For debug purposes.
     filename: PathBuf,
+
+    /// Cached file length.
+    ///
+    /// Third parties changing the length concurrently is pretty certain to break things anyway.
+    size: AtomicU64,
 }
 
-impl From<fs::File> for File {
-    fn from(file: fs::File) -> Self {
-        File {
+impl TryFrom<fs::File> for File {
+    type Error = io::Error;
+
+    fn try_from(mut file: fs::File) -> io::Result<Self> {
+        let size = file.seek(SeekFrom::End(0))?;
+
+        Ok(File {
             file: RwLock::new(file),
             // TODO: Find out, or better yet, drop `direct_io` and just probe the alignment.
             direct_io: false,
             filename: PathBuf::new(),
-        }
+            size: AtomicU64::new(size),
+        })
     }
 }
 
@@ -65,7 +76,9 @@ impl Storage for File {
         }
 
         let filename_owned = filename.to_owned();
-        let file = file_opts.open(filename)?;
+        let mut file = file_opts.open(filename)?;
+
+        let size = file.seek(SeekFrom::End(0))?;
 
         #[cfg(target_os = "macos")]
         if opts.direct {
@@ -84,6 +97,7 @@ impl Storage for File {
             file: RwLock::new(file),
             direct_io: opts.direct,
             filename: filename_owned,
+            size: AtomicU64::new(size),
         })
     }
 
@@ -106,12 +120,27 @@ impl Storage for File {
     }
 
     fn size(&self) -> io::Result<u64> {
-        let mut file = self.file.write().unwrap();
-        file.seek(SeekFrom::End(0))
+        Ok(self.size.load(Ordering::Relaxed))
     }
 
     #[cfg(unix)]
     async fn readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
+        let sz = self.size.load(Ordering::Relaxed);
+        let end = offset
+            .checked_add(bufv.len())
+            .ok_or_else(|| io::Error::other("Read offset overflow"))?;
+        let bufv = if end > sz {
+            let (head, mut tail) = bufv.split_at(sz - offset);
+            tail.fill(0);
+            head
+        } else {
+            bufv
+        };
+
+        if bufv.is_empty() {
+            return Ok(());
+        }
+
         // TODO: Use `read_vectored_at()` once `unix_file_vectored_at` is stable
         for mut buffer in bufv.into_inner() {
             let next_offset = offset
@@ -131,7 +160,12 @@ impl Storage for File {
         for mut buffer in bufv.into_inner() {
             let mut buffer: &mut [u8] = &mut buffer;
             while !buffer.is_empty() {
-                let len = self.file.write().unwrap().seek_read(buffer, offset)?;
+                let len = if offset >= self.size.load(Ordering::Relaxed) {
+                    buffer.fill(0);
+                    buffer.len()
+                } else {
+                    self.file.write().unwrap().seek_read(buffer, offset)?
+                };
                 offset = offset
                     .checked_add(len as u64)
                     .ok_or_else(|| io::Error::other("Read offset overflow"))?;
@@ -150,6 +184,7 @@ impl Storage for File {
                 .ok_or_else(|| io::Error::other("Write offset overflow"))?;
             self.file.read().unwrap().write_all_at(&buffer, offset)?;
             offset = next_offset;
+            self.size.fetch_max(offset, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -163,6 +198,7 @@ impl Storage for File {
                 offset = offset
                     .checked_add(len as u64)
                     .ok_or_else(|| io::Error::other("Write offset overflow"))?;
+                self.size.fetch_max(offset, Ordering::Relaxed);
                 buffer = buffer.split_at(len).1;
             }
         }
@@ -291,12 +327,11 @@ impl File {
     /// If the range is not at the end of the file, i.e. another method of discarding is needed,
     /// return `false`.
     fn try_discard_by_truncate(&self, offset: u64, length: u64) -> io::Result<bool> {
-        let mut file = self.file.write().unwrap();
-        let Ok(size) = file.seek(SeekFrom::End(0)) else {
-            // Failed to get length?  Try normal discard.
-            return Ok(false);
-        };
+        // Prevent modifications to the file length
+        #[allow(clippy::readonly_write_lock)]
+        let file = self.file.write().unwrap();
 
+        let size = self.size.load(Ordering::Relaxed);
         if offset >= size {
             // Nothing to do
             return Ok(true);

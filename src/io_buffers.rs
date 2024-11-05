@@ -482,7 +482,10 @@ pub trait IoVectorTrait: Sized {
     ///
     /// Each buffer must be aligned to `mem_alignment`, and each buffer’s length must be aligned to
     /// both `mem_alignment` and `req_alignment` (the I/O request offset/size alignment).
-    fn is_aligned(&self, mem_alignment: usize, req_alignment: usize) -> bool;
+    ///
+    /// If `ignore_end` is set, ignore the length alignment of the last buffer (for the end of the
+    /// file).
+    fn is_aligned(&self, mem_alignment: usize, req_alignment: usize, ignore_end: bool) -> bool;
 
     /// Return the internal vector of `IoSlice` objects.
     fn into_inner(self) -> Vec<Self::BufferType>;
@@ -588,7 +591,7 @@ macro_rules! impl_io_vector {
                 }
             }
 
-            fn is_aligned(&self, mem_alignment: usize, req_alignment: usize) -> bool {
+            fn is_aligned(&self, mem_alignment: usize, req_alignment: usize, ignore_end: bool) -> bool {
                 // Trivial case
                 if mem_alignment == 1 && req_alignment == 1 {
                     return true;
@@ -598,10 +601,18 @@ macro_rules! impl_io_vector {
                 let base_align_mask = mem_alignment - 1;
                 let len_align_mask = base_align_mask | (req_alignment - 1);
 
-                self.vector.iter().all(|buf| {
-                    buf.as_ptr() as usize & base_align_mask == 0 &&
-                        buf.len() & len_align_mask == 0
-                })
+                if ignore_end {
+                    let buffer_count = self.vector.len();
+                    self.vector.iter().enumerate().all(|(i, buf)| {
+                        buf.as_ptr() as usize & base_align_mask == 0 &&
+                            (i == buffer_count - 1 || buf.len() & len_align_mask == 0)
+                    })
+                } else {
+                    self.vector.iter().all(|buf| {
+                        buf.as_ptr() as usize & base_align_mask == 0 &&
+                            buf.len() & len_align_mask == 0
+                    })
+                }
             }
 
             fn into_inner(self) -> Vec<Self::BufferType> {
