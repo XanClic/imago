@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{cmp, io};
+use tracing::trace;
 
 /// Parameters from which a storage object can be constructed.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StorageOpenOptions {
     /// Filename to open.
     pub(crate) filename: Option<PathBuf>,
@@ -132,6 +133,10 @@ pub trait StorageExt: Storage {
     /// Check alignment.  If anything does not meet the requirements, enforce it.
     #[allow(async_fn_in_trait)] // No need for Send
     async fn unaligned_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        if bufv.is_empty() {
+            return Ok(());
+        }
+
         let mem_align = self.mem_align();
         let req_align = self.req_align();
         let req_align_mask = req_align as u64 - 1;
@@ -145,35 +150,33 @@ pub trait StorageExt: Storage {
             return self.readv(bufv, offset).await;
         }
 
+        trace!("Unaligned read: 0x{:x} + {}", offset, bufv.len());
+
         let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !req_align_mask;
         let padded_end = (unpadded_end + req_align_mask) & !req_align_mask;
 
+        trace!(
+            "Padded read: 0x{:x} + {}",
+            padded_offset,
+            padded_end - padded_offset
+        );
+
         let pad_head_len = (offset - padded_offset) as usize;
-        let mut head_buf = (pad_head_len > 0)
-            .then(|| IoBuffer::new(pad_head_len, mem_align))
-            .transpose()?;
-
         let pad_tail_len = (padded_end - unpadded_end) as usize;
-        let mut tail_buf = (pad_tail_len > 0)
-            .then(|| IoBuffer::new(pad_tail_len, mem_align))
-            .transpose()?;
 
-        let bufv = if let Some(head_buf) = head_buf.as_mut() {
-            bufv.with_inserted(0, head_buf.as_mut().into_slice())
-        } else {
-            bufv
-        };
-
-        let bufv = if let Some(tail_buf) = tail_buf.as_mut() {
-            bufv.with_pushed(tail_buf.as_mut().into_slice())
-        } else {
-            bufv
-        };
+        trace!("Head length: {pad_head_len}; tail length: {pad_tail_len}");
 
         let mut bounce = IoVectorBounceBuffers::default();
-        let bufv = bufv.enforce_alignment_for_read(mem_align, req_align, &mut bounce)?;
-        self.readv(bufv, offset).await
+        let bufv = bufv.enforce_alignment_for_read(
+            mem_align,
+            req_align,
+            pad_head_len,
+            pad_tail_len,
+            &mut bounce,
+        )?;
+        self.readv(bufv, padded_offset).await?;
+        Ok(())
     }
 
     /// Write data from `buf` to `offset`.
@@ -187,6 +190,10 @@ pub trait StorageExt: Storage {
     /// Check alignment.  If anything does not meet the requirements, enforce it.
     #[allow(async_fn_in_trait)] // No need for Send
     async fn unaligned_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+        if bufv.is_empty() {
+            return Ok(());
+        }
+
         let mem_align = self.mem_align();
         let req_align = self.req_align();
         let req_align_mask = req_align as u64 - 1;

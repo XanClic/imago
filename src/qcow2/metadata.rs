@@ -1857,7 +1857,10 @@ impl RefBlock {
         header: &Header,
         cluster: HostCluster,
     ) -> io::Result<Self> {
-        let mut raw_data = IoBuffer::new(header.cluster_size(), image.mem_align())?;
+        let mut raw_data = IoBuffer::new(
+            header.cluster_size(),
+            cmp::max(image.mem_align(), size_of::<u64>()),
+        )?;
         image
             .read(&mut raw_data, cluster.offset(header.cluster_bits()).0)
             .await?;

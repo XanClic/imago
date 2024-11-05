@@ -171,7 +171,6 @@ impl<
                 let mut locked = self.0.flush_before.lock().await;
                 // Shouldn’t be long, so linear search seems fine
                 if locked.iter().any(|x| Arc::ptr_eq(x, &cloned)) {
-                    trace!("Already dependent on that");
                     break;
                 }
 
