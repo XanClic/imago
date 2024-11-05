@@ -1,7 +1,7 @@
 //! Support for compressed clusters.
 
 use super::*;
-use crate::io_buffers::IoBuffer;
+use crate::io_buffers::{IoBuffer, IoBufferRefTrait};
 use miniz_oxide::inflate::core::{decompress as inflate, DecompressorOxide};
 use miniz_oxide::inflate::TINFLStatus;
 

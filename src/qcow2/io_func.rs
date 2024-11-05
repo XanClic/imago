@@ -5,7 +5,7 @@
 //! by image drivers (like handling compression).
 
 use super::*;
-use crate::io_buffers::IoBuffer;
+use crate::io_buffers::{IoBuffer, IoBufferRefTrait};
 
 impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Read the special range at `offset`.

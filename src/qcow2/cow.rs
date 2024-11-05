@@ -3,7 +3,7 @@
 //! Implements copy-on-write when writing to clusters that are not simple allocated data clusters.
 
 use super::*;
-use crate::io_buffers::IoBuffer;
+use crate::io_buffers::{IoBuffer, IoBufferRefTrait};
 
 impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Do copy-on-write for the given guest cluster, if necessary.

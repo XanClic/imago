@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use super::types::*;
-use crate::io_buffers::IoBuffer;
+use crate::io_buffers::{IoBuffer, IoBufferRefTrait};
 use crate::macros::numerical_enum;
 use crate::{Storage, StorageExt};
 use bincode::Options;
