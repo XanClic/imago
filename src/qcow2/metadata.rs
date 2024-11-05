@@ -1,7 +1,5 @@
 //! Functionality for working with qcow2 metadata.
 
-#![allow(dead_code)]
-
 use super::types::*;
 use crate::io_buffers::{IoBuffer, IoBufferRefTrait};
 use crate::macros::numerical_enum;
@@ -541,11 +539,6 @@ impl Header {
         1 << self.rb_bits()
     }
 
-    /// For the given host/guest offset, calculate the offset in its cluster.
-    pub fn in_cluster_offset(&self, offset: u64) -> usize {
-        (offset % self.cluster_size() as u64) as usize
-    }
-
     /// log2 of the refcount bits.
     pub fn refcount_order(&self) -> u32 {
         self.v3.refcount_order
@@ -867,11 +860,6 @@ impl L1Entry {
         self.0 & (1u64 << 63) != 0
     }
 
-    /// Whether this entry is unallocated.
-    pub fn is_unallocated(&self) -> bool {
-        self.l2_offset().is_none()
-    }
-
     /// Return all reserved bits.
     pub fn reserved_bits(&self) -> u64 {
         self.0 & 0x7f00_0000_0000_01feu64
@@ -932,16 +920,6 @@ pub(super) struct L1Table {
 }
 
 impl L1Table {
-    /// Create a new empty L1 table.
-    pub fn empty(header: &Header) -> Self {
-        Self {
-            cluster: None,
-            data: Default::default(),
-            cluster_bits: header.cluster_bits(),
-            modified: true.into(),
-        }
-    }
-
     /// Create a clone that covers at least `at_least_index`.
     pub fn clone_and_grow(&self, at_least_index: usize, header: &Header) -> Self {
         let new_size = cmp::max(at_least_index + 1, self.data.len());
@@ -1311,17 +1289,6 @@ impl AtomicL2Entry {
         L2Entry(self.0.load(Ordering::Relaxed))
     }
 
-    /// Set the contained value.
-    ///
-    /// # Safety
-    /// Caller must ensure that:
-    /// (1) No reader sees invalid intermediate states.
-    /// (2) Updates are done atomically (do not depend on prior state of the L2 table), or there is
-    ///     only one writer at a time
-    unsafe fn set(&self, l2e: L2Entry) {
-        self.0.store(l2e.0, Ordering::Relaxed)
-    }
-
     /// Exchange the contained value.
     ///
     /// # Safety
@@ -1470,7 +1437,7 @@ pub(super) struct L2TableWriteGuard<'a> {
     table: &'a L2Table,
 
     /// Held guard mutex on that L2 table.
-    lock: MutexGuard<'a, ()>,
+    _lock: MutexGuard<'a, ()>,
 }
 
 impl L2Table {
@@ -1500,7 +1467,7 @@ impl L2Table {
     pub async fn lock_write(&self) -> L2TableWriteGuard<'_> {
         L2TableWriteGuard {
             table: self,
-            lock: self.writer_lock.lock().await,
+            _lock: self.writer_lock.lock().await,
         }
     }
 }
@@ -1715,16 +1682,6 @@ pub(super) struct RefTable {
 }
 
 impl RefTable {
-    /// Create a new empty refcount table.
-    pub fn empty(header: &Header) -> Self {
-        Self {
-            cluster: None,
-            data: Default::default(),
-            cluster_bits: header.cluster_bits(),
-            modified: true.into(),
-        }
-    }
-
     /// Create a clone that covers at least `at_least_index`.
     ///
     /// Also ensure that beyond `at_least_index`, there are enough entries to self-describe the new
@@ -1865,7 +1822,7 @@ pub(super) struct RefBlockWriteGuard<'a> {
     rb: &'a RefBlock,
 
     /// Held guard mutex on that refblock.
-    lock: MutexGuard<'a, ()>,
+    _lock: MutexGuard<'a, ()>,
 }
 
 impl RefBlock {
@@ -1917,53 +1874,13 @@ impl RefBlock {
             .get_offset()
             .ok_or_else(|| io::Error::other("Cannot write qcow2 refcount block, no offset set"))?;
 
-        self.modified.store(false, Ordering::Relaxed);
+        self.clear_modified();
         if let Err(err) = image.write(self.raw_data.as_ref(), offset.0).await {
-            self.modified.store(true, Ordering::Relaxed);
+            self.set_modified();
             return Err(err);
         }
 
         Ok(())
-    }
-
-    /// Write at least the given single (modified) entry to the image file.
-    ///
-    /// Potentially writes more of the refblock, if alignment requirements ask for that.
-    pub async fn write_entry<S: Storage>(
-        &self,
-        image: &StorageWrapper<S>,
-        index: usize,
-    ) -> io::Result<()> {
-        // Same calculation as [`Table::write_entry()`].
-        // This alignment calculation code implicitly assumes that the cluster size is aligned to
-        // the storage’s request/memory alignment, but that is often fair.  If that is not the
-        // case, there is not much we can do anyway.
-        let alignment = cmp::min(
-            1 << self.cluster_bits,
-            cmp::max(
-                cmp::max(image.mem_align(), image.req_align()),
-                1 << self.refcount_order,
-            ),
-        );
-
-        let offset = self
-            .get_offset()
-            .ok_or_else(|| io::Error::other("Cannot write qcow2 refcount block, no offset set"))?;
-
-        let byte_index = if self.refcount_order >= 3 {
-            index << (self.refcount_order - 3)
-        } else {
-            index >> (3 - self.refcount_order)
-        };
-        let start_byte = byte_index / alignment * alignment;
-        let end_byte = start_byte + alignment;
-
-        image
-            .write(
-                self.raw_data.as_ref_range(start_byte..end_byte),
-                offset.0 + start_byte as u64,
-            )
-            .await
     }
 
     /// Get the block’s cluster in the image file.
@@ -1979,12 +1896,7 @@ impl RefBlock {
     /// Change the block’s cluster in the image file (for writing).
     pub fn set_cluster(&mut self, cluster: HostCluster) {
         self.cluster = Some(cluster);
-        self.modified.store(true, Ordering::Relaxed);
-    }
-
-    /// Remove the block’s association with any cluster in the image file.
-    pub fn unset_cluster(&mut self) {
-        self.cluster = None;
+        self.set_modified();
     }
 
     /// Get the given cluster’s refcount.
@@ -2065,7 +1977,7 @@ impl RefBlock {
     pub async fn lock_write(&self) -> RefBlockWriteGuard<'_> {
         RefBlockWriteGuard {
             rb: self,
-            lock: self.writer_lock.lock().await,
+            _lock: self.writer_lock.lock().await,
         }
     }
 
@@ -2305,11 +2217,6 @@ impl RefBlockWriteGuard<'_> {
     /// Returns the old value.
     pub fn decrement(&mut self, index: usize) -> io::Result<u64> {
         self.modify(index, -1)
-    }
-
-    /// Get the given cluster’s refcount.
-    pub fn get(&self, index: usize) -> u64 {
-        self.rb.get(index)
     }
 
     /// Check whether the given cluster’s refcount is 0.
