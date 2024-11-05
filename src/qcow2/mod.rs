@@ -14,7 +14,7 @@ mod types;
 use crate::async_lru_cache::AsyncLruCache;
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::wrapped::WrappedFormat;
-use crate::io_buffers::IoVectorMut;
+use crate::io_buffers::{IoVectorMut, IoVectorTrait};
 use crate::raw::Raw;
 use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;

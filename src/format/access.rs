@@ -3,7 +3,7 @@
 //! Provides access to different image formats via `FormatAccess` objects.
 
 use super::drivers::{self, FormatDriverInstance};
-use crate::io_buffers::{IoVector, IoVectorMut};
+use crate::io_buffers::{IoVector, IoVectorMut, IoVectorTrait};
 use crate::vector_select::FutureVector;
 use crate::{Storage, StorageExt};
 use std::fmt::{self, Display, Formatter};

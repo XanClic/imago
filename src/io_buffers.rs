@@ -373,6 +373,89 @@ pub struct IoVectorBounceBuffers<'a> {
     copy_back_into: Option<Vec<IoSliceMut<'a>>>,
 }
 
+/// Common functions for both `IoVector` and `IoVectorMut`.
+pub trait IoVectorTrait: Sized {
+    /// `&[u8]` or `&mut [u8]`.
+    type SliceType;
+
+    /// `IoSlice` or `IoSliceMut`.
+    type BufferType;
+
+    /// Create an empty vector.
+    fn new() -> Self;
+
+    /// Create an empty vector, pre-allocating space for `cap` buffers.
+    ///
+    /// This does not allocate an memory buffer, only space in the buffer vector.
+    fn with_capacity(cap: usize) -> Self;
+
+    /// Append a slice.
+    fn push(&mut self, slice: Self::SliceType);
+
+    /// Append a slice.
+    fn push_ioslice(&mut self, ioslice: Self::BufferType);
+
+    /// Insert a slice at the given `index` in the buffer vector.
+    fn insert(&mut self, index: usize, slice: Self::SliceType);
+
+    /// Return the sum total length in bytes of all buffers in this vector.
+    fn len(&self) -> u64;
+
+    /// Return the number of buffers in this vector.
+    fn buffer_count(&self) -> usize;
+
+    /// Return `true` if and only if this vector’s length is zero.
+    ///
+    /// Synonymous with whether this vector’s buffer count is zero.
+    fn is_empty(&self) -> bool {
+        debug_assert!((self.len() == 0) == (self.buffer_count() == 0));
+        self.len() == 0
+    }
+
+    /// Append all buffers from the given other vector to this vector.
+    fn append(&mut self, other: Self);
+
+    /// Split the vector into two.
+    ///
+    /// The first returned vector contains the bytes in the `[..mid]` range, and the second one
+    /// covers the `[mid..]` range.
+    fn split_at(self, mid: u64) -> (Self, Self);
+
+    /// Like [`IoVectorTrait::split_at()`], but discards the head, only returning the tail.
+    ///
+    /// More efficient than to use `self.split_at(mid).1` because the former requires creating a
+    /// new `Vec` object for the head, which this version skips.
+    fn split_tail_at(self, mid: u64) -> Self;
+
+    /// Copy the data from `self` into `slice`.
+    ///
+    /// Both must have the same length.
+    fn copy_into_slice(&self, slice: &mut [u8]);
+
+    /// Create a single owned [`IoBuffer`] with the same data (copied).
+    fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer>;
+
+    /// Return a corresponding `&[libc::iovec]`.
+    ///
+    /// # Safety
+    /// `iovec` has no lifetime information.  Callers must ensure no elements in the returned slice
+    /// are used beyond the lifetime `'_`.
+    #[cfg(unix)]
+    unsafe fn as_iovec<'a>(&'a self) -> &'a [libc::iovec]
+    where
+        Self: 'a;
+
+    /// Check whether `self` is aligned.
+    ///
+    /// Each buffer must be aligned to `mem_alignment`, and each buffer’s length must be aligned to
+    /// both `mem_alignment` and `req_alignment` (the I/O request offset/size alignment).
+    fn is_aligned(&self, mem_alignment: usize, req_alignment: usize) -> bool;
+
+    /// Return the internal vector of `IoSlice` objects.
+    fn into_inner(self) -> Vec<Self::BufferType>;
+}
+
+/// Implement most of both `IoVector` and `IoVectorMut`.
 macro_rules! impl_io_vector {
     ($type:tt, $inner_type:tt, $buffer_type:tt, $slice_type:ty, $slice_type_lifetime_b:ty) => {
         /// Vector of memory buffers.
@@ -384,37 +467,117 @@ macro_rules! impl_io_vector {
             total_size: u64,
         }
 
-        impl<'a> $type<'a> {
-            /// Create an empty vector.
-            pub fn new() -> Self {
+        impl<'a> IoVectorTrait for $type<'a> {
+            type SliceType = $slice_type;
+            type BufferType = $inner_type<'a>;
+
+            fn new() -> Self {
                 Self::default()
             }
 
-            /// Create an empty vector, pre-allocating space for `cap` buffers.
-            ///
-            /// This does not allocate an memory buffer, only space in the buffer vector.
-            pub fn with_capacity(cap: usize) -> Self {
+            fn with_capacity(cap: usize) -> Self {
                 $type {
                     vector: Vec::with_capacity(cap),
                     total_size: 0,
                 }
             }
 
-            /// Append a slice.
-            pub fn push(&mut self, slice: $slice_type) {
+            fn push(&mut self, slice: Self::SliceType) {
                 debug_assert!(!slice.is_empty());
                 self.total_size += slice.len() as u64;
                 self.vector.push($inner_type::new(slice));
             }
 
-            /// Append a slice.
-            fn push_ioslice(&mut self, ioslice: $inner_type<'a>) {
+            fn push_ioslice(&mut self, ioslice: Self::BufferType) {
                 debug_assert!(!ioslice.is_empty());
                 self.total_size += ioslice.len() as u64;
                 self.vector.push(ioslice);
             }
 
-            /// Same as [`Self::push()`], but takes ownership of `self`.
+            fn insert(&mut self, index: usize, slice: Self::SliceType) {
+                debug_assert!(!slice.is_empty());
+                self.total_size += slice.len() as u64;
+                self.vector.insert(index, $inner_type::new(slice));
+            }
+
+            fn len(&self) -> u64 {
+                self.total_size
+            }
+
+            fn buffer_count(&self) -> usize {
+                self.vector.len()
+            }
+
+            fn append(&mut self, mut other: Self) {
+                self.total_size += other.total_size;
+                self.vector.append(&mut other.vector);
+            }
+
+            fn split_at(self, mid: u64) -> (Self, Self) {
+                let (head, tail) = self.do_split_at(mid, true);
+                (head.unwrap(), tail)
+            }
+
+            fn split_tail_at(self, mid: u64) -> Self {
+                self.do_split_at(mid, false).1
+            }
+
+            fn copy_into_slice(&self, slice: &mut [u8]) {
+                if slice.len() as u64 != self.total_size {
+                    panic!("IoVectorTrait::copy_into_slice() called on a slice of different length from the vector");
+                }
+
+                assert!(self.total_size <= usize::MAX as u64);
+
+                let mut offset = 0usize;
+                for elem in self.vector.iter() {
+                    let next_offset = offset + elem.len();
+                    slice[offset..next_offset].copy_from_slice(&elem[..]);
+                    offset = next_offset;
+                }
+            }
+
+            fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer> {
+                let size = self.total_size.try_into().map_err(|_| {
+                    io::Error::other(format!("Buffer is too big ({})", self.total_size))
+                })?;
+                let mut new_buf = IoBuffer::new(size, alignment)?;
+                self.copy_into_slice(new_buf.as_mut().into_slice());
+                Ok(new_buf)
+            }
+
+            #[cfg(unix)]
+            unsafe fn as_iovec<'b>(&'b self) -> &'b [libc::iovec] where Self: 'b {
+                // IoSlice and IoSliceMut are defined to have the same representation in memory as
+                // libc::iovec does
+                unsafe {
+                    mem::transmute::<&'b [$inner_type<'b>], &'b [libc::iovec]>(&self.vector[..])
+                }
+            }
+
+            fn is_aligned(&self, mem_alignment: usize, req_alignment: usize) -> bool {
+                // Trivial case
+                if mem_alignment == 1 && req_alignment == 1 {
+                    return true;
+                }
+
+                debug_assert!(mem_alignment.is_power_of_two() && req_alignment.is_power_of_two());
+                let base_align_mask = mem_alignment - 1;
+                let len_align_mask = base_align_mask | (req_alignment - 1);
+
+                self.vector.iter().all(|buf| {
+                    buf.as_ptr() as usize & base_align_mask == 0 &&
+                        buf.len() & len_align_mask == 0
+                })
+            }
+
+            fn into_inner(self) -> Vec<Self::BufferType> {
+                self.vector
+            }
+        }
+
+        impl<'a> $type<'a> {
+            /// Same as [`IoVectorTrait::push()`], but takes ownership of `self`.
             ///
             /// By taking ownership of `self` and returning it, this method allows reducing the
             /// lifetime of `self` to that of `slice`, if necessary.
@@ -427,14 +590,7 @@ macro_rules! impl_io_vector {
                 vec
             }
 
-            /// Insert a slice at the given `index` in the buffer vector.
-            pub fn insert(&mut self, index: usize, slice: $slice_type) {
-                debug_assert!(!slice.is_empty());
-                self.total_size += slice.len() as u64;
-                self.vector.insert(index, $inner_type::new(slice));
-            }
-
-            /// Same as [`Self::insert()`], but takes ownership of `self.`
+            /// Same as [`IoVectorTrait::insert()`], but takes ownership of `self.`
             ///
             /// By taking ownership of `self` and returning it, this method allows reducing the
             /// lifetime of `self` to that of `slice`, if necessary.
@@ -447,31 +603,8 @@ macro_rules! impl_io_vector {
                 vec
             }
 
-            /// Return the sum total length in bytes of all buffers in this vector.
-            pub fn len(&self) -> u64 {
-                self.total_size
-            }
-
-            /// Return the number of buffers in this vector.
-            pub fn buffer_count(&self) -> usize {
-                self.vector.len()
-            }
-
-            /// Return `true` if and only if this vector’s length is zero.
-            ///
-            /// Synonymous with whether this vector’s buffer count is zero.
-            pub fn is_empty(&self) -> bool {
-                debug_assert!((self.total_size == 0) == self.vector.is_empty());
-                self.total_size == 0
-            }
-
-            /// Append all buffers from the given other vector to this vector.
-            pub fn append(&mut self, mut other: $type<'a>) {
-                self.total_size += other.total_size;
-                self.vector.append(&mut other.vector);
-            }
-
-            /// Implementation for [`Self::split_at()`] and [`Self::split_tail_at()`].
+            /// Implementation for [`IoVectorTrait::split_at()`] and
+            /// [`IoVectorTrait::split_tail_at()`].
             ///
             /// If `keep_head` is true, both head and tail are returned ([`Self::split_at()`]).
             /// Otherwise, the head is discarded ([`Self::split_tail_at()`]).
@@ -546,86 +679,6 @@ macro_rules! impl_io_vector {
                 };
 
                 (head, tail)
-            }
-
-            /// Split the vector into two.
-            ///
-            /// The first returned vector contains the bytes in the `[..mid]` range, and the second
-            /// one covers the `[mid..]` range.
-            pub fn split_at(self, mid: u64) -> ($type<'a>, $type<'a>) {
-                let (head, tail) = self.do_split_at(mid, true);
-                (head.unwrap(), tail)
-            }
-
-            /// Like [`Self::split_at()`], but discards the head, only returning the tail.
-            ///
-            /// More efficient than to use `self.split_at(mid).1` because the former requires
-            /// creating a new `Vec` object for the head, which this version skips.
-            pub fn split_tail_at(self, mid: u64) -> $type<'a> {
-                self.do_split_at(mid, false).1
-            }
-
-            /// Copy the data from `self` into `slice`.
-            ///
-            /// Both must have the same length.
-            pub fn copy_into_slice(&self, slice: &mut [u8]) {
-                if slice.len() as u64 != self.total_size {
-                    panic!("IoVector*::copy_into_slice() called on a slice of different length from the vector");
-                }
-
-                assert!(self.total_size <= usize::MAX as u64);
-
-                let mut offset = 0usize;
-                for elem in self.vector.iter() {
-                    let next_offset = offset + elem.len();
-                    slice[offset..next_offset].copy_from_slice(&elem[..]);
-                    offset = next_offset;
-                }
-            }
-
-            /// Create a single owned [`IoBuffer`] with the same data (copied).
-            pub fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer> {
-                let size = self.total_size.try_into().map_err(|_| {
-                    io::Error::other(format!("Buffer is too big ({})", self.total_size))
-                })?;
-                let mut new_buf = IoBuffer::new(size, alignment)?;
-                self.copy_into_slice(new_buf.as_mut().into_slice());
-                Ok(new_buf)
-            }
-
-            /// Return a corresponding `&[libc::iovec]`.
-            ///
-            /// # Safety
-            /// `iovec` has no lifetime information.  Callers must ensure no elements in the
-            /// returned slice are used beyond the lifetime `'a`.
-            #[cfg(unix)]
-            pub unsafe fn as_iovec(&'a self) -> &'a [libc::iovec] {
-                // IoSlice and IoSliceMut are defined to have the same representation in memory as
-                // libc::iovec does
-                unsafe {
-                    mem::transmute::<&'a [$inner_type<'a>], &'a [libc::iovec]>(&self.vector[..])
-                }
-            }
-
-            /// Check whether `self` is aligned.
-            ///
-            /// Each buffer must be aligned to `mem_alignment`, and each buffer’s length must be
-            /// aligned to both `mem_alignment` and `req_alignment` (the I/O request offset/size
-            /// alignment).
-            pub fn is_aligned(&self, mem_alignment: usize, req_alignment: usize) -> bool {
-                // Trivial case
-                if mem_alignment == 1 && req_alignment == 1 {
-                    return true;
-                }
-
-                debug_assert!(mem_alignment.is_power_of_two() && req_alignment.is_power_of_two());
-                let base_align_mask = mem_alignment - 1;
-                let len_align_mask = base_align_mask | (req_alignment - 1);
-
-                self.vector.iter().all(|buf| {
-                    buf.as_ptr() as usize & base_align_mask == 0 &&
-                        buf.len() & len_align_mask == 0
-                })
             }
 
             /// Consume `self`, returning an I/O vector that fulfills the given alignment
@@ -799,11 +852,6 @@ macro_rules! impl_io_vector {
                     },
                     copy_back_vector,
                 ))
-            }
-
-            /// Return the internal vector of `IoSlice` objects.
-            pub fn into_inner(self) -> Vec<$inner_type<'a>> {
-                self.vector
             }
         }
 
