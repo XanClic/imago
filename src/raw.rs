@@ -3,7 +3,7 @@
 //! Allows accessing generic storage objects (`Storage`) as images (i.e. `FormatAccess`).
 
 use crate::format::drivers::{FormatDriverInstance, Mapping};
-use crate::{Storage, StorageOpenOptions};
+use crate::{Storage, StorageOpenOptions, StorageWrapper};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -13,7 +13,7 @@ use std::path::Path;
 #[derive(Debug)]
 pub struct Raw<S: Storage> {
     /// Wrapped storage object.
-    inner: S,
+    inner: StorageWrapper<S>,
 
     /// Whether this image may be modified.
     writable: bool,
@@ -27,7 +27,7 @@ impl<S: Storage> Raw<S> {
     pub async fn open_image(inner: S, writable: bool) -> io::Result<Self> {
         let size = inner.size()?;
         Ok(Raw {
-            inner,
+            inner: inner.into(),
             writable,
             size,
         })
@@ -45,7 +45,7 @@ impl<S: Storage> Raw<S> {
     pub fn open_image_sync(inner: S, writable: bool) -> io::Result<Self> {
         let size = inner.size()?;
         Ok(Raw {
-            inner,
+            inner: inner.into(),
             writable,
             size,
         })
@@ -67,7 +67,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         self.size
     }
 
-    fn collect_storage_dependencies(&self) -> Vec<&'_ S> {
+    fn collect_storage_dependencies(&self) -> Vec<&'_ StorageWrapper<S>> {
         vec![&self.inner]
     }
 
@@ -96,7 +96,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         offset: u64,
         length: u64,
         _overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&'_ StorageWrapper<S>, u64, u64)> {
         let Some(remaining) = self.size.checked_sub(offset) else {
             return Err(io::Error::other("Cannot allocate past the end of file"));
         };

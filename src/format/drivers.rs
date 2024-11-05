@@ -4,7 +4,7 @@
 //! the publically visible interface [`FormatAccess`] is built.
 
 use crate::io_buffers::IoVectorMut;
-use crate::{FormatAccess, Storage};
+use crate::{FormatAccess, Storage, StorageWrapper};
 use async_trait::async_trait;
 use std::fmt::{Debug, Display};
 use std::io;
@@ -21,7 +21,7 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// Recursively collect all storage objects associated with this image.
     ///
     /// “Recursive” means to recurse to other images like e.g. a backing file.
-    fn collect_storage_dependencies(&self) -> Vec<&'_ Self::Storage>;
+    fn collect_storage_dependencies(&self) -> Vec<&'_ StorageWrapper<Self::Storage>>;
 
     /// Return whether this image may be modified.
     ///
@@ -64,7 +64,7 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ Self::Storage, u64, u64)>;
+    ) -> io::Result<(&'_ StorageWrapper<Self::Storage>, u64, u64)>;
 
     /// Read data from a `Mapping::Special` area.
     async fn readv_special(&self, _bufv: IoVectorMut<'_>, _offset: u64) -> io::Result<()> {
@@ -91,7 +91,7 @@ pub enum Mapping<'a, S: Storage> {
     /// Raw data.
     Raw {
         /// Storage object where this data is stored.
-        storage: &'a S,
+        storage: &'a StorageWrapper<S>,
 
         /// Offset in `storage` where this data is stored.
         offset: u64,

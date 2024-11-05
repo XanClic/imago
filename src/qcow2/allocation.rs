@@ -11,7 +11,7 @@ use tracing::{event, warn, Level};
 /// Central facility for cluster allocation.
 pub(super) struct Allocator<S: Storage> {
     /// Qcow2 metadata file.
-    file: Arc<S>,
+    file: Arc<StorageWrapper<S>>,
 
     /// Qcow2 refcount table.
     reftable: RefTable,
@@ -144,7 +144,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
 impl<S: Storage> Allocator<S> {
     /// Create a new allocator for the given image file.
-    pub async fn new(image: Arc<S>, header: Arc<Header>) -> io::Result<Self> {
+    pub async fn new(image: Arc<StorageWrapper<S>>, header: Arc<Header>) -> io::Result<Self> {
         let cb = header.cluster_bits();
         let rt_offset = header.reftable_offset();
         let rt_cluster = rt_offset.checked_cluster(cb).ok_or_else(|| {

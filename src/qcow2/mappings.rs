@@ -106,7 +106,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         offset: GuestOffset,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&'_ StorageWrapper<S>, u64, u64)> {
         let l2_table = self.ensure_l2(offset).await?;
 
         // Fast path for if everything is already allocated, which should be the common case at

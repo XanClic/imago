@@ -16,7 +16,7 @@ use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::wrapped::WrappedFormat;
 use crate::io_buffers::{IoVectorMut, IoVectorTrait};
 use crate::raw::Raw;
-use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
+use crate::{FormatAccess, Storage, StorageOpenOptions, StorageWrapper};
 use allocation::Allocator;
 use async_trait::async_trait;
 use cache::L2CacheBackend;
@@ -37,7 +37,7 @@ use types::*;
 /// - Backing image `WrappedFormat<S>`: A backing disk image in any format
 pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAccess<S>> {
     /// Image file (which contains the qcow2 metadata).
-    metadata: Arc<S>,
+    metadata: Arc<StorageWrapper<S>>,
 
     /// Whether this image may be modified.
     writable: bool,
@@ -45,7 +45,7 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     /// Whether the user explicitly assigned a data file storage object (or `None`).
     storage_set: bool,
     /// Data file storage object; will use `metadata` if `None`.
-    storage: Option<S>,
+    storage: Option<StorageWrapper<S>>,
     /// Whether the user explicitly assigned a backing file (or `None`).
     backing_set: bool,
     /// Backing image.
@@ -79,6 +79,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// If you want to use the implicit references given in the image header, use
     /// [`Qcow2::open_implicit_dependencies()`].
     pub async fn open_image(metadata: S, writable: bool) -> io::Result<Self> {
+        let metadata = Arc::new(metadata.into());
+
         let header = Arc::new(Header::load(&metadata, writable).await?);
 
         let cb = header.cluster_bits();
@@ -92,8 +94,6 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
         let l1_table =
             L1Table::load(&metadata, &header, l1_cluster, header.l1_table_entries()).await?;
-
-        let metadata = Arc::new(metadata);
 
         let allocator = if writable {
             let allocator = Allocator::new(Arc::clone(&metadata), Arc::clone(&header)).await?;
@@ -143,7 +143,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
     /// Check whether the given image file is a qcow2 file.
     pub(crate) async fn probe(metadata: &S) -> io::Result<()> {
-        Header::load(metadata, true).await?;
+        let metadata = metadata.into();
+        Header::load(&metadata, true).await?;
         Ok(())
     }
 
@@ -183,7 +184,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// `None` means using the same data storage for both metadata and data, which should be used
     /// if [`Qcow2::requires_external_data_file()`] is `false`.
     pub fn set_data_file(&mut self, file: Option<S>) {
-        self.storage = file;
+        self.storage = file.map(Into::into);
         self.storage_set = true;
     }
 
@@ -199,7 +200,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     ///
     /// If we have an external data file, return that.  Otherwise, return the image (metadata)
     /// file.
-    fn storage(&self) -> &'_ S {
+    fn storage(&self) -> &'_ StorageWrapper<S> {
         self.storage.as_ref().unwrap_or(&self.metadata)
     }
 
@@ -278,7 +279,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// [`Qcow2::set_data_file()`] or [`Qcow2::set_backing()`], respectively.
     pub async fn open_implicit_dependencies(&mut self) -> io::Result<()> {
         if !self.storage_set {
-            self.storage = self.open_implicit_data_file().await?;
+            self.storage = self.open_implicit_data_file().await?.map(Into::into);
             self.storage_set = true;
         }
 
@@ -306,7 +307,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.header.size()
     }
 
-    fn collect_storage_dependencies(&self) -> Vec<&'_ S> {
+    fn collect_storage_dependencies(&self) -> Vec<&'_ StorageWrapper<S>> {
         let mut v = self
             .backing
             .as_ref()
@@ -341,7 +342,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&'_ StorageWrapper<S>, u64, u64)> {
         let length_until_eof = self.header.size().saturating_sub(offset);
         if length_until_eof < length {
             return Err(io::Error::other("Cannot allocate beyond the disk size"));

@@ -187,7 +187,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Used for COW on non-copied data clusters.
     async fn cow_copy_storage(
         &self,
-        from: &S,
+        from: &StorageWrapper<S>,
         from_cluster: HostCluster,
         to_cluster: HostCluster,
         partial_skip_cow: Option<Range<usize>>,

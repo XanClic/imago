@@ -6,8 +6,9 @@
 use crate::io_buffers::{
     IoBuffer, IoBufferRefTrait, IoVector, IoVectorBounceBuffers, IoVectorMut, IoVectorTrait,
 };
-use std::fmt::{Debug, Display};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ pub struct StorageOpenOptions {
     pub(crate) direct: bool,
 }
 
-/// Provides access to generic storage objects.
+/// Implementation for storage objects.
 pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// Open a storage object.
     ///
@@ -120,51 +121,99 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     async fn sync(&self) -> io::Result<()>;
 }
 
-/// Check whether the given request is aligned.
-fn is_aligned<V: IoVectorTrait>(
-    bufv: &V,
-    offset: u64,
-    mem_align: usize,
-    req_align: usize,
-    size: Option<u64>,
-) -> io::Result<bool> {
-    debug_assert!(mem_align.is_power_of_two() && req_align.is_power_of_two());
-
-    let req_align_mask = req_align as u64 - 1;
-
-    Ok(if offset & req_align_mask != 0 {
-        false
-    } else if bufv.len() & req_align_mask == 0 {
-        bufv.is_aligned(mem_align, req_align, false)
-    } else if bufv.is_aligned(mem_align, req_align, true) {
-        if let Some(size) = size {
-            let end = offset
-                .checked_add(bufv.len())
-                .ok_or_else(|| io::Error::other("Write wrap-around"))?;
-            end == size
-        } else {
-            false
-        }
-    } else {
-        false
-    })
+/// Wrapper around storage driver implementations to provide additional common functionality.
+#[derive(Debug)]
+pub struct StorageWrapper<S: Storage> {
+    /// Storage driver instance.
+    inner: S,
 }
 
-/// Helper methods for storage objects.
-///
-/// Provides some simpler methods for accessing storage objects.
-pub trait StorageExt: Storage {
+impl<S: Storage> StorageWrapper<S> {
+    /// Minimum required alignment for memory buffers.
+    pub fn mem_align(&self) -> usize {
+        self.inner.mem_align()
+    }
+
+    /// Minimum required alignment for offsets and lengths.
+    pub fn req_align(&self) -> usize {
+        self.inner.req_align()
+    }
+
+    /// Storage object length.
+    pub fn size(&self) -> io::Result<u64> {
+        self.inner.size()
+    }
+
+    /// Read data at `offset` into `bufv`.
+    ///
+    /// Reads until `bufv` is filled completely, i.e. will not do short reads.  When reaching the
+    /// end of file, the rest of `bufv` is filled with 0.
+    ///
+    /// Everything must be aligned properly.
+    pub async fn aligned_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        self.inner.readv(bufv, offset).await
+    }
+
+    /// Write data from `bufv` to `offset`.
+    ///
+    /// Writes all data from `bufv`, i.e. will not do short writes.  When reaching the end of file,
+    /// grow it as necessary so that the new end of file will be at `offset + bufv.len()`.
+    ///
+    /// If growing is not possible, writes beyond the end of file (even if only partially) should
+    /// fail.
+    ///
+    /// Everything must be aligned properly.
+    pub async fn aligned_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+        // TODO await serializing writes
+        self.inner.writev(bufv, offset).await
+    }
+
+    /// Ensure the given range reads back as zeroes.
+    ///
+    /// The default implementation writes actual zeroes as data, which is inefficient.  Storage
+    /// drivers should override it with a more efficient implementation.
+    pub async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        // TODO await serializing writes
+        self.inner.write_zeroes(offset, length).await
+    }
+
+    /// Discard the given range, with undefined contents when read back.
+    ///
+    /// Tell the storage layer this range is no longer needed and need not be backed by actual
+    /// storage.  When read back, the data read will be undefined, i.e. not necessarily zeroes.
+    ///
+    /// No-op implementations therefore explicitly fulfill the interface contract.
+    pub async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        // TODO await serializing writes
+        self.inner.discard(offset, length).await
+    }
+
+    /// Flush internal buffers.
+    ///
+    /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
+    /// you want to call `sync()` afterwards.
+    pub async fn flush(&self) -> io::Result<()> {
+        self.inner.flush().await
+    }
+
+    /// Sync data already written to the storage hardware.
+    ///
+    /// This does not necessarily include flushing internal buffers, i.e. `flush`.  When using
+    /// `sync()`, consider whether you want to call `flush()` before it.
+    pub async fn sync(&self) -> io::Result<()> {
+        self.inner.sync().await
+    }
+
     /// Read data at `offset` into `buf`.
     #[allow(async_fn_in_trait)] // No need for Send
-    async fn read(&self, buf: impl Into<IoVectorMut<'_>>, offset: u64) -> io::Result<()> {
+    pub async fn read(&self, buf: impl Into<IoVectorMut<'_>>, offset: u64) -> io::Result<()> {
         self.unaligned_readv(buf.into(), offset).await
     }
 
     /// Read data at `offset` into `bufv`.
     ///
     /// Check alignment.  If anything does not meet the requirements, enforce it.
-    #[allow(async_fn_in_trait)] // No need for Send
-    async fn unaligned_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+    pub async fn unaligned_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         if bufv.is_empty() {
             return Ok(());
         }
@@ -173,7 +222,7 @@ pub trait StorageExt: Storage {
         let req_align = self.req_align();
 
         if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
-            return self.readv(bufv, offset).await;
+            return self.inner.readv(bufv, offset).await;
         }
 
         let req_align_mask = req_align as u64 - 1;
@@ -210,13 +259,13 @@ pub trait StorageExt: Storage {
             &mut pad_tail_len,
             &mut bounce,
         )?;
-        self.readv(bufv, padded_offset).await?;
+        self.inner.readv(bufv, padded_offset).await?;
         Ok(())
     }
 
     /// Write data from `buf` to `offset`.
     #[allow(async_fn_in_trait)] // No need for Send
-    async fn write(&self, buf: impl Into<IoVector<'_>>, offset: u64) -> io::Result<()> {
+    pub async fn write(&self, buf: impl Into<IoVector<'_>>, offset: u64) -> io::Result<()> {
         self.unaligned_writev(buf.into(), offset).await
     }
 
@@ -224,7 +273,8 @@ pub trait StorageExt: Storage {
     ///
     /// Check alignment.  If anything does not meet the requirements, enforce it.
     #[allow(async_fn_in_trait)] // No need for Send
-    async fn unaligned_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+    pub async fn unaligned_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+        // TODO await serializing writes
         if bufv.is_empty() {
             return Ok(());
         }
@@ -233,7 +283,7 @@ pub trait StorageExt: Storage {
         let req_align = self.req_align();
 
         if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
-            return self.writev(bufv, offset).await;
+            return self.inner.writev(bufv, offset).await;
         }
 
         // FIXME: Write serialization
@@ -397,9 +447,45 @@ pub trait StorageExt: Storage {
         }
 
         let bufv = bufv_unwrapped.into();
-        self.writev(bufv, padded_offset).await?;
+        self.inner.writev(bufv, padded_offset).await?;
         Ok(())
     }
+}
+
+impl<S: Storage> From<S> for StorageWrapper<S> {
+    fn from(inner: S) -> Self {
+        StorageWrapper { inner }
+    }
+}
+
+/// Check whether the given request is aligned.
+fn is_aligned<V: IoVectorTrait>(
+    bufv: &V,
+    offset: u64,
+    mem_align: usize,
+    req_align: usize,
+    size: Option<u64>,
+) -> io::Result<bool> {
+    debug_assert!(mem_align.is_power_of_two() && req_align.is_power_of_two());
+
+    let req_align_mask = req_align as u64 - 1;
+
+    Ok(if offset & req_align_mask != 0 {
+        false
+    } else if bufv.len() & req_align_mask == 0 {
+        bufv.is_aligned(mem_align, req_align, false)
+    } else if bufv.is_aligned(mem_align, req_align, true) {
+        if let Some(size) = size {
+            let end = offset
+                .checked_add(bufv.len())
+                .ok_or_else(|| io::Error::other("Write wrap-around"))?;
+            end == size
+        } else {
+            false
+        }
+    } else {
+        false
+    })
 }
 
 /// Allow dynamic use of storage objects (i.e. is object safe).
@@ -459,8 +545,6 @@ pub trait DynStorage: Debug + Display + Send + Sync {
     /// Object-safe wrapper around [`Storage::sync()`].
     fn sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 }
-
-impl<S: Storage> StorageExt for S {}
 
 impl<S: Storage> Storage for &S {
     fn mem_align(&self) -> usize {
@@ -666,5 +750,19 @@ impl StorageOpenOptions {
     pub fn direct(mut self, direct: bool) -> Self {
         self.direct = direct;
         self
+    }
+}
+
+impl<S: Storage> Display for StorageWrapper<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        <S as Display>::fmt(&self.inner, f)
+    }
+}
+
+impl<S: Storage> Deref for StorageWrapper<S> {
+    type Target = S;
+
+    fn deref(&self) -> &S {
+        &self.inner
     }
 }

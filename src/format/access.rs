@@ -5,7 +5,7 @@
 use super::drivers::{self, FormatDriverInstance};
 use crate::io_buffers::{IoVector, IoVectorMut, IoVectorTrait};
 use crate::vector_select::FutureVector;
-use crate::{Storage, StorageExt};
+use crate::{Storage, StorageWrapper};
 use std::fmt::{self, Display, Formatter};
 use std::{cmp, io};
 
@@ -33,7 +33,7 @@ pub enum Mapping<'a, S: Storage> {
     /// Raw data.
     Raw {
         /// Storage object where this data is stored.
-        storage: &'a S,
+        storage: &'a StorageWrapper<S>,
 
         /// Offset in `storage` where this data is stored.
         offset: u64,
@@ -109,7 +109,7 @@ impl<S: Storage> FormatAccess<S> {
     ///
     /// Includes recursive dependencies, i.e. those from other image dependencies like backing
     /// images.
-    pub(crate) fn collect_storage_dependencies(&self) -> Vec<&'_ S> {
+    pub(crate) fn collect_storage_dependencies(&self) -> Vec<&'_ StorageWrapper<S>> {
         self.inner.collect_storage_dependencies()
     }
 
@@ -243,7 +243,7 @@ impl<S: Storage> FormatAccess<S> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&'_ StorageWrapper<S>, u64, u64)> {
         let (storage, mapped_offset, mapped_length) = self
             .inner
             .ensure_data_mapping(offset, length, overwrite)

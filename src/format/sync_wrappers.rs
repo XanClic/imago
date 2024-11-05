@@ -2,7 +2,7 @@
 
 use super::drivers::FormatDriverInstance;
 use crate::io_buffers::{IoVector, IoVectorMut};
-use crate::{FormatAccess, Mapping, Storage};
+use crate::{FormatAccess, Mapping, Storage, StorageWrapper};
 use std::io;
 
 /// Synchronous wrapper around [`FormatAccess`].
@@ -102,7 +102,7 @@ impl<S: Storage> SyncFormatAccess<S> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&'_ StorageWrapper<S>, u64, u64)> {
         self.runtime
             .block_on(self.inner.ensure_data_mapping(offset, length, overwrite))
     }
