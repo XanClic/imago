@@ -388,7 +388,7 @@ impl<'a> From<IoBufferMut<'a>> for IoSliceMut<'a> {
 /// For read requests, dropping this object will automatically copy the data back to the original
 /// guest buffers.
 #[derive(Default)]
-pub struct IoVectorBounceBuffers<'a> {
+pub(crate) struct IoVectorBounceBuffers<'a> {
     /// Collection of bounce buffers; references to these are put into the re-aligned IoVector*
     /// object.
     buffers: Vec<IoBuffer>,
@@ -990,7 +990,7 @@ impl<'a> IoVector<'a> {
     ///
     /// `bounce_buffers` must have been created specifically for this single function call through
     /// `IoVectorBounceBuffers::default()`.
-    pub fn enforce_alignment_for_write<'b>(
+    pub(crate) fn enforce_alignment_for_write<'b>(
         self,
         mem_alignment: usize,
         req_alignment: usize,
@@ -1063,7 +1063,7 @@ impl<'a> IoVectorMut<'a> {
     ///
     /// `bounce_buffers` must have been created specifically for this single function call through
     /// `IoVectorBounceBuffers::default()`.
-    pub fn enforce_alignment_for_read<'b>(
+    pub(crate) fn enforce_alignment_for_read<'b>(
         self,
         mem_alignment: usize,
         req_alignment: usize,
