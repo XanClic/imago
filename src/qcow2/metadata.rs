@@ -1470,7 +1470,7 @@ pub(super) struct L2TableWriteGuard<'a> {
 impl L2Table {
     /// Create a new zeroed L2 table.
     pub fn new_cleared(header: &Header) -> Self {
-        let mut data = Vec::with_capacity(header.cluster_size());
+        let mut data = Vec::with_capacity(header.l2_entries());
         data.resize_with(header.l2_entries(), Default::default);
 
         L2Table {
