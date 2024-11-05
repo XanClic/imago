@@ -991,8 +991,8 @@ impl Table for L1Table {
         self.data.len()
     }
 
-    fn get_ref(&self, index: usize) -> &L1Entry {
-        self.data.get(index).unwrap()
+    fn get_ref(&self, index: usize) -> Option<&L1Entry> {
+        self.data.get(index)
     }
 
     fn get(&self, index: usize) -> L1Entry {
@@ -1558,8 +1558,8 @@ impl Table for L2Table {
         self.data.len()
     }
 
-    fn get_ref(&self, index: usize) -> &AtomicL2Entry {
-        self.data.get(index).unwrap()
+    fn get_ref(&self, index: usize) -> Option<&AtomicL2Entry> {
+        self.data.get(index)
     }
 
     fn get(&self, index: usize) -> L2Entry {
@@ -1767,8 +1767,8 @@ impl Table for RefTable {
         self.data.len()
     }
 
-    fn get_ref(&self, index: usize) -> &RefTableEntry {
-        self.data.get(index).unwrap()
+    fn get_ref(&self, index: usize) -> Option<&RefTableEntry> {
+        self.data.get(index)
     }
 
     fn get(&self, index: usize) -> RefTableEntry {
@@ -2313,7 +2313,7 @@ pub trait Table: Sized {
     /// Number of entries.
     fn entries(&self) -> usize;
     /// Get the given entry (as reference).
-    fn get_ref(&self, index: usize) -> &Self::InternalEntry;
+    fn get_ref(&self, index: usize) -> Option<&Self::InternalEntry>;
     /// Get the given entry (copied).
     fn get(&self, index: usize) -> Self::Entry;
     /// Get this table’s (first) cluster in the image file.
@@ -2388,7 +2388,8 @@ pub trait Table: Sized {
         // Safe because we have just allocated this, and it fits the alignment
         let raw_table = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
         for (i, be_value) in raw_table.iter_mut().enumerate() {
-            *be_value = self.get_ref(i).to_plain().to_be();
+            // 0 always works, that’s by design.
+            *be_value = self.get_ref(i).map(|e| e.to_plain()).unwrap_or(0).to_be();
         }
 
         if let Err(err) = image.write(&buffer, offset.0).await {
@@ -2432,7 +2433,12 @@ pub trait Table: Sized {
         let first_index = (index / alignment_in_entries) * alignment_in_entries;
         #[allow(clippy::needless_range_loop)]
         for i in 0..alignment_in_entries {
-            raw_entries[i] = self.get_ref(first_index + i).to_plain().to_be();
+            // 0 always works, that’s by design.
+            raw_entries[i] = self
+                .get_ref(first_index + i)
+                .map(|e| e.to_plain())
+                .unwrap_or(0)
+                .to_be();
         }
 
         image

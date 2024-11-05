@@ -749,23 +749,29 @@ macro_rules! impl_io_vector {
             ///
             /// This function has the returned vector’s lifetime be limited to how long the
             /// `bounce_buffers` object lives.
+            ///
+            /// `.2` and `.3` are the unaligned head and tail, if any (only returned when
+            /// `copy_into == true`).  These are not copied from `self` (despite `copy_into ==
+            /// true`), because the caller will need to use the aligned head and tail bounce
+            /// buffers for RMW, and then copy the data from `.2` and `.3` into there.  Note that
+            /// if the unaligned head and tail are covered by the same bounce buffer, only one
+            /// vector for both will be returned (in `.2`).
             #[allow(clippy::too_many_arguments)]
             fn create_aligned_buffer<'b>(
                 self,
                 mem_alignment: usize,
                 req_alignment: usize,
                 pad_head_len: usize,
-                mut pad_tail_len: usize,
+                pad_tail_len: &mut usize,
                 bounce_buffers: &'b mut Vec<IoBuffer>,
                 copy_into: bool,
                 copy_back: bool,
-            ) -> io::Result<($type<'b>, Option<Vec<$inner_type<'a>>>)>
+            ) -> io::Result<($type<'b>, Option<Vec<$inner_type<'a>>>, Option<Self>, Option<Self>)>
             where
                 'a: 'b,
             {
-                // An empty request is always aligned.
                 if self.len() == 0 {
-                    return Ok((self, None));
+                    panic!("Must not call create_aligned_buffer() for a length of 0");
                 }
 
                 debug_assert!(copy_into || copy_back);
@@ -777,7 +783,7 @@ macro_rules! impl_io_vector {
                 let usize_len = self.len().try_into().map_err(|_| io::Error::other("I/O vector length overflow"))?;
                 let full_length = pad_head_len
                     .checked_add(usize_len)
-                    .and_then(|l| l.checked_add(pad_tail_len))
+                    .and_then(|l| l.checked_add(*pad_tail_len))
                     .ok_or_else(|| io::Error::other("I/O vector length overflow"))?;
                 let missing = (
                     full_length
@@ -791,13 +797,13 @@ macro_rules! impl_io_vector {
                         missing,
                         pad_head_len,
                         self.len(),
-                        pad_tail_len,
+                        *pad_tail_len,
                         full_length,
                     );
-                    pad_tail_len += missing;
+                    *pad_tail_len += missing;
                 }
                 let full_length = full_length + missing;
-                debug_assert_eq!(pad_head_len + usize_len + pad_tail_len, full_length);
+                debug_assert_eq!(pad_head_len + usize_len + *pad_tail_len, full_length);
                 debug_assert_eq!(full_length & len_align_mask, 0);
 
                 // First, create all bounce buffers as necessary and put them into
@@ -810,19 +816,18 @@ macro_rules! impl_io_vector {
                     let base = buffer.as_ptr() as usize;
                     let len = buffer.len();
 
-                    if base & base_align_mask != 0 || len & len_align_mask != 0 || unaligned_length_collection == 0 {
-                        let unaligned_len = unaligned_length_collection + len;
+                    if base & base_align_mask != 0 || len & len_align_mask != 0 || unaligned_length_collection != 0 {
+                        unaligned_length_collection += len;
 
+                        let unaligned_len = unaligned_length_collection;
                         if unaligned_len & len_align_mask == 0 {
                             bounce_buffers.push(IoBuffer::new(unaligned_len, mem_alignment)?);
                             unaligned_length_collection = 0;
-                        } else {
-                            unaligned_length_collection = unaligned_len;
                         }
                     }
                 }
 
-                let unaligned_len = unaligned_length_collection + pad_tail_len;
+                let unaligned_len = unaligned_length_collection + *pad_tail_len;
                 if unaligned_len != 0 {
                     // `pad_head_len` and `pad_tail_len` must result in the whole length being
                     // aligned
@@ -837,42 +842,52 @@ macro_rules! impl_io_vector {
 
                 let mut realigned_vector = Vec::<$inner_type<'b>>::new();
                 let mut unaligned_collection: Option<Self> = None;
+                let mut head_buf = pad_head_len != 0;
                 let mut buffer_iter = bounce_buffers.iter_mut();
                 let mut copy_back_vector = copy_back.then(|| Vec::<$inner_type<'a>>::new());
+                let mut unaligned_head: Option<Self> = None;
+                let mut unaligned_tail: Option<Self> = None;
                 let buffer_count = self.vector.len();
+
+                unaligned_length_collection = pad_head_len;
 
                 for (i, buffer) in self.vector.into_iter().enumerate() {
                     let base = buffer.as_ptr() as usize;
                     let len = buffer.len();
-                    let head = i == 0;
-                    let tail = i == buffer_count - 1;
+                    let last_buffer = i == buffer_count - 1;
 
-                    if base & base_align_mask != 0 || len & len_align_mask != 0 || unaligned_collection.is_some() || tail {
+                    if base & base_align_mask != 0 || len & len_align_mask != 0 || unaligned_length_collection != 0 || last_buffer {
                         let collection = unaligned_collection.get_or_insert_with(|| Self::new());
+                        unaligned_length_collection += buffer.len();
                         collection.push_ioslice(buffer);
 
-                        let unaligned_len = collection.len() +
-                            (if head { pad_head_len as u64 } else { 0 }) +
-                            (if tail { pad_tail_len as u64 } else { 0 });
-                        if tail {
+                        if last_buffer {
+                            unaligned_length_collection += *pad_tail_len;
                             // Padding must align the tail
-                            debug_assert_eq!(unaligned_len & len_align_mask as u64, 0);
+                            debug_assert_eq!(unaligned_length_collection & len_align_mask, 0);
                         }
-                        if unaligned_len & len_align_mask as u64 == 0 {
+
+                        let unaligned_len = unaligned_length_collection;
+                        if unaligned_len & len_align_mask == 0 {
                             let new_buf: &'b mut IoBuffer = buffer_iter.next().unwrap();
                             if copy_into {
-                                let range = std::ops::Range {
-                                    start: if head { pad_head_len } else { 0 },
-                                    end: new_buf.len() - if tail { pad_tail_len } else { 0 },
-                                };
-                                collection.copy_into_slice(new_buf.as_mut_range(range).into_slice());
-                            }
-
-                            // Drop the collection
-                            let mut collection = unaligned_collection.take().unwrap();
-                            if let Some(copy_back_vector) = copy_back_vector.as_mut() {
+                                if head_buf {
+                                    assert!(unaligned_head.is_none());
+                                    unaligned_head = Some(unaligned_collection.take().unwrap());
+                                    head_buf = false;
+                                } else if last_buffer && *pad_tail_len != 0 {
+                                    assert!(unaligned_tail.is_none());
+                                    unaligned_tail = Some(unaligned_collection.take().unwrap());
+                                } else {
+                                    collection.copy_into_slice(new_buf.as_mut().into_slice());
+                                }
+                            } else if let Some(copy_back_vector) = copy_back_vector.as_mut() {
+                                let mut collection = unaligned_collection.take().unwrap();
                                 copy_back_vector.append(&mut collection.vector);
                             }
+
+                            unaligned_collection = None;
+                            unaligned_length_collection = 0;
 
                             // Get a reference from `bounce_buffers` to ensure the lifetime
                             realigned_vector.push($inner_type::new(new_buf.as_mut().into_slice()));
@@ -895,6 +910,8 @@ macro_rules! impl_io_vector {
                         total_size: full_length as u64,
                     },
                     copy_back_vector,
+                    unaligned_head,
+                    unaligned_tail,
                 ))
             }
         }
@@ -981,7 +998,15 @@ impl<'a> IoVector<'a> {
     ///
     /// `pad_head_len` and `pad_tail_len` may specify whether bounce buffers should be appended to
     /// head or tail, respectively (to match the request alignment).  Note that these are not
-    /// initialized; the caller is expected to fill those areas for RMW.
+    /// initialized; the caller is expected to fill those areas for RMW, like so:
+    /// - This function will not copy data from `self` into the unaligned part of head and tail.
+    /// - This unaligned part of head and tail is returned (if any), these are `.1` and `.2` of the
+    ///   return value.
+    /// - The caller is expected to read head and tail into the bounce buffers (which are
+    ///   referenced by the returned vector), and then copy `.1` and `.2` into there, too.
+    ///
+    /// (Note that if the unaligned head and tail are covered by the same bounce buffer, only one
+    /// vector for both will be returned (in `.1`).)
     ///
     /// To align everything, bounce buffers are created and filled with data from the
     /// buffers in the vector (which is why this is only for writes).  These bounce buffers
@@ -995,29 +1020,30 @@ impl<'a> IoVector<'a> {
         mem_alignment: usize,
         req_alignment: usize,
         pad_head_len: usize,
-        pad_tail_len: usize,
+        pad_tail_len: &mut usize,
         bounce_buffers: &'b mut IoVectorBounceBuffers<'static>,
-    ) -> io::Result<IoVector<'b>>
+    ) -> io::Result<(IoVector<'b>, Option<IoVector<'a>>, Option<IoVector<'a>>)>
     where
         'a: 'b,
     {
         debug_assert!(bounce_buffers.is_empty());
 
-        let (aligned, copy_back_buffers) = self.create_aligned_buffer(
-            mem_alignment,
-            req_alignment,
-            pad_head_len,
-            pad_tail_len,
-            &mut bounce_buffers.buffers,
-            true,
-            false,
-        )?;
+        let (aligned, copy_back_buffers, unaligned_head, unaligned_tail) = self
+            .create_aligned_buffer(
+                mem_alignment,
+                req_alignment,
+                pad_head_len,
+                pad_tail_len,
+                &mut bounce_buffers.buffers,
+                true,
+                false,
+            )?;
         debug_assert!(copy_back_buffers.is_none());
 
         bounce_buffers.pad_head_len = pad_head_len;
-        bounce_buffers.pad_tail_len = pad_tail_len;
+        bounce_buffers.pad_tail_len = *pad_tail_len;
 
-        Ok(aligned)
+        Ok((aligned, unaligned_head, unaligned_tail))
     }
 }
 
@@ -1068,7 +1094,7 @@ impl<'a> IoVectorMut<'a> {
         mem_alignment: usize,
         req_alignment: usize,
         pad_head_len: usize,
-        pad_tail_len: usize,
+        pad_tail_len: &mut usize,
         bounce_buffers: &'b mut IoVectorBounceBuffers<'a>,
     ) -> io::Result<IoVectorMut<'b>>
     where
@@ -1076,7 +1102,7 @@ impl<'a> IoVectorMut<'a> {
     {
         debug_assert!(bounce_buffers.is_empty());
 
-        let (aligned, copy_back_buffers) = self.create_aligned_buffer(
+        let (aligned, copy_back_buffers, head, tail) = self.create_aligned_buffer(
             mem_alignment,
             req_alignment,
             pad_head_len,
@@ -1086,9 +1112,12 @@ impl<'a> IoVectorMut<'a> {
             true,
         )?;
 
+        debug_assert!(head.is_none());
+        debug_assert!(tail.is_none());
+
         bounce_buffers.copy_back_into = copy_back_buffers;
         bounce_buffers.pad_head_len = pad_head_len;
-        bounce_buffers.pad_tail_len = pad_tail_len;
+        bounce_buffers.pad_tail_len = *pad_tail_len;
 
         Ok(aligned)
     }

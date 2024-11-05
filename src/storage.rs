@@ -198,7 +198,7 @@ pub trait StorageExt: Storage {
         );
 
         let pad_head_len = (offset - padded_offset) as usize;
-        let pad_tail_len = (padded_end - unpadded_end) as usize;
+        let mut pad_tail_len = (padded_end - unpadded_end) as usize;
 
         trace!("Head length: {pad_head_len}; tail length: {pad_tail_len}");
 
@@ -207,7 +207,7 @@ pub trait StorageExt: Storage {
             mem_align,
             req_align,
             pad_head_len,
-            pad_tail_len,
+            &mut pad_tail_len,
             &mut bounce,
         )?;
         self.readv(bufv, padded_offset).await?;
@@ -236,7 +236,169 @@ pub trait StorageExt: Storage {
             return self.writev(bufv, offset).await;
         }
 
-        todo!("RMW requires write serialization capabilities")
+        // FIXME: Write serialization
+
+        let req_align_mask = req_align as u64 - 1;
+
+        trace!(
+            "Unaligned write: {:#x} + {} (size: {:#x})",
+            offset,
+            bufv.len(),
+            self.size().unwrap()
+        );
+
+        let unpadded_end = offset + bufv.len();
+        let padded_offset = offset & !req_align_mask;
+        // This will over-align at the end of file (aligning to exactly the end of file would be
+        // sufficient), but it is easier this way.  Small TODO, as this will indeed increase the
+        // file length (which the over-alignment in `unaligned_readv()` does not).
+        let padded_end = (unpadded_end + req_align_mask) & !req_align_mask;
+
+        trace!(
+            "Padded write: {:#x} + {}",
+            padded_offset,
+            padded_end - padded_offset
+        );
+
+        let pad_head_len = (offset - padded_offset) as usize;
+        let mut pad_tail_len = (padded_end - unpadded_end) as usize;
+
+        trace!("Head length: {pad_head_len}; tail length: {pad_tail_len}");
+
+        let mut bounce = IoVectorBounceBuffers::default();
+        let (bufv, unaligned_head, unaligned_tail) = bufv.enforce_alignment_for_write(
+            mem_align,
+            req_align,
+            pad_head_len,
+            &mut pad_tail_len,
+            &mut bounce,
+        )?;
+
+        let bufv_unwrapped = bufv.into_inner();
+
+        if pad_head_len > 0 && pad_tail_len > 0 && bufv_unwrapped.len() == 1 {
+            let unaligned = unaligned_head.unwrap();
+            // Covered by `unaligned_head`.
+            assert!(unaligned_tail.is_none());
+
+            // Single buffer for both head and tail.  Must be a bounce buffer because of
+            // `pad_head_len > 0`, so we can make it mutable.
+            let buf = bufv_unwrapped.first().unwrap();
+            let buf = unsafe { std::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len()) };
+
+            let retain_start = pad_head_len;
+            let retain_end = retain_start + unaligned.len() as usize;
+            // from the head case below
+            let read_len1 = retain_start.next_multiple_of(cmp::max(mem_align, req_align));
+            let read_start1 = 0;
+            let read_end1 = read_start1 + read_len1;
+            // from the tail case below
+            let read_len2 = pad_tail_len.next_multiple_of(cmp::max(mem_align, req_align));
+            let read_end2 = buf.len();
+            let read_start2 = read_end2.checked_sub(read_len2).unwrap();
+            trace!(
+                "Single buffer RMW, full length: {}; read ranges: {}..{} (from {:#x}) and {}..{} (from {:#x}); retain range: {}..{}",
+                buf.len(),
+                read_start1,
+                read_end1,
+                padded_offset,
+                read_start2,
+                read_end2,
+                padded_end - read_len2 as u64,
+                retain_start,
+                retain_end,
+            );
+
+            if read_start2 <= read_end1 {
+                trace!(
+                    "Unifying read to {}..{} (from {:#x})",
+                    read_start1,
+                    read_end2,
+                    padded_offset
+                );
+                self.read(&mut buf[read_start1..read_end2], padded_offset)
+                    .await?;
+            } else {
+                self.read(&mut buf[read_start1..read_end1], padded_offset)
+                    .await?;
+                self.read(
+                    &mut buf[read_start2..read_end2],
+                    padded_end - read_len2 as u64,
+                )
+                .await?;
+            }
+            unaligned.copy_into_slice(&mut buf[retain_start..retain_end]);
+        } else {
+            if pad_head_len > 0 {
+                let unaligned_head = unaligned_head.unwrap();
+
+                // There must be a head bounce buffer because `pad_head_len > 0`.
+                let head_buf = bufv_unwrapped.first().unwrap();
+                let head_buf = unsafe {
+                    std::slice::from_raw_parts_mut(head_buf.as_ptr() as *mut u8, head_buf.len())
+                };
+
+                let retain_start = pad_head_len;
+                let retain_end = head_buf.len();
+                let read_len = retain_start.next_multiple_of(cmp::max(mem_align, req_align));
+                let read_start = 0;
+                let read_end = read_start + read_len;
+                trace!(
+                    "Head buffer RMW, head length: {}; read range: {}..{} (from {:#x}; retain range: {}..{}",
+                    head_buf.len(),
+                    read_start,
+                    read_end,
+                    padded_offset,
+                    retain_start,
+                    retain_end,
+                );
+
+                assert!(read_end <= head_buf.len());
+                self.read(&mut head_buf[read_start..read_end], padded_offset)
+                    .await?;
+
+                assert_eq!(retain_end - retain_start, unaligned_head.len() as usize);
+                unaligned_head.copy_into_slice(&mut head_buf[retain_start..retain_end]);
+            }
+
+            if pad_tail_len > 0 {
+                let unaligned_tail = unaligned_tail.unwrap();
+
+                // There must be a tail bounce buffer one because `pad_tail_len > 0`.
+                let tail_buf = bufv_unwrapped.last().unwrap();
+                let tail_buf = unsafe {
+                    std::slice::from_raw_parts_mut(tail_buf.as_ptr() as *mut u8, tail_buf.len())
+                };
+
+                let retain_start = 0;
+                let retain_end = tail_buf.len() - pad_tail_len;
+                let read_len = pad_tail_len.next_multiple_of(cmp::max(mem_align, req_align));
+                let read_end = tail_buf.len();
+                let read_start = read_end.checked_sub(read_len).unwrap();
+                trace!(
+                    "Tail buffer RMW, tail length: {}; read range: {}..{} (from {:#x}); retain range: {}..{}",
+                    tail_buf.len(),
+                    read_start,
+                    read_end,
+                    padded_end - read_len as u64,
+                    retain_start,
+                    retain_end,
+                );
+
+                self.read(
+                    &mut tail_buf[read_start..read_end],
+                    padded_end - read_len as u64,
+                )
+                .await?;
+
+                assert_eq!(retain_end - retain_start, unaligned_tail.len() as usize);
+                unaligned_tail.copy_into_slice(&mut tail_buf[retain_start..retain_end]);
+            }
+        }
+
+        let bufv = bufv_unwrapped.into();
+        self.writev(bufv, padded_offset).await?;
+        Ok(())
     }
 }
 

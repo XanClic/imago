@@ -109,11 +109,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ) -> io::Result<(&'_ S, u64, u64)> {
         let l2_table = self.ensure_l2(offset).await?;
 
-        // TODO: Is there a more optimized way?
-        // We do not want to write-lock the L2 table until we need to.  But getting a Write lock
-        // that would ensure no modifications happened since we checked last (while not having a
-        // lock yet) is not possible.
-        // FWIW, this is a fast path for already-present allocations, so not too terrible.
+        // Fast path for if everything is already allocated, which should be the common case at
+        // runtime.
+        // It must really be everything, though; we know our caller will want to have everything
+        // allocated eventually, so if anything is missing, go down to the allocation path so we
+        // try to allocate clusters such that they are not fragmented (if possible) and we can
+        // return as big of a single mapping as possible.
         let existing = self
             .do_get_mapping_with_l2(offset, length, &l2_table)
             .await?;
@@ -123,7 +124,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             writable: true,
         } = existing.0
         {
-            return Ok((storage, offset, existing.1));
+            if existing.1 >= length {
+                return Ok((storage, offset, existing.1));
+            }
         }
 
         let l2_table = l2_table.lock_write().await;
