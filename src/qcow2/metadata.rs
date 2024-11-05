@@ -1881,8 +1881,12 @@ impl RefBlock {
             .get_offset()
             .ok_or_else(|| io::Error::other("Cannot write qcow2 refcount block, no offset set"))?;
 
-        image.write(self.raw_data.as_ref(), offset.0).await?;
         self.modified.store(false, Ordering::Relaxed);
+        if let Err(err) = image.write(self.raw_data.as_ref(), offset.0).await {
+            self.modified.store(true, Ordering::Relaxed);
+            return Err(err);
+        }
+
         Ok(())
     }
 
@@ -2379,14 +2383,19 @@ pub trait Table: Sized {
 
         let mut buffer = IoBuffer::new(byte_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
+        self.clear_modified();
+
         // Safe because we have just allocated this, and it fits the alignment
         let raw_table = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
         for (i, be_value) in raw_table.iter_mut().enumerate() {
             *be_value = self.get_ref(i).to_plain().to_be();
         }
 
-        image.write(&buffer, offset.0).await?;
-        self.clear_modified();
+        if let Err(err) = image.write(&buffer, offset.0).await {
+            self.set_modified();
+            return Err(err);
+        }
+
         Ok(())
     }
 
