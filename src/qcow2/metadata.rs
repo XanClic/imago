@@ -1137,6 +1137,12 @@ impl L2Entry {
         self.0 & (1u64 << 63) != 0
     }
 
+    /// Clear “copied” flag.
+    #[must_use]
+    pub fn without_copied(self) -> Self {
+        L2Entry(self.0 & !(1u64 << 63))
+    }
+
     /// Whether the cluster is a zero cluster.
     ///
     /// Assumes the L2 entry references a data cluster, not a compressed cluster.
@@ -1602,6 +1608,27 @@ impl Table for L2Table {
 
     fn set_modified(&self) {
         self.modified.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Clone for L2Table {
+    fn clone(&self) -> Self {
+        let mut data = Vec::with_capacity(self.data.len());
+        for entry in &self.data {
+            // None of these can be `copied`
+            let entry = entry.get().without_copied();
+            data.push(AtomicL2Entry(AtomicU64::new(entry.0)));
+        }
+
+        let modified = AtomicBool::new(self.is_modified());
+
+        L2Table {
+            cluster: None,
+            data: data.into_boxed_slice(),
+            cluster_bits: self.cluster_bits,
+            modified,
+            writer_lock: Default::default(),
+        }
     }
 }
 

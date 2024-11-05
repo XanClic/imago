@@ -24,7 +24,10 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             let l2_table = if let Some(saved) = saved_l2_table.as_ref() {
                 saved
             } else {
-                let new_l2 = self.get_l2(offset).await?.ok_or(io::ErrorKind::Other)?;
+                let new_l2 = self
+                    .get_l2(offset, false)
+                    .await?
+                    .ok_or(io::ErrorKind::Other)?;
                 saved_l2_table.get_or_insert(new_l2)
             };
 

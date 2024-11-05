@@ -12,7 +12,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         offset: GuestOffset,
         max_length: u64,
     ) -> io::Result<(Mapping<'_, S>, u64)> {
-        let Some(l2_table) = self.get_l2(offset).await? else {
+        let Some(l2_table) = self.get_l2(offset, false).await? else {
             let cb = self.header.cluster_bits();
             let len = cmp::min(offset.remaining_in_l2_table(cb), max_length);
             let mapping = if let Some(backing) = self.backing.as_ref() {
@@ -152,12 +152,22 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
     /// Get the L2 table referenced by the given L1 table index, if any.
     ///
-    /// If the L1 table index does not point to any L2 table, return `Ok(None)`.
-    pub(super) async fn get_l2(&self, offset: GuestOffset) -> io::Result<Option<Arc<L2Table>>> {
+    /// `writable` says whether the L2 table should be modifiable.
+    ///
+    /// If the L1 table index does not point to any L2 table, or the existing entry is not
+    /// modifiable but `writable` is true, return `Ok(None)`.
+    pub(super) async fn get_l2(
+        &self,
+        offset: GuestOffset,
+        writable: bool,
+    ) -> io::Result<Option<Arc<L2Table>>> {
         let cb = self.header.cluster_bits();
 
         let l1_entry = self.l1_table.read().await.get(offset.l1_index(cb));
         if let Some(l2_offset) = l1_entry.l2_offset() {
+            if writable && !l1_entry.is_copied() {
+                return Ok(None);
+            }
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -178,7 +188,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     pub(super) async fn ensure_l2(&self, offset: GuestOffset) -> io::Result<Arc<L2Table>> {
         let cb = self.header.cluster_bits();
 
-        if let Some(l2) = self.get_l2(offset).await? {
+        if let Some(l2) = self.get_l2(offset, true).await? {
             return Ok(l2);
         }
 
@@ -191,9 +201,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
 
         let l1_entry = l1_locked.get(l1_index);
-        if let Some(l2_offset) = l1_entry.l2_offset() {
-            drop(l1_locked);
-
+        let mut l2_table = if let Some(l2_offset) = l1_entry.l2_offset() {
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -201,11 +209,17 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 )
             })?;
 
-            return self.l2_cache.get_or_insert(l2_cluster).await;
-        }
+            let l2 = self.l2_cache.get_or_insert(l2_cluster).await?;
+            if l1_entry.is_copied() {
+                return Ok(l2);
+            }
+
+            L2Table::clone(&l2)
+        } else {
+            L2Table::new_cleared(&self.header)
+        };
 
         let l2_cluster = self.allocate_meta_cluster().await?;
-        let mut l2_table = L2Table::new_cleared(&self.header);
         l2_table.set_cluster(l2_cluster);
         l2_table.write(self.metadata.as_ref()).await?;
 
@@ -213,6 +227,12 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         l1_locked
             .write_entry(self.metadata.as_ref(), l1_index)
             .await?;
+
+        // Free old L2 table, if any
+        if let Some(l2_offset) = l1_entry.l2_offset() {
+            self.free_meta_clusters(l2_offset.cluster(cb), ClusterCount(1))
+                .await;
+        }
 
         let l2_table = Arc::new(l2_table);
         self.l2_cache
