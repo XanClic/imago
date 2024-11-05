@@ -4,28 +4,27 @@
 //! `select`ing (awaiting one) or `join`ing (awaiting all) them.
 
 use std::future::Future;
-use std::io;
 use std::marker::Unpin;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// Collect futures and await one or all of them.
-pub(crate) struct FutureVector<R, F: Future<Output = io::Result<R>> + Unpin> {
+pub(crate) struct FutureVector<R, E, F: Future<Output = Result<R, E>> + Unpin> {
     /// Pending futures.
     vec: Vec<F>,
 }
 
 /// Await a single future.
-pub(crate) struct FutureVectorSelect<'a, R, F: Future<Output = io::Result<R>> + Unpin>(
-    &'a mut FutureVector<R, F>,
+pub(crate) struct FutureVectorSelect<'a, R, E, F: Future<Output = Result<R, E>> + Unpin>(
+    &'a mut FutureVector<R, E, F>,
 );
 
 /// Await all futures, discarding successful results.
-pub(crate) struct FutureVectorDiscardingJoin<'a, R, F: Future<Output = io::Result<R>> + Unpin>(
-    &'a mut FutureVector<R, F>,
+pub(crate) struct FutureVectorDiscardingJoin<'a, R, E, F: Future<Output = Result<R, E>> + Unpin>(
+    &'a mut FutureVector<R, E, F>,
 );
 
-impl<R, F: Future<Output = io::Result<R>> + Unpin> FutureVector<R, F> {
+impl<R, E, F: Future<Output = Result<R, E>> + Unpin> FutureVector<R, E, F> {
     /// Create a new `FutureVector`.
     pub fn new() -> Self {
         FutureVector { vec: Vec::new() }
@@ -52,9 +51,9 @@ impl<R, F: Future<Output = io::Result<R>> + Unpin> FutureVector<R, F> {
     ///
     /// Functionally, behaves like:
     /// ```ignore
-    /// async fn select(&mut self) -> io::Result<R>;
+    /// async fn select(&mut self) -> Result<R, E>;
     /// ```
-    pub fn select(&mut self) -> FutureVectorSelect<'_, R, F> {
+    pub fn select(&mut self) -> FutureVectorSelect<'_, R, E, F> {
         FutureVectorSelect(self)
     }
 
@@ -64,14 +63,14 @@ impl<R, F: Future<Output = io::Result<R>> + Unpin> FutureVector<R, F> {
     ///
     /// Functionally, behaves like:
     /// ```ignore
-    /// async fn discarding_join(&mut self) -> io::Result<()>;
+    /// async fn discarding_join(&mut self) -> Result<(), E>;
     /// ```
-    pub fn discarding_join(&mut self) -> FutureVectorDiscardingJoin<'_, R, F> {
+    pub fn discarding_join(&mut self) -> FutureVectorDiscardingJoin<'_, R, E, F> {
         FutureVectorDiscardingJoin(self)
     }
 }
 
-impl<R, F: Future<Output = io::Result<R>> + Unpin> Future for FutureVectorSelect<'_, R, F> {
+impl<R, E, F: Future<Output = Result<R, E>> + Unpin> Future for FutureVectorSelect<'_, R, E, F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<F::Output> {
@@ -88,10 +87,12 @@ impl<R, F: Future<Output = io::Result<R>> + Unpin> Future for FutureVectorSelect
     }
 }
 
-impl<R, F: Future<Output = io::Result<R>> + Unpin> Future for FutureVectorDiscardingJoin<'_, R, F> {
-    type Output = io::Result<()>;
+impl<R, E, F: Future<Output = Result<R, E>> + Unpin> Future
+    for FutureVectorDiscardingJoin<'_, R, E, F>
+{
+    type Output = Result<(), E>;
 
-    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Result<(), E>> {
         let mut i = 0;
         while i < self.0.len() {
             if let Poll::Ready(result) = F::poll(Pin::new(&mut self.0.vec[i]), ctx) {
