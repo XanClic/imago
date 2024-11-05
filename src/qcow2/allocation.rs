@@ -174,6 +174,11 @@ impl<S: Storage> Allocator<S> {
         })
     }
 
+    /// Flush the refcount block cache.
+    pub async fn flush_rb_cache(&self) -> io::Result<()> {
+        self.rb_cache.flush().await
+    }
+
     /// Allocate clusters in the image file.
     async fn allocate_clusters(&mut self, count: ClusterCount) -> io::Result<HostCluster> {
         let mut index = self.first_free_cluster;

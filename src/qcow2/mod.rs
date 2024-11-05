@@ -364,6 +364,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
     async fn flush(&self) -> io::Result<()> {
         self.l2_cache.flush().await?;
+        if let Some(allocator) = self.allocator.as_ref() {
+            allocator.lock().await.flush_rb_cache().await?;
+        }
 
         self.metadata.flush().await?;
         if let Some(storage) = self.storage.as_ref() {
