@@ -86,6 +86,7 @@ pub mod file;
 pub mod format;
 pub mod io_buffers;
 mod macros;
+mod misc_helpers;
 pub mod null;
 pub mod qcow2;
 pub mod raw;

@@ -6,13 +6,17 @@
 use crate::io_buffers::{
     IoBuffer, IoBufferRefTrait, IoVector, IoVectorBounceBuffers, IoVectorMut, IoVectorTrait,
 };
+use crate::misc_helpers::Overlaps;
+use crate::vector_select::FutureVector;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{cmp, io};
+use tokio::sync::oneshot;
 use tracing::trace;
 
 /// Parameters from which a storage object can be constructed.
@@ -126,6 +130,66 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
 pub struct StorageWrapper<S: Storage> {
     /// Storage driver instance.
     inner: S,
+
+    /// Current in-flight write that allow concurrent writes to the same region.
+    non_serializing_writes: RangeBlockList,
+
+    /// Current in-flight write that do not allow concurrent writes to the same region.
+    serializing_writes: RangeBlockList,
+}
+
+/// A list of ranges blocked for some kind of concurrent access.
+///
+/// Depending on the use, some will block all concurrent access (i.e. serializing writes will block
+/// both serializing and non-serializing writes), while others will only block a subset
+/// (non-serializing writes will only block serializing writes).
+#[derive(Debug, Default)]
+struct RangeBlockList {
+    /// The list of ranges.
+    ///
+    /// Serializing writes (concurrent write blockers) are supposed to be rare, so it is important
+    /// that entering items into this list is cheap, not that iterating it is.
+    ///
+    /// Normal non-async RwLock, so do not await while locked!
+    blocked: std::sync::RwLock<Vec<Arc<RangeBlock>>>,
+}
+
+/// A range blocked for some kind of concurrent access.
+#[derive(Debug)]
+struct RangeBlock {
+    /// The range.
+    range: Range<u64>,
+
+    /// List of requests awaiting the range to become unblocked.
+    ///
+    /// When the corresponding `RangeBlockGuard` is dropped, these will all be awoken (via
+    /// `oneshot::Sender::send(())`).
+    ///
+    /// Normal non-async mutex, so do not await while locked!
+    waitlist: std::sync::Mutex<Vec<oneshot::Sender<()>>>,
+
+    /// Index in the corresponding `RangeBlockList.blocked` list, so it can be dropped quickly.
+    ///
+    /// (When the corresponding `RangeBlockGuard` is dropped, this entry is swap-removed from the
+    /// `blocked` list, and the other entry taking its place has its `index` updated.)
+    ///
+    /// Only access under `blocked` lock!
+    index: AtomicUsize,
+}
+
+/// Keeps a `RangeBlock` alive.
+///
+/// When dropped, removes the `RangeBlock` from its list, and wakes all requests in the `waitlist`.
+#[derive(Debug)]
+struct RangeBlockGuard<'a> {
+    /// List where this blocker resides.
+    list: &'a RangeBlockList,
+
+    /// `Option`, so `drop()` can `take()` it and unwrap the `Arc`.
+    ///
+    /// Consequently, do not clone: Must have refcount 1 when dropped.  (The only clone must be in
+    /// `self.list.blocked`, under index `self.block.index`.)
+    block: Option<Arc<RangeBlock>>,
 }
 
 impl<S: Storage> StorageWrapper<S> {
@@ -164,7 +228,9 @@ impl<S: Storage> StorageWrapper<S> {
     ///
     /// Everything must be aligned properly.
     pub async fn aligned_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
-        // TODO await serializing writes
+        let _sw_guard = self
+            .await_write_blockers(offset..(offset + bufv.len()))
+            .await;
         self.inner.writev(bufv, offset).await
     }
 
@@ -173,7 +239,7 @@ impl<S: Storage> StorageWrapper<S> {
     /// The default implementation writes actual zeroes as data, which is inefficient.  Storage
     /// drivers should override it with a more efficient implementation.
     pub async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        // TODO await serializing writes
+        let _sw_guard = self.await_write_blockers(offset..(offset + length)).await;
         self.inner.write_zeroes(offset, length).await
     }
 
@@ -184,7 +250,7 @@ impl<S: Storage> StorageWrapper<S> {
     ///
     /// No-op implementations therefore explicitly fulfill the interface contract.
     pub async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        // TODO await serializing writes
+        let _sw_guard = self.await_write_blockers(offset..(offset + length)).await;
         self.inner.discard(offset, length).await
     }
 
@@ -219,6 +285,7 @@ impl<S: Storage> StorageWrapper<S> {
         }
 
         let mem_align = self.mem_align();
+
         let req_align = self.req_align();
 
         if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
@@ -274,7 +341,6 @@ impl<S: Storage> StorageWrapper<S> {
     /// Check alignment.  If anything does not meet the requirements, enforce it.
     #[allow(async_fn_in_trait)] // No need for Send
     pub async fn unaligned_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
-        // TODO await serializing writes
         if bufv.is_empty() {
             return Ok(());
         }
@@ -283,10 +349,11 @@ impl<S: Storage> StorageWrapper<S> {
         let req_align = self.req_align();
 
         if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
+            let _sw_guard = self
+                .await_write_blockers(offset..(offset + bufv.len()))
+                .await;
             return self.inner.writev(bufv, offset).await;
         }
-
-        // FIXME: Write serialization
 
         let req_align_mask = req_align as u64 - 1;
 
@@ -323,6 +390,10 @@ impl<S: Storage> StorageWrapper<S> {
             &mut pad_tail_len,
             &mut bounce,
         )?;
+
+        let _sw_guard = self
+            .block_concurrent_writes(padded_offset..(padded_offset + bufv.len()))
+            .await;
 
         let bufv_unwrapped = bufv.into_inner();
 
@@ -450,11 +521,119 @@ impl<S: Storage> StorageWrapper<S> {
         self.inner.writev(bufv, padded_offset).await?;
         Ok(())
     }
+
+    /// Await concurrent write blockers for the given range.
+    ///
+    /// Await intersecting concurrent writes that must not be intersected by other writes.  Return
+    /// a guard that will delay new such writes until the guard is dropped.
+    async fn await_write_blockers(&self, range: Range<u64>) -> RangeBlockGuard<'_> {
+        let mut intersecting = FutureVector::new();
+
+        let range_block = {
+            // Acquire write lock first
+            let mut nsw = self.non_serializing_writes.blocked.write().unwrap();
+            let sw = self.serializing_writes.blocked.read().unwrap();
+
+            for range_block in sw.iter() {
+                if range_block.range.overlaps(&range) {
+                    let (s, r) = oneshot::channel::<()>();
+                    range_block.waitlist.lock().unwrap().push(s);
+                    intersecting.push(r);
+                }
+            }
+
+            let range_block = Arc::new(RangeBlock {
+                range,
+                waitlist: Default::default(),
+                index: nsw.len().into(),
+            });
+            nsw.push(Arc::clone(&range_block));
+            range_block
+        };
+
+        intersecting.discarding_join().await.unwrap();
+
+        RangeBlockGuard {
+            list: &self.non_serializing_writes,
+            block: Some(range_block),
+        }
+    }
+
+    /// Await all concurrent writes to the given range.
+    ///
+    /// Await intersecting writes on the given range, and return a guard that will delay new writes
+    /// to that range until it is dropped.
+    async fn block_concurrent_writes(&self, range: Range<u64>) -> RangeBlockGuard<'_> {
+        let mut intersecting = FutureVector::new();
+
+        let range_block = {
+            // Acquire write lock first
+            let mut sw = self.serializing_writes.blocked.write().unwrap();
+            let nsw = self.non_serializing_writes.blocked.read().unwrap();
+
+            for range_block in nsw.iter() {
+                if range_block.range.overlaps(&range) {
+                    let (s, r) = oneshot::channel();
+                    range_block.waitlist.lock().unwrap().push(s);
+                    intersecting.push(r);
+                }
+            }
+
+            for range_block in sw.iter() {
+                if range_block.range.overlaps(&range) {
+                    let (s, r) = oneshot::channel();
+                    range_block.waitlist.lock().unwrap().push(s);
+                    intersecting.push(r);
+                }
+            }
+
+            let range_block = Arc::new(RangeBlock {
+                range,
+                waitlist: Default::default(),
+                index: sw.len().into(),
+            });
+            sw.push(Arc::clone(&range_block));
+            range_block
+        };
+
+        intersecting.discarding_join().await.unwrap();
+
+        RangeBlockGuard {
+            list: &self.serializing_writes,
+            block: Some(range_block),
+        }
+    }
+}
+
+impl Drop for RangeBlockGuard<'_> {
+    fn drop(&mut self) {
+        let block = self.block.take().unwrap();
+
+        {
+            let mut list = self.list.blocked.write().unwrap();
+            let i = block.index.load(Ordering::Relaxed);
+            let removed = list.swap_remove(i);
+            debug_assert!(Arc::ptr_eq(&removed, &block));
+            if let Some(block) = list.get(i) {
+                block.index.store(i, Ordering::Relaxed);
+            }
+        }
+
+        let block = Arc::into_inner(block).unwrap();
+        let waitlist = block.waitlist.into_inner().unwrap();
+        for waiting in waitlist {
+            waiting.send(()).unwrap();
+        }
+    }
 }
 
 impl<S: Storage> From<S> for StorageWrapper<S> {
     fn from(inner: S) -> Self {
-        StorageWrapper { inner }
+        StorageWrapper {
+            inner,
+            non_serializing_writes: Default::default(),
+            serializing_writes: Default::default(),
+        }
     }
 }
 
