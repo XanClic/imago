@@ -109,7 +109,7 @@ impl<S: Storage> FormatAccess<S> {
     ///
     /// Includes recursive dependencies, i.e. those from other image dependencies like backing
     /// images.
-    pub(crate) fn collect_storage_dependencies(&self) -> Vec<&'_ S> {
+    pub(crate) fn collect_storage_dependencies(&self) -> Vec<&S> {
         self.inner.collect_storage_dependencies()
     }
 
@@ -243,7 +243,7 @@ impl<S: Storage> FormatAccess<S> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&S, u64, u64)> {
         let (storage, mapped_offset, mapped_length) = self
             .inner
             .ensure_data_mapping(offset, length, overwrite)

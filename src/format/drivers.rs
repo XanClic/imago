@@ -21,7 +21,7 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// Recursively collect all storage objects associated with this image.
     ///
     /// “Recursive” means to recurse to other images like e.g. a backing file.
-    fn collect_storage_dependencies(&self) -> Vec<&'_ Self::Storage>;
+    fn collect_storage_dependencies(&self) -> Vec<&Self::Storage>;
 
     /// Return whether this image may be modified.
     ///
@@ -41,11 +41,11 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// exceed that value if that simplifies the implementation.
     ///
     /// The returned length must only be 0 if `Mapping::Eof` is returned.
-    async fn get_mapping(
-        &self,
+    async fn get_mapping<'a>(
+        &'a self,
         offset: u64,
         max_length: u64,
-    ) -> io::Result<(Mapping<'_, Self::Storage>, u64)>;
+    ) -> io::Result<(Mapping<'a, Self::Storage>, u64)>;
 
     /// Ensure that `offset` is directly mapped to some storage object, up to a length of `length`.
     ///
@@ -59,12 +59,12 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     ///
     /// If `overwrite` is true, the contents in the range are supposed to be overwritten and may be
     /// discarded.  Otherwise, they must be kept.
-    async fn ensure_data_mapping(
-        &self,
+    async fn ensure_data_mapping<'a>(
+        &'a self,
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ Self::Storage, u64, u64)>;
+    ) -> io::Result<(&'a Self::Storage, u64, u64)>;
 
     /// Read data from a `Mapping::Special` area.
     async fn readv_special(&self, _bufv: IoVectorMut<'_>, _offset: u64) -> io::Result<()> {

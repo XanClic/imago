@@ -67,7 +67,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         self.size
     }
 
-    fn collect_storage_dependencies(&self) -> Vec<&'_ S> {
+    fn collect_storage_dependencies(&self) -> Vec<&S> {
         vec![&self.inner]
     }
 
@@ -75,7 +75,11 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         self.writable
     }
 
-    async fn get_mapping(&self, offset: u64, max_length: u64) -> io::Result<(Mapping<'_, S>, u64)> {
+    async fn get_mapping<'a>(
+        &'a self,
+        offset: u64,
+        max_length: u64,
+    ) -> io::Result<(Mapping<'a, S>, u64)> {
         let remaining = match self.size.checked_sub(offset) {
             None | Some(0) => return Ok((Mapping::Eof, 0)),
             Some(remaining) => remaining,
@@ -91,12 +95,12 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         ))
     }
 
-    async fn ensure_data_mapping(
-        &self,
+    async fn ensure_data_mapping<'a>(
+        &'a self,
         offset: u64,
         length: u64,
         _overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&'a S, u64, u64)> {
         let Some(remaining) = self.size.checked_sub(offset) else {
             return Err(io::Error::other("Cannot allocate past the end of file"));
         };

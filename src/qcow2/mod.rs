@@ -159,12 +159,12 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// Note that even if an image requires an external data file, the header may not contain its
     /// filename.  In this case, an external data file must be set explicitly via
     /// [`Qcow2::set_data_file()`].
-    pub fn implicit_external_data_file(&self) -> Option<&'_ String> {
+    pub fn implicit_external_data_file(&self) -> Option<&String> {
         self.header.external_data_filename()
     }
 
     /// Backing image filename given in the image header.
-    pub fn implicit_backing_file(&self) -> Option<&'_ String> {
+    pub fn implicit_backing_file(&self) -> Option<&String> {
         self.header.backing_filename()
     }
 
@@ -174,7 +174,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// dangerous if guests have write access to the backing file: Given a raw image, a guest can
     /// write a qcow2 header into it, resulting in the image being opened as qcow2 the next time,
     /// allowing the guest to read arbitrary files (e.g. by setting them as backing files).
-    pub fn implicit_backing_format(&self) -> Option<&'_ String> {
+    pub fn implicit_backing_format(&self) -> Option<&String> {
         self.header.backing_format()
     }
 
@@ -199,7 +199,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     ///
     /// If we have an external data file, return that.  Otherwise, return the image (metadata)
     /// file.
-    fn storage(&self) -> &'_ S {
+    fn storage(&self) -> &S {
         self.storage.as_ref().unwrap_or(&self.metadata)
     }
 
@@ -306,7 +306,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.header.size()
     }
 
-    fn collect_storage_dependencies(&self) -> Vec<&'_ S> {
+    fn collect_storage_dependencies(&self) -> Vec<&S> {
         let mut v = self
             .backing
             .as_ref()
@@ -325,7 +325,11 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.writable
     }
 
-    async fn get_mapping(&self, offset: u64, max_length: u64) -> io::Result<(Mapping<'_, S>, u64)> {
+    async fn get_mapping<'a>(
+        &'a self,
+        offset: u64,
+        max_length: u64,
+    ) -> io::Result<(Mapping<'a, S>, u64)> {
         let length_until_eof = match self.header.size().checked_sub(offset) {
             None | Some(0) => return Ok((Mapping::Eof, 0)),
             Some(length) => length,
@@ -336,12 +340,12 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.do_get_mapping(offset, max_length).await
     }
 
-    async fn ensure_data_mapping(
-        &self,
+    async fn ensure_data_mapping<'a>(
+        &'a self,
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&'a S, u64, u64)> {
         let length_until_eof = self.header.size().saturating_sub(offset);
         if length_until_eof < length {
             return Err(io::Error::other("Cannot allocate beyond the disk size"));

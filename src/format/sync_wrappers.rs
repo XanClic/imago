@@ -23,7 +23,7 @@ impl<S: Storage> SyncFormatAccess<S> {
     }
 
     /// Get a reference to the contained async [`FormatAccess`] object.
-    pub fn inner(&self) -> &'_ FormatAccess<S> {
+    pub fn inner(&self) -> &FormatAccess<S> {
         &self.inner
     }
 
@@ -102,7 +102,7 @@ impl<S: Storage> SyncFormatAccess<S> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ S, u64, u64)> {
+    ) -> io::Result<(&S, u64, u64)> {
         self.runtime
             .block_on(self.inner.ensure_data_mapping(offset, length, overwrite))
     }
