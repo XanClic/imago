@@ -131,12 +131,12 @@ impl Storage for File {
 
     #[cfg(unix)]
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
-        let sz = self.size.load(Ordering::Relaxed);
+        let sz: u64 = self.size.load(Ordering::Relaxed);
         let end = offset
             .checked_add(bufv.len())
             .ok_or_else(|| io::Error::other("Read offset overflow"))?;
         let bufv = if end > sz {
-            let (head, mut tail) = bufv.split_at(sz - offset);
+            let (head, mut tail) = bufv.split_at(sz.saturating_sub(offset));
             tail.fill(0);
             head
         } else {
