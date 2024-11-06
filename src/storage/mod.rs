@@ -45,6 +45,14 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         ))
     }
 
+    /// Synchronous wrapper around [`Storage::open()`].
+    #[cfg(feature = "sync-wrappers")]
+    fn open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(Self::open(opts))
+    }
+
     /// Minimum required alignment for memory buffers.
     fn mem_align(&self) -> usize {
         1

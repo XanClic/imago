@@ -94,6 +94,11 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         Ok(S::open(opts).await?.into())
     }
 
+    #[cfg(feature = "sync-wrappers")]
+    fn open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
+        Ok(S::open_sync(opts)?.into())
+    }
+
     fn mem_align(&self) -> usize {
         self.inner.mem_align()
     }

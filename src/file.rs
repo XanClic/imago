@@ -64,47 +64,12 @@ impl TryFrom<fs::File> for File {
 
 impl Storage for File {
     async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
-        let Some(filename) = opts.filename else {
-            return Err(io::Error::other("Filename required"));
-        };
+        Self::do_open_sync(opts)
+    }
 
-        let mut file_opts = fs::OpenOptions::new();
-        file_opts.read(true).write(opts.writable);
-        #[cfg(not(target_os = "macos"))]
-        if opts.direct {
-            file_opts.custom_flags(
-                #[cfg(unix)]
-                libc::O_DIRECT,
-                #[cfg(windows)]
-                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING,
-            );
-        }
-
-        let filename_owned = filename.to_owned();
-        let mut file = file_opts.open(filename)?;
-
-        let size = file.seek(SeekFrom::End(0))?;
-
-        #[cfg(target_os = "macos")]
-        if opts.direct {
-            // Safe: We check the return value.
-            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                return Err(io::Error::new(
-                    err.kind(),
-                    format!("Failed to disable host cache: {err}"),
-                ));
-            }
-        }
-
-        Ok(File {
-            file: RwLock::new(file),
-            direct_io: opts.direct,
-            filename: filename_owned,
-            size: AtomicU64::new(size),
-            common_storage_helper: Default::default(),
-        })
+    #[cfg(feature = "sync-wrappers")]
+    fn open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
+        Self::do_open_sync(opts)
     }
 
     fn mem_align(&self) -> usize {
@@ -344,6 +309,51 @@ impl Storage for File {
 }
 
 impl File {
+    /// Implementation for [`File::open()`] and [`File::open_sync()`].
+    fn do_open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
+        let Some(filename) = opts.filename else {
+            return Err(io::Error::other("Filename required"));
+        };
+
+        let mut file_opts = fs::OpenOptions::new();
+        file_opts.read(true).write(opts.writable);
+        #[cfg(not(target_os = "macos"))]
+        if opts.direct {
+            file_opts.custom_flags(
+                #[cfg(unix)]
+                libc::O_DIRECT,
+                #[cfg(windows)]
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING,
+            );
+        }
+
+        let filename_owned = filename.to_owned();
+        let mut file = file_opts.open(filename)?;
+
+        let size = file.seek(SeekFrom::End(0))?;
+
+        #[cfg(target_os = "macos")]
+        if opts.direct {
+            // Safe: We check the return value.
+            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("Failed to disable host cache: {err}"),
+                ));
+            }
+        }
+
+        Ok(File {
+            file: RwLock::new(file),
+            direct_io: opts.direct,
+            filename: filename_owned,
+            size: AtomicU64::new(size),
+            common_storage_helper: Default::default(),
+        })
+    }
+
     /// Attempt to discard range by truncating the file.
     ///
     /// If the given range is at the end of the file, discard it by simply truncating the file.
