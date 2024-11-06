@@ -5,7 +5,7 @@
 use super::drivers::{self, FormatDriverInstance};
 use crate::io_buffers::{IoVector, IoVectorMut, IoVectorTrait};
 use crate::vector_select::FutureVector;
-use crate::{Storage, StorageWrapper};
+use crate::{Storage, StorageExt};
 use std::fmt::{self, Display, Formatter};
 use std::{cmp, io};
 
@@ -33,7 +33,7 @@ pub enum Mapping<'a, S: Storage> {
     /// Raw data.
     Raw {
         /// Storage object where this data is stored.
-        storage: &'a StorageWrapper<S>,
+        storage: &'a S,
 
         /// Offset in `storage` where this data is stored.
         offset: u64,
@@ -109,7 +109,7 @@ impl<S: Storage> FormatAccess<S> {
     ///
     /// Includes recursive dependencies, i.e. those from other image dependencies like backing
     /// images.
-    pub(crate) fn collect_storage_dependencies(&self) -> Vec<&'_ StorageWrapper<S>> {
+    pub(crate) fn collect_storage_dependencies(&self) -> Vec<&'_ S> {
         self.inner.collect_storage_dependencies()
     }
 
@@ -152,7 +152,7 @@ impl<S: Storage> FormatAccess<S> {
                 storage,
                 offset,
                 writable: _,
-            } => storage.unaligned_readv(bufv, offset).await,
+            } => storage.readv(bufv, offset).await,
 
             Mapping::Zero | Mapping::Eof => {
                 bufv.fill(0);
@@ -243,7 +243,7 @@ impl<S: Storage> FormatAccess<S> {
         offset: u64,
         length: u64,
         overwrite: bool,
-    ) -> io::Result<(&'_ StorageWrapper<S>, u64, u64)> {
+    ) -> io::Result<(&'_ S, u64, u64)> {
         let (storage, mapped_offset, mapped_length) = self
             .inner
             .ensure_data_mapping(offset, length, overwrite)
@@ -335,9 +335,9 @@ impl<S: Storage> FormatAccess<S> {
             offset += st_length;
 
             if let Some(workers) = workers.as_mut() {
-                workers.push(Box::pin(storage.unaligned_writev(chunk, st_offset)));
+                workers.push(Box::pin(storage.writev(chunk, st_offset)));
             } else {
-                storage.unaligned_writev(chunk, st_offset).await?;
+                storage.writev(chunk, st_offset).await?;
             }
         }
 

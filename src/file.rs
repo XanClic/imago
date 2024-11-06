@@ -1,6 +1,7 @@
 //! Use a plain as storage.
 
 use crate::io_buffers::{IoVector, IoVectorMut, IoVectorTrait};
+use crate::storage::drivers::CommonStorageHelper;
 use crate::{Storage, StorageOpenOptions};
 use std::fmt::{self, Display, Formatter};
 use std::fs;
@@ -39,6 +40,9 @@ pub struct File {
     ///
     /// Third parties changing the length concurrently is pretty certain to break things anyway.
     size: AtomicU64,
+
+    /// Storage helper.
+    common_storage_helper: CommonStorageHelper,
 }
 
 impl TryFrom<fs::File> for File {
@@ -53,6 +57,7 @@ impl TryFrom<fs::File> for File {
             direct_io: false,
             filename: PathBuf::new(),
             size: AtomicU64::new(size),
+            common_storage_helper: Default::default(),
         })
     }
 }
@@ -98,6 +103,7 @@ impl Storage for File {
             direct_io: opts.direct,
             filename: filename_owned,
             size: AtomicU64::new(size),
+            common_storage_helper: Default::default(),
         })
     }
 
@@ -124,7 +130,7 @@ impl Storage for File {
     }
 
     #[cfg(unix)]
-    async fn readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
+    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
         let sz = self.size.load(Ordering::Relaxed);
         let end = offset
             .checked_add(bufv.len())
@@ -156,7 +162,7 @@ impl Storage for File {
     }
 
     #[cfg(windows)]
-    async fn readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
+    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
         for mut buffer in bufv.into_inner() {
             let mut buffer: &mut [u8] = &mut buffer;
             while !buffer.is_empty() {
@@ -176,7 +182,7 @@ impl Storage for File {
     }
 
     #[cfg(unix)]
-    async fn writev(&self, bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
+    async unsafe fn pure_writev(&self, bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
         // TODO: Use `write_vectored_at()` once `unix_file_vectored_at` is stable
         for buffer in bufv.into_inner() {
             let next_offset = offset
@@ -190,7 +196,7 @@ impl Storage for File {
     }
 
     #[cfg(windows)]
-    async fn writev(&self, bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
+    async unsafe fn pure_writev(&self, bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
         for buffer in bufv.into_inner() {
             let mut buffer: &[u8] = &buffer;
             while !buffer.is_empty() {
@@ -205,8 +211,17 @@ impl Storage for File {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+    async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        // All of our discard methods also ensure the range reads back as zeroes
+        unsafe { self.pure_discard(offset, length) }.await
+    }
+
+    // Beware when adding new discard methods: This is called by `pure_write_zeroes()`, so the
+    // current expectation is that discarded ranges will read back as zeroes.  If the new method
+    // does not guarantee that, you will need to modify `pure_write_zeroes()`.
     #[cfg(target_os = "linux")]
-    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
         if self.try_discard_by_truncate(offset, length)? {
             return Ok(());
         }
@@ -236,8 +251,11 @@ impl Storage for File {
         Ok(())
     }
 
+    // Beware when adding new discard methods: This is called by `pure_write_zeroes()`, so the
+    // current expectation is that discarded ranges will read back as zeroes.  If the new method
+    // does not guarantee that, you will need to modify `pure_write_zeroes()`.
     #[cfg(windows)]
-    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
         if self.try_discard_by_truncate(offset, length)? {
             return Ok(());
         }
@@ -279,8 +297,11 @@ impl Storage for File {
         Ok(())
     }
 
+    // Beware when adding new discard methods: This is called by `pure_write_zeroes()`, so the
+    // current expectation is that discarded ranges will read back as zeroes.  If the new method
+    // does not guarantee that, you will need to modify `pure_write_zeroes()`.
     #[cfg(target_os = "macos")]
-    async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
+    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
         if self.try_discard_by_truncate(offset, length)? {
             return Ok(());
         }
@@ -315,6 +336,10 @@ impl Storage for File {
 
     async fn sync(&self) -> io::Result<()> {
         self.file.write().unwrap().sync_all()
+    }
+
+    fn get_storage_helper(&self) -> &CommonStorageHelper {
+        &self.common_storage_helper
     }
 }
 

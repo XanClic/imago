@@ -42,6 +42,7 @@
 //! ```
 
 use crate::io_buffers::{IoVector, IoVectorMut};
+use crate::storage::drivers::CommonStorageHelper;
 use crate::{Storage, StorageOpenOptions};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
@@ -105,16 +106,24 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         self.inner.size()
     }
 
-    async fn readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
-        self.inner.readv(bufv, offset).await
+    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        // Caller guarantees safety
+        unsafe { self.inner.pure_readv(bufv, offset) }.await
     }
 
-    async fn writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
-        self.inner.writev(bufv, offset).await
+    async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+        // Caller guarantees safety
+        unsafe { self.inner.pure_writev(bufv, offset) }.await
     }
 
-    async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        self.inner.write_zeroes(offset, length).await
+    async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Caller guarantees safety
+        unsafe { self.inner.pure_write_zeroes(offset, length) }.await
+    }
+
+    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Caller guarantees safety
+        unsafe { self.inner.pure_discard(offset, length) }.await
     }
 
     async fn flush(&self) -> io::Result<()> {
@@ -123,6 +132,11 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
 
     async fn sync(&self) -> io::Result<()> {
         self.inner.sync().await
+    }
+
+    fn get_storage_helper(&self) -> &CommonStorageHelper {
+        // Share storage helper from inner (to e.g. get same request serialization)
+        self.inner.get_storage_helper()
     }
 }
 

@@ -96,4 +96,5 @@ mod vector_select;
 pub use format::access::*;
 #[cfg(feature = "sync-wrappers")]
 pub use format::sync_wrappers::*;
+pub use storage::ext::StorageExt;
 pub use storage::*;

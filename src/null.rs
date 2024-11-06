@@ -3,6 +3,7 @@
 //! Discard all written data, and return zeroes when read.
 
 use crate::io_buffers::{IoVector, IoVectorMut, IoVectorTrait};
+use crate::storage::drivers::CommonStorageHelper;
 use crate::Storage;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -16,12 +17,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct Null {
     /// Virtual “file length”.
     size: AtomicU64,
+
+    /// Storage helper.
+    common_storage_helper: CommonStorageHelper,
 }
 
 impl Null {
     /// Create a new null storage object with the given initial virtual size.
     pub fn new(size: u64) -> Self {
-        Null { size: size.into() }
+        Null {
+            size: size.into(),
+            common_storage_helper: Default::default(),
+        }
     }
 }
 
@@ -30,12 +37,12 @@ impl Storage for Null {
         Ok(self.size.load(Ordering::Relaxed))
     }
 
-    async fn readv(&self, mut bufv: IoVectorMut<'_>, _offset: u64) -> io::Result<()> {
+    async unsafe fn pure_readv(&self, mut bufv: IoVectorMut<'_>, _offset: u64) -> io::Result<()> {
         bufv.fill(0);
         Ok(())
     }
 
-    async fn writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+    async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
         let Some(end) = offset.checked_add(bufv.len()) else {
             return Err(io::Error::other("Write too long"));
         };
@@ -44,7 +51,7 @@ impl Storage for Null {
         Ok(())
     }
 
-    async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+    async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         let Some(end) = offset.checked_add(length) else {
             return Err(io::Error::other("Write too long"));
         };
@@ -61,6 +68,10 @@ impl Storage for Null {
     async fn sync(&self) -> io::Result<()> {
         // Nothing to do, there is no hardware
         Ok(())
+    }
+
+    fn get_storage_helper(&self) -> &CommonStorageHelper {
+        &self.common_storage_helper
     }
 }
 

@@ -3,7 +3,7 @@
 use super::types::*;
 use crate::io_buffers::{IoBuffer, IoBufferRefTrait};
 use crate::macros::numerical_enum;
-use crate::{Storage, StorageWrapper};
+use crate::{Storage, StorageExt};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -271,7 +271,7 @@ impl Header {
     /// Load the qcow2 header from disk.
     ///
     /// If `read_only` is true, do not perform any modifications (e.g. clearing auto-clear bits).
-    pub async fn load<S: Storage>(image: &StorageWrapper<S>, read_only: bool) -> io::Result<Self> {
+    pub async fn load<S: Storage>(image: &S, read_only: bool) -> io::Result<Self> {
         let bincode = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_big_endian();
@@ -439,7 +439,7 @@ impl Header {
     }
 
     /// Write the qcow2 header to disk.
-    pub async fn write<S: Storage>(&mut self, image: &StorageWrapper<S>) -> io::Result<()> {
+    pub async fn write<S: Storage>(&mut self, image: &S) -> io::Result<()> {
         let bincode = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_big_endian();
@@ -707,7 +707,7 @@ impl Header {
     }
 
     /// Helper for functions that just need to change little bits in the v2 header part.
-    async fn write_v2_header<S: Storage>(&self, image: &StorageWrapper<S>) -> io::Result<()> {
+    async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
         let bincode = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_big_endian();
@@ -720,19 +720,13 @@ impl Header {
     }
 
     /// Write the refcount table pointer (offset and size) to disk.
-    pub async fn write_reftable_pointer<S: Storage>(
-        &self,
-        image: &StorageWrapper<S>,
-    ) -> io::Result<()> {
+    pub async fn write_reftable_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
         // TODO: Just write the reftable offset and size
         self.write_v2_header(image).await
     }
 
     /// Write the L1 table pointer (offset and size) to disk.
-    pub async fn write_l1_table_pointer<S: Storage>(
-        &self,
-        image: &StorageWrapper<S>,
-    ) -> io::Result<()> {
+    pub async fn write_l1_table_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
         // TODO: Just write the L1 table offset and size
         self.write_v2_header(image).await
     }
@@ -1827,10 +1821,7 @@ pub(super) struct RefBlockWriteGuard<'a> {
 
 impl RefBlock {
     /// Create a new zeroed refcount block.
-    pub fn new_cleared<S: Storage>(
-        for_image: &StorageWrapper<S>,
-        header: &Header,
-    ) -> io::Result<Self> {
+    pub fn new_cleared<S: Storage>(for_image: &S, header: &Header) -> io::Result<Self> {
         let mut raw_data = IoBuffer::new(header.cluster_size(), for_image.mem_align())?;
         raw_data.as_mut().into_slice().fill(0);
 
@@ -1846,7 +1837,7 @@ impl RefBlock {
 
     /// Load a refcount block from disk.
     pub async fn load<S: Storage>(
-        image: &StorageWrapper<S>,
+        image: &S,
         header: &Header,
         cluster: HostCluster,
     ) -> io::Result<Self> {
@@ -1869,7 +1860,7 @@ impl RefBlock {
     }
 
     /// Write a refcount block to disk.
-    pub async fn write<S: Storage>(&self, image: &StorageWrapper<S>) -> io::Result<()> {
+    pub async fn write<S: Storage>(&self, image: &S) -> io::Result<()> {
         let offset = self
             .get_offset()
             .ok_or_else(|| io::Error::other("Cannot write qcow2 refcount block, no offset set"))?;
@@ -2291,7 +2282,7 @@ pub trait Table: Sized {
 
     /// Load a table from the image file.
     async fn load<S: Storage>(
-        image: &StorageWrapper<S>,
+        image: &S,
         header: &Header,
         cluster: HostCluster,
         entries: usize,
@@ -2322,7 +2313,7 @@ pub trait Table: Sized {
     /// Write a table to the image file.
     ///
     /// Callers must ensure the table is copied, i.e. its refcount is 1.
-    async fn write<S: Storage>(&self, image: &StorageWrapper<S>) -> io::Result<()> {
+    async fn write<S: Storage>(&self, image: &S) -> io::Result<()> {
         let byte_size = self.byte_size();
         let offset = self
             .get_offset()
@@ -2350,11 +2341,7 @@ pub trait Table: Sized {
     /// Write at least the given single (modified) entry to the image file.
     ///
     /// Potentially writes more of the table, if alignment requirements ask for that.
-    async fn write_entry<S: Storage>(
-        &self,
-        image: &StorageWrapper<S>,
-        index: usize,
-    ) -> io::Result<()> {
+    async fn write_entry<S: Storage>(&self, image: &S, index: usize) -> io::Result<()> {
         // This alignment calculation code implicitly assumes that the cluster size is aligned to
         // the storage’s request/memory alignment, but that is often fair.  If that is not the
         // case, there is not much we can do anyway.

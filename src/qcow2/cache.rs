@@ -7,7 +7,7 @@ use tracing::trace;
 /// I/O back-end for the L2 table cache.
 pub(super) struct L2CacheBackend<S: Storage> {
     /// Qcow2 metadata file.
-    file: Arc<StorageWrapper<S>>,
+    file: Arc<S>,
 
     /// Qcow2 header.
     header: Arc<Header>,
@@ -16,7 +16,7 @@ pub(super) struct L2CacheBackend<S: Storage> {
 /// I/O back-end for the refblock cache.
 pub(super) struct RefBlockCacheBackend<S: Storage> {
     /// Qcow2 metadata file.
-    file: Arc<StorageWrapper<S>>,
+    file: Arc<S>,
 
     /// Qcow2 header.
     header: Arc<Header>,
@@ -26,7 +26,7 @@ impl<S: Storage> L2CacheBackend<S> {
     /// Create a new `L2CacheBackend`.
     ///
     /// `file` is the qcow2 metadata (image) file.
-    pub fn new(file: Arc<StorageWrapper<S>>, header: Arc<Header>) -> Self {
+    pub fn new(file: Arc<S>, header: Arc<Header>) -> Self {
         L2CacheBackend { file, header }
     }
 }
@@ -61,7 +61,7 @@ impl<S: Storage> RefBlockCacheBackend<S> {
     /// Create a new `RefBlockCacheBackend`.
     ///
     /// `file` is the qcow2 metadata (image) file.
-    pub fn new(file: Arc<StorageWrapper<S>>, header: Arc<Header>) -> Self {
+    pub fn new(file: Arc<S>, header: Arc<Header>) -> Self {
         RefBlockCacheBackend { file, header }
     }
 }
