@@ -55,6 +55,16 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         1
     }
 
+    /// Minimum required alignment for zero writes.
+    fn zero_align(&self) -> usize {
+        1
+    }
+
+    /// Minimum required alignment for effective discards.
+    fn discard_align(&self) -> usize {
+        1
+    }
+
     /// Storage object length.
     fn size(&self) -> io::Result<u64>;
 
@@ -96,7 +106,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     ///
     /// # Safety
     /// This is a pure write to storage.  The request must be fully aligned to
-    /// [`Self::req_align()`], and safeguards we want to implement for safe concurrent access may
+    /// [`Self::zero_align()`], and safeguards we want to implement for safe concurrent access may
     /// not be available.
     ///
     /// Use [`StorageExt::write_zeroes()`] instead.
@@ -125,8 +135,9 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// No-op implementations therefore explicitly fulfill the interface contract.
     ///
     /// # Safety
-    /// This is a pure write to storage.  Safeguards we want to implement for safe concurrent
-    /// access may not be available.
+    /// This is a pure write to storage.  The request must be fully aligned to
+    /// [`Self::discard_align()`], and safeguards we want to implement for safe concurrent access
+    /// may not be available.
     ///
     /// Use [`StorageExt::discard()`] instead.
     #[allow(async_fn_in_trait)] // No need for Send
@@ -171,6 +182,12 @@ pub trait DynStorage: Debug + Display + Send + Sync {
 
     /// Wrapper around [`Storage::req_align()`].
     fn req_align(&self) -> usize;
+
+    /// Wrapper around [`Storage::zero_align()`].
+    fn zero_align(&self) -> usize;
+
+    /// Wrapper around [`Storage::discard_align()`].
+    fn discard_align(&self) -> usize;
 
     /// Wrapper around [`Storage::size()`].
     fn size(&self) -> io::Result<u64>;
@@ -234,6 +251,14 @@ impl<S: Storage> Storage for &S {
         (*self).req_align()
     }
 
+    fn zero_align(&self) -> usize {
+        (*self).zero_align()
+    }
+
+    fn discard_align(&self) -> usize {
+        (*self).discard_align()
+    }
+
     fn size(&self) -> io::Result<u64> {
         (*self).size()
     }
@@ -274,6 +299,14 @@ impl<S: Storage> DynStorage for S {
 
     fn req_align(&self) -> usize {
         S::req_align(self)
+    }
+
+    fn zero_align(&self) -> usize {
+        S::zero_align(self)
+    }
+
+    fn discard_align(&self) -> usize {
+        S::discard_align(self)
     }
 
     fn size(&self) -> io::Result<u64> {
@@ -341,6 +374,14 @@ impl Storage for Box<dyn DynStorage> {
         <Self as DynStorage>::req_align(self)
     }
 
+    fn zero_align(&self) -> usize {
+        <Self as DynStorage>::zero_align(self)
+    }
+
+    fn discard_align(&self) -> usize {
+        <Self as DynStorage>::discard_align(self)
+    }
+
     fn size(&self) -> io::Result<u64> {
         <Self as DynStorage>::size(self)
     }
@@ -388,6 +429,14 @@ impl Storage for Arc<dyn DynStorage> {
 
     fn req_align(&self) -> usize {
         <Self as DynStorage>::req_align(self)
+    }
+
+    fn zero_align(&self) -> usize {
+        <Self as DynStorage>::zero_align(self)
+    }
+
+    fn discard_align(&self) -> usize {
+        <Self as DynStorage>::discard_align(self)
     }
 
     fn size(&self) -> io::Result<u64> {

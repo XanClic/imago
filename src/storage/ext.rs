@@ -5,7 +5,9 @@
 //! unaligned requests and provides write serialization.
 
 use super::drivers::RangeBlockedGuard;
-use crate::io_buffers::{IoVector, IoVectorBounceBuffers, IoVectorMut, IoVectorTrait};
+use crate::io_buffers::{
+    IoBuffer, IoBufferRefTrait, IoVector, IoVectorBounceBuffers, IoVectorMut, IoVectorTrait,
+};
 use crate::Storage;
 use std::ops::Range;
 use std::{cmp, io};
@@ -152,7 +154,7 @@ impl<S: Storage> StorageExt for S {
         if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
             let _sw_guard = self.weak_write_blocker(offset..(offset + bufv.len())).await;
 
-            // Safe: Alignment checked, and no weak write blocker set up
+            // Safe: Alignment checked, and weak write blocker set up
             return unsafe { self.pure_writev(bufv, offset) }.await;
         }
 
@@ -326,7 +328,7 @@ impl<S: Storage> StorageExt for S {
 
         let bufv = bufv_unwrapped.into();
 
-        // Safe: Alignment enforced, and serializing write blocker set up
+        // Safe: Alignment enforced, and strong write blocker set up
         unsafe { self.pure_writev(bufv, padded_offset) }.await
     }
 
@@ -339,17 +341,71 @@ impl<S: Storage> StorageExt for S {
     }
 
     async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        let _sw_guard = self.weak_write_blocker(offset..(offset + length)).await;
-        // FIXME: Check alignment, write head and tail as zero data.
-        // We did at least set up a weak write blocker.
-        unsafe { self.pure_write_zeroes(offset, length) }.await
+        let zero_align = self.zero_align();
+        debug_assert!(zero_align.is_power_of_two());
+        let align_mask = zero_align as u64 - 1;
+
+        let unaligned_end = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("Zero-write wrap-around"))?;
+        let aligned_offset = (offset + align_mask) & !align_mask;
+        let aligned_end = unaligned_end & !align_mask;
+
+        if aligned_end > aligned_offset {
+            let _sw_guard = self.weak_write_blocker(aligned_offset..aligned_end).await;
+            // Safe: Alignment checked, and weak write blocker set up
+            unsafe { self.pure_write_zeroes(aligned_offset, aligned_end - aligned_offset) }.await?;
+        }
+
+        let zero_buf = if aligned_offset > offset || aligned_end < unaligned_end {
+            let mut buf = IoBuffer::new(
+                cmp::max(aligned_offset - offset, unaligned_end - aligned_end) as usize,
+                self.mem_align(),
+            )?;
+            buf.as_mut().into_slice().fill(0);
+            Some(buf)
+        } else {
+            None
+        };
+
+        if aligned_offset > offset {
+            let buf = zero_buf
+                .as_ref()
+                .unwrap()
+                .as_ref_range(0..((aligned_offset - offset) as usize));
+            self.write(buf, offset).await?;
+        }
+        if aligned_end < unaligned_end {
+            let buf = zero_buf
+                .as_ref()
+                .unwrap()
+                .as_ref_range(0..((unaligned_end - aligned_end) as usize));
+            self.write(buf, aligned_end).await?;
+        }
+
+        Ok(())
     }
 
     async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        let _sw_guard = self.weak_write_blocker(offset..(offset + length)).await;
-        // FIXME: Check alignment, skip head and tail.
-        // We did at least set up a weak write blocker.
-        unsafe { self.pure_discard(offset, length) }.await
+        let discard_align = self.discard_align();
+        debug_assert!(discard_align.is_power_of_two());
+        let align_mask = discard_align as u64 - 1;
+
+        let unaligned_end = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("Discard wrap-around"))?;
+        let aligned_offset = (offset + align_mask) & !align_mask;
+        let aligned_end = unaligned_end & !align_mask;
+
+        if aligned_end > aligned_offset {
+            let _sw_guard = self.weak_write_blocker(offset..(offset + length)).await;
+            // Safe: Alignment checked, and weak write blocker set up
+            unsafe { self.pure_discard(offset, length) }.await?;
+        }
+
+        // Nothing to do for the unaligned part; discarding is always just advisory.
+
+        Ok(())
     }
 
     async fn weak_write_blocker(&self, range: Range<u64>) -> RangeBlockedGuard<'_> {
