@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-/// Helper object for the [`StorageExt`] implementation.
+/// Helper object for the [`StorageExt`](crate::StorageExt) implementation.
 ///
 /// State such as write blockers needs to be kept somewhere, and instead of introducing a wrapper
-/// (that might be bypassed), we store it directly in the [`Storage`] objects so it cannot be
-/// bypassed (at least when using the [`StorageExt`] methods).
+/// (that might be bypassed), we store it directly in the [`Storage`](crate::Storage) objects so it
+/// cannot be bypassed (at least when using the [`StorageExt`](crate::StorageExt) methods).
 #[derive(Debug, Default)]
 pub struct CommonStorageHelper {
     /// Current in-flight write that allow concurrent writes to the same region.
