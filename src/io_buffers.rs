@@ -1045,6 +1045,41 @@ impl<'a> IoVector<'a> {
 
         Ok((aligned, unaligned_head, unaligned_tail))
     }
+
+    /// Converts a `VolatileSlice` array (from vm-memory) into an `IoVector`.
+    ///
+    /// In addition to a the vector, return a guard that ensures that the memory in `slices` is
+    /// indeed mapped while in use.  This guard must not be dropped while this vector is in use!
+    #[cfg(feature = "vm-memory")]
+    pub fn from_volatile_slice<B: vm_memory::bitmap::BitmapSlice>(
+        slices: &'a [&'a vm_memory::VolatileSlice<B>],
+    ) -> (
+        Self,
+        VolatileSliceGuard<'a, vm_memory::volatile_memory::PtrGuard, B>,
+    ) {
+        let ptr_guards = slices
+            .iter()
+            .map(|slice| slice.ptr_guard())
+            .collect::<Vec<_>>();
+        let buffers = ptr_guards
+            .iter()
+            .map(|pg| {
+                // Safe because this whole module basically exists to follow the same design concepts
+                // as `VolatileSlice`.
+                let slice = unsafe { std::slice::from_raw_parts(pg.as_ptr(), pg.len()) };
+                IoSlice::new(slice)
+            })
+            .collect::<Vec<_>>();
+
+        let vector = IoVector::from(buffers);
+        let guard = VolatileSliceGuard {
+            _ptr_guards: ptr_guards,
+            // `IoVector` is immutable, so no need to dirty
+            dirty_on_drop: None,
+        };
+
+        (vector, guard)
+    }
 }
 
 impl<'a> IoVectorMut<'a> {
@@ -1121,6 +1156,46 @@ impl<'a> IoVectorMut<'a> {
 
         Ok(aligned)
     }
+
+    /// Converts a `VolatileSlice` array (from vm-memory) into an `IoVectorMut`.
+    ///
+    /// In addition to a the vector, return a guard that ensures that the memory in `slices` is
+    /// indeed mapped while in use.  This guard must not be dropped while this vector is in use!
+    #[cfg(feature = "vm-memory")]
+    pub fn from_volatile_slice<B: vm_memory::bitmap::BitmapSlice>(
+        slices: &'a [&'a vm_memory::VolatileSlice<B>],
+    ) -> (
+        Self,
+        VolatileSliceGuard<'a, vm_memory::volatile_memory::PtrGuardMut, B>,
+    ) {
+        let ptr_guards = slices
+            .iter()
+            .map(|slice| slice.ptr_guard_mut())
+            .collect::<Vec<_>>();
+        let buffers = ptr_guards
+            .iter()
+            .map(|pg| {
+                // Safe because this whole module basically exists to follow the same design concepts
+                // as `VolatileSlice`.
+                let slice = unsafe { std::slice::from_raw_parts_mut(pg.as_ptr(), pg.len()) };
+                IoSliceMut::new(slice)
+            })
+            .collect::<Vec<_>>();
+
+        let vector = IoVectorMut::from(buffers);
+        let guard = VolatileSliceGuard {
+            _ptr_guards: ptr_guards,
+            // `IoVector` is mutable, so we can assume it will all be written
+            dirty_on_drop: Some(
+                slices
+                    .iter()
+                    .map(|slice| (slice.bitmap(), slice.len()))
+                    .collect(),
+            ),
+        };
+
+        (vector, guard)
+    }
 }
 
 impl<'a> From<&'a Vec<u8>> for IoVector<'a> {
@@ -1144,6 +1219,38 @@ impl<'a> From<&'a mut Vec<u8>> for IoVectorMut<'a> {
 impl<'a> From<&'a mut IoBuffer> for IoVectorMut<'a> {
     fn from(buf: &'a mut IoBuffer) -> Self {
         buf.as_mut().into_slice().into()
+    }
+}
+
+/// Ensures an I/O vector’s validity when created from `[VolatileSlice]`.
+///
+/// `[VolatileSlice]` arrays may require being explicitly mapped before use (and unmapped after),
+/// and this guard ensures that the memory is mapped until it is dropped.
+///
+/// Further, for mutable vectors ([`IoVectorMut`]), it will also dirty the corresponding bitmap
+/// slices when dropped, assuming the whole vector has been written.
+#[cfg(feature = "vm-memory")]
+pub struct VolatileSliceGuard<'a, PtrGuardType, BitmapType: vm_memory::bitmap::Bitmap> {
+    /// vm-memory’s pointer guards ensuring the memory remains mapped while used.
+    _ptr_guards: Vec<PtrGuardType>,
+
+    /// If given, mark the given dirty bitmap range as dirty when dropping this guard.
+    ///
+    /// `.1` is the length of the respective `VolatileSlice` (i.e. the length of the area to
+    /// dirty).
+    dirty_on_drop: Option<Vec<(&'a BitmapType, usize)>>,
+}
+
+#[cfg(feature = "vm-memory")]
+impl<P, B: vm_memory::bitmap::Bitmap> Drop for VolatileSliceGuard<'_, P, B> {
+    fn drop(&mut self) {
+        if let Some(dirty_on_drop) = self.dirty_on_drop.take() {
+            for (bitmap, len) in dirty_on_drop {
+                // Every bitmap is a window into the full bitmap for its specific `VolatileSlice`,
+                // so marking the whole thing is dirty is correct.
+                bitmap.mark_dirty(0, len);
+            }
+        }
     }
 }
 

@@ -79,6 +79,11 @@
 //! - `sync-wrappers`: Provide synchronous wrappers for the native `async` interface.  Note that
 //!   these build a `tokio` runtime in which they run the `async` functions, so using the `async`
 //!   interface is definitely preferred.
+//!
+//! - `vm-memory`: Provide conversion functions
+//!   [`IoVector::from_volatile_slice`](io_buffers::IoVector::from_volatile_slice) and
+//!   [`IoVectorMut::from_volatile_slice`](io_buffers::IoVectorMut::from_volatile_slice) to convert
+//!   the vm-memory crate’s `[VolatileSlice]` arrays into imago’s native I/O vectors.
 
 pub mod annotated;
 mod async_lru_cache;
