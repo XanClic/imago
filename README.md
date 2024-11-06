@@ -19,9 +19,9 @@ let mut buf = vec![0u8; 512];
 qcow2.read(&mut buf, 0)?;
 ```
 
-Another example, using the native async interface instead of sync wrapper functions, explicitly overriding the implicit
-references contained in qcow2 files, and showcasing using different types of storage (specifically normal files and null
-storage):
+Another example, using the native async interface instead of sync wrapper functions, explicitly
+overriding the implicit references contained in qcow2 files, and showcasing using different
+types of storage (specifically normal files and null storage):
 ```rust
 use imago::file::File;
 use imago::null::Null;
@@ -41,7 +41,7 @@ let mut qcow2 =
         .await?;
 
 let backing_storage: Box<dyn DynStorage> = Box::new(Null::new(0));
-let backing = Raw::new(backing_storage)?;
+let backing = Raw::open_image(backing_storage, false).await?;
 let backing = Arc::new(FormatAccess::new(backing));
 qcow2.set_backing(Some(Arc::clone(&backing)));
 
@@ -52,9 +52,25 @@ let qcow2 = FormatAccess::new(qcow2);
 
 let mut buf = vec![0u8; 512];
 qcow2.read(&mut buf, 0).await?;
+
+qcow2.flush().await?;
 ```
+
+# Flushing
+
+Given that `AsyncDrop` is not stable yet (and probably will not be stable for a long time),
+callers must ensure that images are properly flushed before dropping them, i.e. call
+`.flush().await` on any image that is not read-only.
+
+(The synchronous wrapper `SyncFormatAccess` does perform a synchronous flush in its `Drop`
+implementation.)
 
 # Features
 
-- `sync-wrappers`: Provide synchronous wrappers for the native `async` interface.  Note that these build a `tokio`
-  runtime in which they run the `async` functions, so using the `async` interface is definitely preferred.
+- `sync-wrappers`: Provide synchronous wrappers for the native `async` interface.  Note that
+  these build a `tokio` runtime in which they run the `async` functions, so using the `async`
+  interface is definitely preferred.
+
+- `vm-memory`: Provide conversion functions `IoVector::from_volatile_slice` and
+  `IoVectorMut::from_volatile_slice` to convert the vm-memory crate’s `[VolatileSlice]` arrays into
+  imago’s native I/O vectors.
