@@ -1,4 +1,5 @@
 // #![feature(async_drop)] -- enable with async-drop
+#![cfg_attr(all(doc, nightly), feature(doc_auto_cfg))] // expect nightly for doc
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
