@@ -16,12 +16,13 @@
 //! #   .unwrap()
 //! #   .block_on(async move {
 //! #
+//! const TEST_TAG: u32 = 42;
+//!
 //! let disk_size = 16 << 30;
 //! let test_offset = 1 << 30;
-//! let test_tag = 42;
 //!
 //! let inner_storage = Null::new(disk_size);
-//! let annotated_storage = Annotated::new(inner_storage, test_tag);
+//! let annotated_storage = Annotated::new(inner_storage, TEST_TAG);
 //! let image = Raw::open_image(annotated_storage, false).await?;
 //! let image = FormatAccess::new(image);
 //!
@@ -34,7 +35,7 @@
 //! else {
 //!     panic!("Raw mapping expected");
 //! };
-//! assert_eq!(*storage.tag(), test_tag);
+//! assert_eq!(*storage.tag(), TEST_TAG);
 //! assert_eq!(offset, test_offset);
 //! #
 //! # Ok::<(), std::io::Error>(())
