@@ -57,10 +57,10 @@ pub struct IoBufferMut<'a> {
 // Blocked because of the pointer, but we want this to be usable across threads
 unsafe impl Send for IoBuffer {}
 unsafe impl Sync for IoBuffer {}
-unsafe impl<'a> Send for IoBufferRef<'a> {}
-unsafe impl<'a> Sync for IoBufferRef<'a> {}
-unsafe impl<'a> Send for IoBufferMut<'a> {}
-unsafe impl<'a> Sync for IoBufferMut<'a> {}
+unsafe impl Send for IoBufferRef<'_> {}
+unsafe impl Sync for IoBufferRef<'_> {}
+unsafe impl Send for IoBufferMut<'_> {}
+unsafe impl Sync for IoBufferMut<'_> {}
 
 impl IoBuffer {
     /// Create a new owned buffer, containing uninitialized data.
