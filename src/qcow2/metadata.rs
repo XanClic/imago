@@ -1088,12 +1088,16 @@ impl L2Entry {
     /// Offset of the data cluster, if any.
     ///
     /// Assumes the L2 entry references a data cluster, not a compressed cluster.
-    pub fn cluster_offset(&self) -> Option<HostOffset> {
+    ///
+    /// `external_data_file` must be true when using an external data file; in this case, offset 0
+    /// is a valid offset, and can only be distinguished from “unallocated” by whether the COPIED
+    /// flag is set or not (which it always is when using an external data file).
+    pub fn cluster_offset(&self, external_data_file: bool) -> Option<HostOffset> {
         let ofs = self.0 & 0x00ff_ffff_ffff_fe00u64;
-        if ofs == 0 {
-            None
-        } else {
+        if ofs != 0 || (external_data_file && self.is_copied()) {
             Some(HostOffset(ofs))
+        } else {
+            None
         }
     }
 
@@ -1156,7 +1160,13 @@ impl L2Entry {
 
     /// If this entry is allocated, return the first host cluster and the number of clusters it
     /// references.
-    pub fn allocation(&self, cluster_bits: u32) -> Option<(HostCluster, ClusterCount)> {
+    ///
+    /// `external_data_file` must be true when using an external data file.
+    fn allocation(
+        &self,
+        cluster_bits: u32,
+        external_data_file: bool,
+    ) -> Option<(HostCluster, ClusterCount)> {
         if let Some((offset, length)) = self.compressed_range(cluster_bits) {
             // Compressed clusters can cross host cluster boundaries, and thus occupy two clusters
             let first_cluster = offset.cluster(cluster_bits);
@@ -1166,7 +1176,7 @@ impl L2Entry {
             );
             Some((first_cluster, cluster_count))
         } else {
-            self.cluster_offset()
+            self.cluster_offset(external_data_file)
                 .map(|ofs| (ofs.cluster(cluster_bits), ClusterCount(1)))
         }
     }
@@ -1174,11 +1184,12 @@ impl L2Entry {
     /// Return the high-level `L2Mapping` representation.
     ///
     /// `guest_cluster` is the guest cluster being accessed, `cluster_bits` is log2 of the cluster
-    /// size.
-    pub fn into_mapping(
+    /// size.  `external_data_file` must be true when using an external data file.
+    fn into_mapping(
         self,
         guest_cluster: GuestCluster,
         cluster_bits: u32,
+        external_data_file: bool,
     ) -> io::Result<L2Mapping> {
         let mapping = if let Some((offset, length)) = self.compressed_range(cluster_bits) {
             L2Mapping::Compressed {
@@ -1187,7 +1198,7 @@ impl L2Entry {
             }
         } else if self.is_zero() {
             let host_cluster = self
-                .cluster_offset()
+                .cluster_offset(external_data_file)
                 .map(|ofs| {
                     ofs.checked_cluster(cluster_bits).ok_or_else(|| {
                         let offset = guest_cluster.offset(cluster_bits);
@@ -1202,7 +1213,7 @@ impl L2Entry {
                 host_cluster,
                 copied: host_cluster.is_some() && self.is_copied(),
             }
-        } else if let Some(host_offset) = self.cluster_offset() {
+        } else if let Some(host_offset) = self.cluster_offset(external_data_file) {
             let host_cluster = host_offset.checked_cluster(cluster_bits).ok_or_else(|| {
                 let offset = guest_cluster.offset(cluster_bits);
                 io::Error::other(format!(
@@ -1224,7 +1235,7 @@ impl L2Entry {
     }
 
     /// Create an L2 entry from its high-level `L2Mapping` representation.
-    pub fn from_mapping(value: L2Mapping, cluster_bits: u32) -> Self {
+    fn from_mapping(value: L2Mapping, cluster_bits: u32) -> Self {
         let num_val: u64 = match value {
             L2Mapping::DataFile {
                 host_cluster,
@@ -1310,7 +1321,7 @@ impl TableEntry for AtomicL2Entry {
             ));
         }
 
-        if let Some(offset) = entry.cluster_offset() {
+        if let Some(offset) = entry.cluster_offset(header.external_data_file()) {
             if !entry.is_compressed() && offset.in_cluster_offset(header.cluster_bits()) != 0 {
                 return Err(io::Error::new(
                     InvalidData,
@@ -1417,6 +1428,9 @@ pub(super) struct L2Table {
     /// log2 of the cluster size.
     cluster_bits: u32,
 
+    /// Whether this image uses an external data file.
+    external_data_file: bool,
+
     /// Whether this table has been modified since it was last written.
     modified: AtomicBool,
 
@@ -1444,6 +1458,7 @@ impl L2Table {
             cluster: None,
             data: data.into_boxed_slice(),
             cluster_bits: header.cluster_bits(),
+            external_data_file: header.external_data_file(),
             modified: true.into(),
             writer_lock: Default::default(),
         }
@@ -1452,7 +1467,7 @@ impl L2Table {
     /// Look up a cluster mapping.
     pub fn get_mapping(&self, lookup_cluster: GuestCluster) -> io::Result<L2Mapping> {
         self.get(lookup_cluster.l2_index(self.cluster_bits))
-            .into_mapping(lookup_cluster, self.cluster_bits)
+            .into_mapping(lookup_cluster, self.cluster_bits, self.external_data_file)
     }
 
     /// Allow modifying this L2 table.
@@ -1498,7 +1513,7 @@ impl L2TableWriteGuard<'_> {
         let l2e = unsafe { self.table.data[index].swap(new) };
         self.table.modified.store(true, Ordering::Relaxed);
 
-        let allocation = l2e.allocation(self.table.cluster_bits);
+        let allocation = l2e.allocation(self.table.cluster_bits, self.table.external_data_file);
         if let Some((a_cluster, a_count)) = allocation {
             if a_cluster == host_cluster && a_count == ClusterCount(1) {
                 None
@@ -1522,6 +1537,7 @@ impl Table for L2Table {
             cluster: None,
             data,
             cluster_bits: header.cluster_bits(),
+            external_data_file: header.external_data_file(),
             modified: true.into(),
             writer_lock: Default::default(),
         }
@@ -1587,6 +1603,7 @@ impl Clone for L2Table {
             cluster: None,
             data: data.into_boxed_slice(),
             cluster_bits: self.cluster_bits,
+            external_data_file: self.external_data_file,
             modified,
             writer_lock: Default::default(),
         }
