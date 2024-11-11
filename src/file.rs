@@ -16,7 +16,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 #[cfg(windows)]
@@ -33,8 +33,8 @@ pub struct File {
     /// Whether we are using direct I/O.
     direct_io: bool,
 
-    /// For debug purposes.
-    filename: PathBuf,
+    /// For debug purposes, and to resolve relative filenames.
+    filename: Option<PathBuf>,
 
     /// Cached file length.
     ///
@@ -48,6 +48,12 @@ pub struct File {
 impl TryFrom<fs::File> for File {
     type Error = io::Error;
 
+    /// Use the given existing `std::fs::File`.
+    ///
+    /// Convert the given existing `std::fs::File` object into an imago storage object.
+    ///
+    /// When using this, the resulting object will not know its own filename.  That makes it
+    /// impossible to auto-resolve relative paths to it, e.g. qcow2 backing file names.
     fn try_from(mut file: fs::File) -> io::Result<Self> {
         let size = file.seek(SeekFrom::End(0))?;
 
@@ -55,7 +61,7 @@ impl TryFrom<fs::File> for File {
             file: RwLock::new(file),
             // TODO: Find out, or better yet, drop `direct_io` and just probe the alignment.
             direct_io: false,
-            filename: PathBuf::new(),
+            filename: None,
             size: AtomicU64::new(size),
             common_storage_helper: Default::default(),
         })
@@ -92,6 +98,25 @@ impl Storage for File {
 
     fn size(&self) -> io::Result<u64> {
         Ok(self.size.load(Ordering::Relaxed))
+    }
+
+    fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
+        let relative = relative.as_ref();
+
+        if relative.is_absolute() {
+            return Ok(relative.to_path_buf());
+        }
+
+        let filename = self
+            .filename
+            .as_ref()
+            .ok_or_else(|| io::Error::other("No filename set for base image"))?;
+
+        let dirname = filename
+            .parent()
+            .ok_or_else(|| io::Error::other("Invalid base image filename set"))?;
+
+        Ok(dirname.join(relative))
     }
 
     #[cfg(unix)]
@@ -348,7 +373,7 @@ impl File {
         Ok(File {
             file: RwLock::new(file),
             direct_io: opts.direct,
-            filename: filename_owned,
+            filename: Some(filename_owned),
             size: AtomicU64::new(size),
             common_storage_helper: Default::default(),
         })
@@ -386,6 +411,10 @@ impl File {
 
 impl Display for File {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "file:{}", self.filename.to_string_lossy())
+        if let Some(filename) = self.filename.as_ref() {
+            write!(f, "file:{filename:?}")
+        } else {
+            write!(f, "file:<unknown path>")
+        }
     }
 }

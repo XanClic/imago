@@ -15,6 +15,7 @@ use crate::async_lru_cache::AsyncLruCache;
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::wrapped::WrappedFormat;
 use crate::io_buffers::{IoVectorMut, IoVectorTrait};
+use crate::misc_helpers::ResultErrorContext;
 use crate::raw::Raw;
 use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
@@ -215,10 +216,18 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             ));
         };
 
+        let absolute = self
+            .metadata
+            .resolve_relative_path(filename)
+            .err_context(|| format!("Cannot resolve external data file name {filename}"))?;
+
         let opts = StorageOpenOptions::new()
             .write(true)
-            .filename(filename.clone());
-        Ok(Some(S::open(opts).await?))
+            .filename(absolute.clone());
+
+        Ok(Some(S::open(opts).await.err_context(|| {
+            format!("External data file {absolute:?}")
+        })?))
     }
 
     /// Wrap `file` in the `Raw` format.  Helper for [`Qcow2::implicit_backing_file()`].
@@ -241,9 +250,17 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             return Ok(None);
         };
 
-        let opts = StorageOpenOptions::new().filename(filename.clone());
-        let file = S::open(opts).await?;
-        match self.header.backing_format().map(|f| f.as_str()) {
+        let absolute = self
+            .metadata
+            .resolve_relative_path(filename)
+            .err_context(|| format!("Cannot resolve backing file name {filename}"))?;
+
+        let opts = StorageOpenOptions::new().filename(absolute.clone());
+        let file = S::open(opts)
+            .await
+            .err_context(|| format!("Backing file {absolute:?}"))?;
+
+        let result = match self.header.backing_format().map(|f| f.as_str()) {
             Some("qcow2") => self.open_qcow2_backing_file(file).await.map(Some),
             Some("raw") | Some("file") => self.open_raw_backing_file(file).await.map(Some),
 
@@ -256,7 +273,9 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
                     self.open_raw_backing_file(file).await.map(Some)
                 }
             }
-        }
+        };
+
+        result.err_context(|| format!("Backing file {absolute:?}"))
     }
 
     /// Open all implicit dependencies.

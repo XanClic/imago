@@ -76,6 +76,19 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// Storage object length.
     fn size(&self) -> io::Result<u64>;
 
+    /// Resolve the given path relative to this storage object.
+    ///
+    /// `relative` need not really be a relative path; it is up to the storage driver to check
+    /// whether it is an absolute path that does not need to be changed, or a relative path that
+    /// needs to be resolved.
+    ///
+    /// Must not return a relative path.
+    ///
+    /// The returned `PathBuf` should be usable with `StorageOpenOptions::filename()`.
+    fn resolve_relative_path<P: AsRef<Path>>(&self, _relative: P) -> io::Result<PathBuf> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Read data at `offset` into `bufv`.
     ///
     /// Reads until `bufv` is filled completely, i.e. will not do short reads.  When reaching the
