@@ -8,8 +8,6 @@ use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
@@ -125,7 +123,7 @@ impl Storage for File {
         let end = offset
             .checked_add(bufv.len())
             .ok_or_else(|| io::Error::other("Read offset overflow"))?;
-        let bufv = if end > sz {
+        let mut bufv = if end > sz {
             let (head, mut tail) = bufv.split_at(sz.saturating_sub(offset));
             tail.fill(0);
             head
@@ -133,21 +131,31 @@ impl Storage for File {
             bufv
         };
 
-        if bufv.is_empty() {
-            return Ok(());
+        while !bufv.is_empty() {
+            let iovec = unsafe { bufv.as_iovec() };
+            let result = unsafe {
+                libc::preadv(
+                    self.file.read().unwrap().as_raw_fd(),
+                    iovec.as_ptr(),
+                    iovec.len() as libc::c_int,
+                    offset
+                        .try_into()
+                        .map_err(|_| io::Error::other("Read offset overflow"))?,
+                )
+            };
+
+            let len = if result < 0 {
+                return Err(io::Error::last_os_error());
+            } else {
+                result as u64
+            };
+
+            bufv = bufv.split_tail_at(len);
+            offset = offset
+                .checked_add(len)
+                .ok_or_else(|| io::Error::other("Read offset overflow"))?;
         }
 
-        // TODO: Use `read_vectored_at()` once `unix_file_vectored_at` is stable
-        for mut buffer in bufv.into_inner() {
-            let next_offset = offset
-                .checked_add(buffer.len() as u64)
-                .ok_or_else(|| io::Error::other("Read offset overflow"))?;
-            self.file
-                .read()
-                .unwrap()
-                .read_exact_at(&mut buffer, offset)?;
-            offset = next_offset;
-        }
         Ok(())
     }
 
@@ -172,16 +180,33 @@ impl Storage for File {
     }
 
     #[cfg(unix)]
-    async unsafe fn pure_writev(&self, bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
-        // TODO: Use `write_vectored_at()` once `unix_file_vectored_at` is stable
-        for buffer in bufv.into_inner() {
-            let next_offset = offset
-                .checked_add(buffer.len() as u64)
+    async unsafe fn pure_writev(&self, mut bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
+        while !bufv.is_empty() {
+            let iovec = unsafe { bufv.as_iovec() };
+            let result = unsafe {
+                libc::pwritev(
+                    self.file.read().unwrap().as_raw_fd(),
+                    iovec.as_ptr(),
+                    iovec.len() as libc::c_int,
+                    offset
+                        .try_into()
+                        .map_err(|_| io::Error::other("Write offset overflow"))?,
+                )
+            };
+
+            let len = if result < 0 {
+                return Err(io::Error::last_os_error());
+            } else {
+                result as u64
+            };
+
+            bufv = bufv.split_tail_at(len);
+            offset = offset
+                .checked_add(len)
                 .ok_or_else(|| io::Error::other("Write offset overflow"))?;
-            self.file.read().unwrap().write_all_at(&buffer, offset)?;
-            offset = next_offset;
             self.size.fetch_max(offset, Ordering::Relaxed);
         }
+
         Ok(())
     }
 
