@@ -1462,3 +1462,40 @@ impl Drop for IoVectorBounceBuffers<'_> {
         }
     }
 }
+
+#[cfg(all(test, feature = "vm-memory"))]
+mod vm_memory_test {
+    use crate::io_buffers::{IoVector, IoVectorMut};
+    use vm_memory::bitmap::BitmapSlice;
+    use vm_memory::VolatileSlice;
+
+    pub fn do_test_volatile_slice_owned<B: BitmapSlice>(slices: &[VolatileSlice<B>]) {
+        {
+            let _vec = IoVector::from_volatile_slice(slices);
+        }
+        {
+            let _vec = IoVectorMut::from_volatile_slice(slices);
+        }
+    }
+
+    #[test]
+    fn test_volatile_slice_owned() {
+        let empty: Vec<VolatileSlice<()>> = Vec::new();
+        do_test_volatile_slice_owned(&empty);
+    }
+
+    pub fn do_test_volatile_slice_ref<B: BitmapSlice>(slices: &[&VolatileSlice<B>]) {
+        {
+            let _vec = IoVector::from_volatile_slice(slices);
+        }
+        {
+            let _vec = IoVectorMut::from_volatile_slice(slices);
+        }
+    }
+
+    #[test]
+    fn test_volatile_slice_ref() {
+        let empty: Vec<&vm_memory::VolatileSlice<()>> = Vec::new();
+        do_test_volatile_slice_ref(&empty);
+    }
+}
