@@ -3,6 +3,9 @@ name = "imago"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "A library for accessing virtual machine disk images."
+repository = "https://gitlab.com/hreitz/imago"
+readme = "README.md"
 
 [dependencies]
 async-trait = "0.1"
