@@ -1,8 +1,12 @@
 //! Use a plain as storage.
 
+#[cfg(unix)]
+use crate::io_buffers::IoBuffer;
 use crate::io_buffers::{IoVector, IoVectorMut};
+use crate::misc_helpers::ResultErrorContext;
 use crate::storage::drivers::CommonStorageHelper;
 use crate::{Storage, StorageOpenOptions};
+use std::cmp;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -15,8 +19,12 @@ use std::os::windows::fs::{FileExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+#[cfg(unix)]
+use tracing::{debug, warn};
 #[cfg(windows)]
 use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
 #[cfg(windows)]
@@ -28,11 +36,14 @@ pub struct File {
     /// The file.
     file: RwLock<fs::File>,
 
-    /// Whether we are using direct I/O.
-    direct_io: bool,
-
     /// For debug purposes, and to resolve relative filenames.
     filename: Option<PathBuf>,
+
+    /// Minimal I/O alignment for requests.
+    req_align: usize,
+
+    /// Minimal memory buffer alignment.
+    mem_align: usize,
 
     /// Cached file length.
     ///
@@ -52,17 +63,8 @@ impl TryFrom<fs::File> for File {
     ///
     /// When using this, the resulting object will not know its own filename.  That makes it
     /// impossible to auto-resolve relative paths to it, e.g. qcow2 backing file names.
-    fn try_from(mut file: fs::File) -> io::Result<Self> {
-        let size = file.seek(SeekFrom::End(0))?;
-
-        Ok(File {
-            file: RwLock::new(file),
-            // TODO: Find out, or better yet, drop `direct_io` and just probe the alignment.
-            direct_io: false,
-            filename: None,
-            size: AtomicU64::new(size),
-            common_storage_helper: Default::default(),
-        })
+    fn try_from(file: fs::File) -> io::Result<Self> {
+        Self::new(file, None, false)
     }
 }
 
@@ -77,21 +79,11 @@ impl Storage for File {
     }
 
     fn mem_align(&self) -> usize {
-        // TODO: Probe
-        if self.direct_io {
-            4096
-        } else {
-            1
-        }
+        self.mem_align
     }
 
     fn req_align(&self) -> usize {
-        // TODO: Probe
-        if self.direct_io {
-            4096
-        } else {
-            1
-        }
+        self.req_align
     }
 
     fn size(&self) -> io::Result<u64> {
@@ -370,6 +362,328 @@ impl Storage for File {
 }
 
 impl File {
+    /// Central internal function to create a `File` object.
+    ///
+    /// `direct_io` should be `true` if direct I/O was requested, and can be `false` if that status
+    /// is unknown.
+    fn new(mut file: fs::File, filename: Option<PathBuf>, direct_io: bool) -> io::Result<Self> {
+        let size = file
+            .seek(SeekFrom::End(0))
+            .err_context(|| "Failed to determine file size")?;
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let direct_io = direct_io || {
+            // Safe: No argument, returns result.
+            let res = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            res > 0 && (res & libc::O_DIRECT) != 0
+        };
+
+        let (min_req_align, min_mem_align) = if direct_io {
+            #[cfg(unix)]
+            {
+                (
+                    Self::get_min_dio_req_align(&file),
+                    Self::get_min_dio_mem_align(&file),
+                )
+            }
+
+            #[cfg(not(unix))]
+            {
+                (1, 1)
+            } // probe it then
+        } else {
+            (1, 1)
+        };
+
+        let (req_align, mem_align) =
+            Self::probe_alignments(&mut file, min_req_align, min_mem_align);
+        assert!(req_align.is_power_of_two());
+        assert!(mem_align.is_power_of_two());
+
+        Ok(File {
+            file: RwLock::new(file),
+            filename,
+            req_align,
+            mem_align,
+            size: size.into(),
+            common_storage_helper: Default::default(),
+        })
+    }
+
+    /// Probe minimal request and memory alignments.
+    ///
+    /// Start at `min_req_align` and `min_mem_align`.
+    #[cfg(unix)]
+    fn probe_alignments(
+        file: &mut fs::File,
+        min_req_align: usize,
+        min_mem_align: usize,
+    ) -> (usize, usize) {
+        let mut page_size = page_size::get();
+        if !page_size.is_power_of_two() {
+            let assume = page_size.checked_next_power_of_two().unwrap_or(4096);
+            let assume = cmp::max(4096, assume);
+            warn!("Reported page size of {page_size} is not a power of two, assuming {assume}");
+            page_size = assume;
+        }
+
+        let mut writable = true;
+
+        let max_req_align = 65536;
+        let max_mem_align = cmp::max(page_size, max_req_align);
+
+        // Minimum fallbacks in case something goes wrong.
+        let safe_req_align = 4096;
+        let safe_mem_align = cmp::max(page_size, safe_req_align);
+
+        let mut test_buf = match IoBuffer::new(max_mem_align, max_mem_align) {
+            Ok(buf) => buf,
+            Err(err) => {
+                warn!(
+                    "Failed to allocate memory to probe request alignment ({err}), \
+                    falling back to {safe_req_align}/{safe_mem_align}"
+                );
+                return (safe_req_align, safe_mem_align);
+            }
+        };
+
+        let mut req_align: usize = min_req_align;
+        let result = loop {
+            assert!(req_align <= max_mem_align);
+            match Self::probe_access(
+                file,
+                test_buf.as_mut_range(0..req_align).into_slice(),
+                req_align.try_into().unwrap(),
+                &mut writable,
+            ) {
+                Ok(true) => break Ok(req_align),
+                Ok(false) => {
+                    if req_align >= max_req_align {
+                        break Err(io::Error::other(
+                            "Maximum I/O alignment ({max_req_align}) exceeded",
+                        ));
+                    }
+                    // No reason to probe anything between 1 and 512
+                    if req_align == min_req_align {
+                        req_align = cmp::max(min_req_align << 1, 512);
+                    } else {
+                        req_align <<= 1;
+                    }
+                }
+                Err(err) => break Err(err),
+            }
+        };
+
+        let req_align = match result {
+            Ok(align) => {
+                debug!("Probed request alignment: {align}");
+                align
+            }
+            Err(err) => {
+                // Failed to determine request alignment, use a presumably safe value
+                let align = cmp::max(req_align, safe_req_align);
+                warn!(
+                    "Failed to probe request alignment ({}; {}), falling back to {} bytes",
+                    err,
+                    err.kind(),
+                    align
+                );
+                align
+            }
+        };
+
+        let mut mem_align: usize = min_mem_align;
+        let result = loop {
+            assert!(mem_align <= max_mem_align);
+            let range = (max_mem_align - mem_align)..max_mem_align;
+            match Self::probe_access(
+                file,
+                test_buf.as_mut_range(range).into_slice(),
+                0,
+                &mut writable,
+            ) {
+                Ok(true) => break Ok(mem_align),
+                Ok(false) => {
+                    // Not aligned
+                    if mem_align >= max_mem_align {
+                        break Err(io::Error::other(
+                            "Maximum memory alignment ({max_mem_align}) exceeded",
+                        ));
+                    }
+                    // No reason to probe anything between 1 and the page size (or 4096 at least)
+                    if mem_align == min_mem_align {
+                        mem_align = cmp::max(min_mem_align << 1, cmp::min(page_size, 4096));
+                    } else {
+                        mem_align <<= 1;
+                    }
+                }
+                Err(err) => break Err(err),
+            }
+        };
+
+        let mem_align = match result {
+            Ok(align) => {
+                debug!("Probed memory alignment: {align}");
+                align
+            }
+            Err(err) => {
+                // Failed to determine memory alignment, use a presumably safe value
+                let align = cmp::max(mem_align, safe_mem_align);
+                warn!(
+                    "Failed to probe memory alignment ({}; {}), falling back to {} bytes",
+                    err,
+                    err.kind(),
+                    align
+                );
+                align
+            }
+        };
+
+        (req_align, mem_align)
+    }
+
+    /// Do an alignment-probing I/O access.
+    ///
+    /// Return `Ok(true)` if everything was OK, and `Ok(false)` if the request was reported to be
+    /// misaligned.
+    ///
+    /// `may_write` is a boolean that controls whether this is allowed to write (the same data read
+    /// before) to improve reliability.  Is automatically set to `false` if writing is found to not
+    /// be possible.
+    #[cfg(unix)]
+    fn probe_access(
+        file: &mut fs::File,
+        slice: &mut [u8],
+        offset: libc::off_t,
+        may_write: &mut bool,
+    ) -> io::Result<bool> {
+        // Use `libc::pread` so we get well-defined errors.
+        // Safe: Passing the slice as the buffer it is.
+        let ret = unsafe {
+            libc::pread(
+                file.as_raw_fd(),
+                slice.as_mut_ptr() as *mut libc::c_void,
+                slice.len(),
+                offset,
+            )
+        };
+
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(false);
+            } else {
+                return Err(err);
+            }
+        }
+
+        if !*may_write {
+            return Ok(true);
+        }
+
+        // Safe: Passing the slice as the buffer it is.
+        let ret = unsafe {
+            libc::pwrite(
+                file.as_raw_fd(),
+                slice.as_ptr() as *const libc::c_void,
+                slice.len(),
+                offset,
+            )
+        };
+
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                Ok(false)
+            } else if err.raw_os_error() == Some(libc::EBADF) {
+                *may_write = false;
+                Ok(true)
+            } else {
+                Err(err)
+            }
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Get system-reported minimum request alignment for direct I/O.
+    #[cfg(unix)]
+    fn get_min_dio_req_align(file: &fs::File) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            let mut alignment: libc::c_int = 0;
+            // Safe: BLKSSZGET wants an int.
+            let res = unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    libc::BLKSSZGET,
+                    ptr::addr_of_mut!(alignment),
+                )
+            };
+            if res >= 0 && alignment > 0 {
+                let alignment = alignment as usize;
+                if alignment.is_power_of_two() {
+                    return alignment;
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut alignment: u32 = 0;
+            // Safe: DKIOCGETBLOCKSIZE wants a uint32_t.
+            let res = unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    0x40046418, // libc::DKIOCGETBLOCKSIZE
+                    ptr::addr_of_mut!(alignment),
+                )
+            };
+            if res >= 0 && alignment.is_power_of_two() {
+                return alignment as usize;
+            }
+        }
+
+        #[cfg(target_os = "freebsd")]
+        {
+            let mut alignment: libc::c_uint = 0;
+            // Safe: DIOCGSECTORSIZE wants an unsigned int.
+            let res = unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    libc::DIOCGSECTORSIZE,
+                    ptr::addr_of_mut!(alignment),
+                )
+            };
+            if res >= 0 && alignment.is_power_of_two() {
+                return alignment as usize;
+            }
+        }
+
+        // Then we’ll probe.
+        1
+    }
+
+    /// Get system-reported minimum memory alignment for direct I/O.
+    #[cfg(unix)]
+    fn get_min_dio_mem_align(_file: &fs::File) -> usize {
+        // I don’t think there’s a reliable way to get this.
+        1
+    }
+
+    /// Probe minimal request and memory alignments.
+    ///
+    /// Start at `min_req_align` and `min_mem_align`.
+    #[cfg(windows)]
+    fn probe_alignments(
+        _file: &mut fs::File,
+        min_req_align: usize,
+        min_mem_align: usize,
+    ) -> (usize, usize) {
+        // TODO: Need to find out how Windows indicates unaligned I/O
+        (cmp::max(min_req_align, 4096), cmp::max(min_mem_align, 4096))
+    }
+
     /// Implementation for [`File::open()`] and [`File::open_sync()`].
     fn do_open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
         let Some(filename) = opts.filename else {
@@ -389,9 +703,7 @@ impl File {
         }
 
         let filename_owned = filename.to_owned();
-        let mut file = file_opts.open(filename)?;
-
-        let size = file.seek(SeekFrom::End(0))?;
+        let file = file_opts.open(filename)?;
 
         #[cfg(target_os = "macos")]
         if opts.direct {
@@ -406,13 +718,7 @@ impl File {
             }
         }
 
-        Ok(File {
-            file: RwLock::new(file),
-            direct_io: opts.direct,
-            filename: Some(filename_owned),
-            size: AtomicU64::new(size),
-            common_storage_helper: Default::default(),
-        })
+        Self::new(file, Some(filename_owned), opts.direct)
     }
 
     /// Attempt to discard range by truncating the file.
