@@ -192,15 +192,15 @@ impl<S: Storage> StorageExt for S {
             &mut bounce,
         )?;
 
+        let padded_end = padded_offset + bufv.len();
+
         // For the strong blocker, just the RMW regions (head and tail) would be enough.  However,
         // we don’t expect any concurrent writes to the non-RMW (pure write) regions (it is
         // unlikely that the guest would write to the same area twice concurrently), so we don’t
         // need to optimize for it.  On the other hand, writes to the RMW regions are likely
         // (adjacent writes), so those will be blocked either way.
         // Instating fewer blockers makes them less expensive to check, though.
-        let _sw_guard = self
-            .strong_write_blocker(padded_offset..(padded_offset + bufv.len()))
-            .await;
+        let _sw_guard = self.strong_write_blocker(padded_offset..padded_end).await;
 
         let bufv_unwrapped = bufv.into_inner();
 
