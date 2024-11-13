@@ -562,10 +562,7 @@ pub(crate) trait IoVectorTrait: Sized {
     ///
     /// Each buffer must be aligned to `mem_alignment`, and each buffer’s length must be aligned to
     /// both `mem_alignment` and `req_alignment` (the I/O request offset/size alignment).
-    ///
-    /// If `ignore_end` is set, ignore the length alignment of the last buffer (for the end of the
-    /// file).
-    fn is_aligned(&self, mem_alignment: usize, req_alignment: usize, ignore_end: bool) -> bool;
+    fn is_aligned(&self, mem_alignment: usize, req_alignment: usize) -> bool;
 
     /// Return the internal vector of `IoSlice` objects.
     fn into_inner(self) -> Vec<Self::BufferType>;
@@ -708,10 +705,7 @@ macro_rules! impl_io_vector {
             /// Each buffer must be aligned to `mem_alignment`, and each buffer’s length must be
             /// aligned to both `mem_alignment` and `req_alignment` (the I/O request offset/size
             /// alignment).
-            ///
-            /// If `ignore_end` is set, ignore the length alignment of the last buffer (for the end
-            /// of the file).
-            pub fn is_aligned(&self, mem_alignment: usize, req_alignment: usize, ignore_end: bool) -> bool {
+            pub fn is_aligned(&self, mem_alignment: usize, req_alignment: usize) -> bool {
                 // Trivial case
                 if mem_alignment == 1 && req_alignment == 1 {
                     return true;
@@ -721,18 +715,10 @@ macro_rules! impl_io_vector {
                 let base_align_mask = mem_alignment - 1;
                 let len_align_mask = base_align_mask | (req_alignment - 1);
 
-                if ignore_end {
-                    let buffer_count = self.vector.len();
-                    self.vector.iter().enumerate().all(|(i, buf)| {
-                        buf.as_ptr() as usize & base_align_mask == 0 &&
-                            (i == buffer_count - 1 || buf.len() & len_align_mask == 0)
-                    })
-                } else {
-                    self.vector.iter().all(|buf| {
-                        buf.as_ptr() as usize & base_align_mask == 0 &&
-                            buf.len() & len_align_mask == 0
-                    })
-                }
+                self.vector.iter().all(|buf| {
+                    buf.as_ptr() as usize & base_align_mask == 0 &&
+                        buf.len() & len_align_mask == 0
+                })
             }
 
             /// Return the internal vector of `IoSlice` objects.
@@ -1050,7 +1036,7 @@ macro_rules! impl_io_vector {
             passthrough_trait_fn! { fn split_tail_at(self, mid: u64) -> Self; }
             passthrough_trait_fn! { fn copy_into_slice(&self, slice: &mut [u8]); }
             passthrough_trait_fn! { fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer>; }
-            passthrough_trait_fn! { fn is_aligned(&self, mem_alignment: usize, req_alignment: usize, ignore_end: bool) -> bool; }
+            passthrough_trait_fn! { fn is_aligned(&self, mem_alignment: usize, req_alignment: usize) -> bool; }
             passthrough_trait_fn! { fn into_inner(self) -> Vec<Self::BufferType>; }
 
             #[cfg(unix)]
