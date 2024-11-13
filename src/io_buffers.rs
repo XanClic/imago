@@ -6,6 +6,7 @@
 //!   change for buffers owned by VM guests),
 //! - buffer vector types.
 
+use crate::macros::passthrough_trait_fn;
 use futures::io::{IoSlice, IoSliceMut};
 use std::alloc::{self, GlobalAlloc};
 use std::fmt::{self, Debug, Formatter};
@@ -407,7 +408,8 @@ pub(crate) struct IoVectorBounceBuffers<'a> {
 }
 
 /// Common functions for both `IoVector` and `IoVectorMut`.
-pub trait IoVectorTrait: Sized {
+#[allow(dead_code)]
+pub(crate) trait IoVectorTrait: Sized {
     /// `&[u8]` or `&mut [u8]`.
     type SliceType;
 
@@ -503,62 +505,88 @@ macro_rules! impl_io_vector {
             total_size: u64,
         }
 
-        impl<'a> IoVectorTrait for $type<'a> {
-            type SliceType = $slice_type;
-            type BufferType = $inner_type<'a>;
-
-            fn new() -> Self {
+        impl<'a> $type<'a> {
+            /// Create an empty vector.
+            pub fn new() -> Self {
                 Self::default()
             }
 
-            fn with_capacity(cap: usize) -> Self {
+            /// Create an empty vector, pre-allocating space for `cap` buffers.
+            ///
+            /// This does not allocate an memory buffer, only space in the buffer vector.
+            pub fn with_capacity(cap: usize) -> Self {
                 $type {
                     vector: Vec::with_capacity(cap),
                     total_size: 0,
                 }
             }
 
-            fn push(&mut self, slice: Self::SliceType) {
+            /// Append a slice.
+            pub fn push(&mut self, slice: $slice_type) {
                 debug_assert!(!slice.is_empty());
                 self.total_size += slice.len() as u64;
                 self.vector.push($inner_type::new(slice));
             }
 
-            fn push_ioslice(&mut self, ioslice: Self::BufferType) {
+            /// Append a slice.
+            pub fn push_ioslice(&mut self, ioslice: $inner_type<'a>) {
                 debug_assert!(!ioslice.is_empty());
                 self.total_size += ioslice.len() as u64;
                 self.vector.push(ioslice);
             }
 
-            fn insert(&mut self, index: usize, slice: Self::SliceType) {
+            /// Insert a slice at the given `index` in the buffer vector.
+            pub fn insert(&mut self, index: usize, slice: $slice_type) {
                 debug_assert!(!slice.is_empty());
                 self.total_size += slice.len() as u64;
                 self.vector.insert(index, $inner_type::new(slice));
             }
 
-            fn len(&self) -> u64 {
+            /// Return the sum total length in bytes of all buffers in this vector.
+            pub fn len(&self) -> u64 {
                 self.total_size
             }
 
-            fn buffer_count(&self) -> usize {
+            /// Return the number of buffers in this vector.
+            pub fn buffer_count(&self) -> usize {
                 self.vector.len()
             }
 
-            fn append(&mut self, mut other: Self) {
+            /// Return `true` if and only if this vector’s length is zero.
+            ///
+            /// Synonymous with whether this vector’s buffer count is zero.
+            pub fn is_empty(&self) -> bool {
+                debug_assert!((self.len() == 0) == (self.buffer_count() == 0));
+                self.len() == 0
+            }
+
+            /// Append all buffers from the given other vector to this vector.
+            pub fn append(&mut self, mut other: Self) {
                 self.total_size += other.total_size;
                 self.vector.append(&mut other.vector);
             }
 
-            fn split_at(self, mid: u64) -> (Self, Self) {
+            /// Split the vector into two.
+            ///
+            /// The first returned vector contains the bytes in the `[..mid]` range, and the second
+            /// one covers the `[mid..]` range.
+            pub fn split_at(self, mid: u64) -> (Self, Self) {
                 let (head, tail) = self.do_split_at(mid, true);
                 (head.unwrap(), tail)
             }
 
-            fn split_tail_at(self, mid: u64) -> Self {
+            /// Like [`Self::split_at()`], but discards the head, only returning the tail.
+            ///
+            /// More efficient than to use `self.split_at(mid).1` because the former requires
+            /// creating a new `Vec` object for the head, which this version skips.
+            pub fn split_tail_at(self, mid: u64) -> Self {
                 self.do_split_at(mid, false).1
             }
 
-            fn copy_into_slice(&self, slice: &mut [u8]) {
+            /// Copy the data from `self` into `slice`.
+            ///
+            /// Both must have the same length.
+            pub fn copy_into_slice(&self, slice: &mut [u8]) {
                 if slice.len() as u64 != self.total_size {
                     panic!("IoVectorTrait::copy_into_slice() called on a slice of different length from the vector");
                 }
@@ -573,7 +601,8 @@ macro_rules! impl_io_vector {
                 }
             }
 
-            fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer> {
+            /// Create a single owned [`IoBuffer`] with the same data (copied).
+            pub fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer> {
                 let size = self.total_size.try_into().map_err(|_| {
                     io::Error::other(format!("Buffer is too big ({})", self.total_size))
                 })?;
@@ -582,8 +611,13 @@ macro_rules! impl_io_vector {
                 Ok(new_buf)
             }
 
+            /// Return a corresponding `&[libc::iovec]`.
+            ///
+            /// # Safety
+            /// `iovec` has no lifetime information.  Callers must ensure no elements in the
+            /// returned slice are used beyond the lifetime `'_`.
             #[cfg(unix)]
-            unsafe fn as_iovec<'b>(&'b self) -> &'b [libc::iovec] where Self: 'b {
+            pub unsafe fn as_iovec<'b>(&'b self) -> &'b [libc::iovec] where Self: 'b {
                 // IoSlice and IoSliceMut are defined to have the same representation in memory as
                 // libc::iovec does
                 unsafe {
@@ -591,7 +625,15 @@ macro_rules! impl_io_vector {
                 }
             }
 
-            fn is_aligned(&self, mem_alignment: usize, req_alignment: usize, ignore_end: bool) -> bool {
+            /// Check whether `self` is aligned.
+            ///
+            /// Each buffer must be aligned to `mem_alignment`, and each buffer’s length must be
+            /// aligned to both `mem_alignment` and `req_alignment` (the I/O request offset/size
+            /// alignment).
+            ///
+            /// If `ignore_end` is set, ignore the length alignment of the last buffer (for the end
+            /// of the file).
+            pub fn is_aligned(&self, mem_alignment: usize, req_alignment: usize, ignore_end: bool) -> bool {
                 // Trivial case
                 if mem_alignment == 1 && req_alignment == 1 {
                     return true;
@@ -615,13 +657,12 @@ macro_rules! impl_io_vector {
                 }
             }
 
-            fn into_inner(self) -> Vec<Self::BufferType> {
+            /// Return the internal vector of `IoSlice` objects.
+            pub fn into_inner(self) -> Vec<$inner_type<'a>> {
                 self.vector
             }
-        }
 
-        impl<'a> $type<'a> {
-            /// Same as [`IoVectorTrait::push()`], but takes ownership of `self`.
+            /// Same as [`Self::push()`], but takes ownership of `self`.
             ///
             /// By taking ownership of `self` and returning it, this method allows reducing the
             /// lifetime of `self` to that of `slice`, if necessary.
@@ -634,7 +675,7 @@ macro_rules! impl_io_vector {
                 vec
             }
 
-            /// Same as [`IoVectorTrait::insert()`], but takes ownership of `self.`
+            /// Same as [`Self::insert()`], but takes ownership of `self.`
             ///
             /// By taking ownership of `self` and returning it, this method allows reducing the
             /// lifetime of `self` to that of `slice`, if necessary.
@@ -647,8 +688,7 @@ macro_rules! impl_io_vector {
                 vec
             }
 
-            /// Implementation for [`IoVectorTrait::split_at()`] and
-            /// [`IoVectorTrait::split_tail_at()`].
+            /// Implementation for [`Self::split_at()`] and [`Self::split_tail_at()`].
             ///
             /// If `keep_head` is true, both head and tail are returned ([`Self::split_at()`]).
             /// Otherwise, the head is discarded ([`Self::split_tail_at()`]).
@@ -913,6 +953,34 @@ macro_rules! impl_io_vector {
                     unaligned_head,
                     unaligned_tail,
                 ))
+            }
+        }
+
+        impl<'a> IoVectorTrait for $type<'a> {
+            type SliceType = $slice_type;
+            type BufferType = $inner_type<'a>;
+
+            passthrough_trait_fn! { fn new() -> Self; }
+            passthrough_trait_fn! { fn with_capacity(cap: usize) -> Self; }
+            passthrough_trait_fn! { fn push(&mut self, slice: Self::SliceType); }
+            passthrough_trait_fn! { fn push_ioslice(&mut self, ioslice: Self::BufferType); }
+            passthrough_trait_fn! { fn insert(&mut self, index: usize, slice: Self::SliceType); }
+            passthrough_trait_fn! { fn len(&self) -> u64; }
+            passthrough_trait_fn! { fn buffer_count(&self) -> usize; }
+            passthrough_trait_fn! { fn append(&mut self, other: Self); }
+            passthrough_trait_fn! { fn split_at(self, mid: u64) -> (Self, Self); }
+            passthrough_trait_fn! { fn split_tail_at(self, mid: u64) -> Self; }
+            passthrough_trait_fn! { fn copy_into_slice(&self, slice: &mut [u8]); }
+            passthrough_trait_fn! { fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer>; }
+            passthrough_trait_fn! { fn is_aligned(&self, mem_alignment: usize, req_alignment: usize, ignore_end: bool) -> bool; }
+            passthrough_trait_fn! { fn into_inner(self) -> Vec<Self::BufferType>; }
+
+            #[cfg(unix)]
+            unsafe fn as_iovec<'b>(&'b self) -> &'b [libc::iovec]
+            where
+                Self: 'b
+            {
+                Self::as_iovec(self)
             }
         }
 

@@ -2,7 +2,7 @@
 //!
 //! Discard all written data, and return zeroes when read.
 
-use crate::io_buffers::{IoVector, IoVectorMut, IoVectorTrait};
+use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
 use crate::Storage;
 use std::fmt::{self, Display, Formatter};

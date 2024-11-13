@@ -1,6 +1,6 @@
 //! Use a plain as storage.
 
-use crate::io_buffers::{IoVector, IoVectorMut, IoVectorTrait};
+use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
 use crate::{Storage, StorageOpenOptions};
 use std::fmt::{self, Display, Formatter};
