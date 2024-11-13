@@ -1,7 +1,7 @@
 //! Functionality for working with qcow2 metadata.
 
 use super::types::*;
-use crate::io_buffers::{IoBuffer, IoBufferRefTrait};
+use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
 use crate::{Storage, StorageExt};
 use bincode::Options;

@@ -6,7 +6,7 @@
 pub(crate) mod drivers;
 pub mod ext;
 
-use crate::io_buffers::{IoBuffer, IoBufferRefTrait, IoVector, IoVectorMut};
+use crate::io_buffers::{IoBuffer, IoVector, IoVectorMut};
 use drivers::CommonStorageHelper;
 use ext::StorageExt;
 use std::fmt::{Debug, Display};

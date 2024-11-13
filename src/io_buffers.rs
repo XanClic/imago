@@ -126,7 +126,7 @@ impl IoBuffer {
 
     /// Generate an immutable reference to a sub-range.
     pub fn as_ref_range(&self, range: Range<usize>) -> IoBufferRef<'_> {
-        IoBufferRef::from_slice::<u8>(&self.as_ref().into_slice()[range])
+        IoBufferRef::from_slice(&self.as_ref().into_slice()[range])
     }
 
     /// Generate a mutable reference.
@@ -165,7 +165,7 @@ pub trait IoBufferRefTrait<'a>: Sized {
     type PointerType<T: Copy + Sized + 'a>;
 
     /// Create a reference to a slice.
-    fn from_slice<T: Sized>(slice: Self::SliceType<u8>) -> Self;
+    fn from_slice(slice: Self::SliceType<u8>) -> Self;
 
     /// Create an owned [`IoBuffer`] with the same data (copied).
     fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer>;
@@ -209,11 +209,9 @@ pub trait IoBufferRefTrait<'a>: Sized {
     fn into_ref(self) -> IoBufferRef<'a>;
 }
 
-impl<'a> IoBufferRefTrait<'a> for IoBufferRef<'a> {
-    type SliceType<T: Copy + Sized + 'a> = &'a [T];
-    type PointerType<T: Copy + Sized + 'a> = *const T;
-
-    fn from_slice<T: Sized>(slice: &'a [u8]) -> Self {
+impl<'a> IoBufferRef<'a> {
+    /// Create a reference to a slice.
+    pub fn from_slice(slice: &'a [u8]) -> Self {
         IoBufferRef {
             pointer: slice.as_ptr(),
             size: size_of_val(slice),
@@ -221,7 +219,8 @@ impl<'a> IoBufferRefTrait<'a> for IoBufferRef<'a> {
         }
     }
 
-    fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer> {
+    /// Create an owned [`IoBuffer`] with the same data (copied).
+    pub fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer> {
         let mut new_buf = IoBuffer::new(self.len(), alignment)?;
         new_buf
             .as_mut()
@@ -230,26 +229,48 @@ impl<'a> IoBufferRefTrait<'a> for IoBufferRef<'a> {
         Ok(new_buf)
     }
 
-    fn len(&self) -> usize {
+    /// Size in bytes.
+    pub fn len(&self) -> usize {
         self.size
     }
 
-    fn as_ptr(&self) -> *const u8 {
+    /// Whether the length is 0.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the pointer to the start of the buffer.
+    pub fn as_ptr(&self) -> *const u8 {
         self.pointer
     }
 
-    unsafe fn into_typed_slice<T: Copy + Sized>(self) -> Self::SliceType<T> {
-        // Safety ensured by the caller; we ensure that nothing outside of this buffer will be part
-        // of the slice
-        unsafe {
-            slice::from_raw_parts(
-                self.as_ptr() as Self::PointerType<T>,
-                self.len() / size_of::<T>(),
-            )
-        }
+    /// Turn this reference into a slice.
+    ///
+    /// References to `IoBuffer`s must not be copied/cloned (so they can only be accessed once;
+    /// they are considered volatile due to potential VM guest accesses), so this consumes the
+    /// object.
+    pub fn into_slice(self) -> &'a [u8] {
+        // Alignment requirement is always met, resulting data is pure binary data
+        unsafe { self.into_typed_slice::<u8>() }
     }
 
-    fn split_at(self, mid: usize) -> (IoBufferRef<'a>, IoBufferRef<'a>) {
+    /// Turn this reference into a slice with the given element type.
+    ///
+    /// # Safety
+    /// Caller must ensure that alignment and length requirements are met and that the resulting
+    /// data is valid.
+    pub unsafe fn into_typed_slice<T: Copy + Sized>(self) -> &'a [T] {
+        // Safety ensured by the caller; we ensure that nothing outside of this buffer will be part
+        // of the slice
+        unsafe { slice::from_raw_parts(self.as_ptr() as *const T, self.len() / size_of::<T>()) }
+    }
+
+    /// Split the buffer at `mid`.
+    ///
+    /// Return `&self[..mid]` and `&self[mid..]`.
+    ///
+    /// If `mid > self.len()`, return `&self[..]` and `[]`.
+    pub fn split_at(self, mid: usize) -> (IoBufferRef<'a>, IoBufferRef<'a>) {
         let head_len = cmp::min(mid, self.size);
 
         (
@@ -267,8 +288,25 @@ impl<'a> IoBufferRefTrait<'a> for IoBufferRef<'a> {
         )
     }
 
-    fn into_ref(self) -> IoBufferRef<'a> {
+    /// Make this reference immutable.
+    pub fn into_ref(self) -> IoBufferRef<'a> {
         self
+    }
+}
+
+impl<'a> IoBufferRefTrait<'a> for IoBufferRef<'a> {
+    type SliceType<T: Copy + Sized + 'a> = &'a [T];
+    type PointerType<T: Copy + Sized + 'a> = *const T;
+
+    passthrough_trait_fn! { fn from_slice(slice: Self::SliceType<u8>) -> Self; }
+    passthrough_trait_fn! { fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer>; }
+    passthrough_trait_fn! { fn len(&self) -> usize; }
+    passthrough_trait_fn! { fn as_ptr(&self) -> Self::PointerType<u8>; }
+    passthrough_trait_fn! { fn split_at(self, mid: usize) -> (Self, Self); }
+    passthrough_trait_fn! { fn into_ref(self) -> IoBufferRef<'a>; }
+
+    unsafe fn into_typed_slice<T: Copy + Sized>(self) -> Self::SliceType<T> {
+        Self::into_typed_slice(self)
     }
 }
 
@@ -288,11 +326,9 @@ impl<'a> From<IoBufferRef<'a>> for IoSlice<'a> {
     }
 }
 
-impl<'a> IoBufferRefTrait<'a> for IoBufferMut<'a> {
-    type SliceType<T: Copy + Sized + 'a> = &'a mut [T];
-    type PointerType<T: Copy + Sized + 'a> = *mut T;
-
-    fn from_slice<T: Sized>(slice: &'a mut [u8]) -> Self {
+impl<'a> IoBufferMut<'a> {
+    /// Create a reference to a slice.
+    pub fn from_slice(slice: &'a mut [u8]) -> Self {
         IoBufferMut {
             pointer: slice.as_mut_ptr(),
             size: size_of_val(slice),
@@ -300,7 +336,8 @@ impl<'a> IoBufferRefTrait<'a> for IoBufferMut<'a> {
         }
     }
 
-    fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer> {
+    /// Create an owned [`IoBuffer`] with the same data (copied).
+    pub fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer> {
         let mut new_buf = IoBuffer::new(self.len(), alignment)?;
         new_buf
             .as_mut()
@@ -309,34 +346,48 @@ impl<'a> IoBufferRefTrait<'a> for IoBufferMut<'a> {
         Ok(new_buf)
     }
 
-    fn len(&self) -> usize {
+    /// Size in bytes.
+    pub fn len(&self) -> usize {
         self.size
     }
 
-    fn as_ptr(&self) -> *mut u8 {
+    /// Whether the length is 0.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the pointer to the start of the buffer.
+    pub fn as_ptr(&self) -> *mut u8 {
         self.pointer
     }
 
-    unsafe fn into_typed_slice<T: Copy + Sized>(self) -> Self::SliceType<T> {
+    /// Turn this reference into a slice.
+    ///
+    /// References to `IoBuffer`s must not be copied/cloned (so they can only be accessed once;
+    /// they are considered volatile due to potential VM guest accesses), so this consumes the
+    /// object.
+    pub fn into_slice(self) -> &'a mut [u8] {
+        // Alignment requirement is always met, resulting data is pure binary data
+        unsafe { self.into_typed_slice::<u8>() }
+    }
+
+    /// Turn this reference into a slice with the given element type.
+    ///
+    /// # Safety
+    /// Caller must ensure that alignment and length requirements are met and that the resulting
+    /// data is valid.
+    pub unsafe fn into_typed_slice<T: Copy + Sized>(self) -> &'a mut [T] {
         // Safety ensured by the caller; we ensure that nothing outside of this buffer will be part
         // of the slice
-        unsafe {
-            slice::from_raw_parts_mut(
-                self.as_ptr() as Self::PointerType<T>,
-                self.len() / size_of::<T>(),
-            )
-        }
+        unsafe { slice::from_raw_parts_mut(self.as_ptr() as *mut T, self.len() / size_of::<T>()) }
     }
 
-    fn into_ref(self) -> IoBufferRef<'a> {
-        IoBufferRef {
-            pointer: self.pointer,
-            size: self.size,
-            _lifetime: PhantomData,
-        }
-    }
-
-    fn split_at(self, mid: usize) -> (IoBufferMut<'a>, IoBufferMut<'a>) {
+    /// Split the buffer at `mid`.
+    ///
+    /// Return `&self[..mid]` and `&self[mid..]`.
+    ///
+    /// If `mid > self.len()`, return `&self[..]` and `[]`.
+    pub fn split_at(self, mid: usize) -> (IoBufferMut<'a>, IoBufferMut<'a>) {
         let head_len = cmp::min(mid, self.size);
 
         (
@@ -352,6 +403,31 @@ impl<'a> IoBufferRefTrait<'a> for IoBufferMut<'a> {
                 _lifetime: PhantomData,
             },
         )
+    }
+
+    /// Make this reference immutable.
+    pub fn into_ref(self) -> IoBufferRef<'a> {
+        IoBufferRef {
+            pointer: self.pointer,
+            size: self.size,
+            _lifetime: PhantomData,
+        }
+    }
+}
+
+impl<'a> IoBufferRefTrait<'a> for IoBufferMut<'a> {
+    type SliceType<T: Copy + Sized + 'a> = &'a mut [T];
+    type PointerType<T: Copy + Sized + 'a> = *mut T;
+
+    passthrough_trait_fn! { fn from_slice(slice: Self::SliceType<u8>) -> Self; }
+    passthrough_trait_fn! { fn try_into_owned(self, alignment: usize) -> io::Result<IoBuffer>; }
+    passthrough_trait_fn! { fn len(&self) -> usize; }
+    passthrough_trait_fn! { fn as_ptr(&self) -> Self::PointerType<u8>; }
+    passthrough_trait_fn! { fn split_at(self, mid: usize) -> (Self, Self); }
+    passthrough_trait_fn! { fn into_ref(self) -> IoBufferRef<'a>; }
+
+    unsafe fn into_typed_slice<T: Copy + Sized>(self) -> Self::SliceType<T> {
+        Self::into_typed_slice(self)
     }
 }
 

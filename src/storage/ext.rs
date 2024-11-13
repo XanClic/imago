@@ -5,9 +5,7 @@
 //! unaligned requests and provides write serialization.
 
 use super::drivers::RangeBlockedGuard;
-use crate::io_buffers::{
-    IoBuffer, IoBufferRefTrait, IoVector, IoVectorBounceBuffers, IoVectorMut, IoVectorTrait,
-};
+use crate::io_buffers::{IoBuffer, IoVector, IoVectorBounceBuffers, IoVectorMut, IoVectorTrait};
 use crate::Storage;
 use std::ops::Range;
 use std::{cmp, io};
