@@ -97,7 +97,7 @@ impl<S: Storage> StorageExt for S {
         let mem_align = self.mem_align();
         let req_align = self.req_align();
 
-        if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
+        if is_aligned(&bufv, offset, mem_align, req_align) {
             // Safe: Alignment checked
             return unsafe { self.pure_readv(bufv, offset) }.await;
         }
@@ -149,7 +149,7 @@ impl<S: Storage> StorageExt for S {
         let mem_align = self.mem_align();
         let req_align = self.req_align();
 
-        if is_aligned(&bufv, offset, mem_align, req_align, self.size().ok())? {
+        if is_aligned(&bufv, offset, mem_align, req_align) {
             let _sw_guard = self.weak_write_blocker(offset..(offset + bufv.len())).await;
 
             // Safe: Alignment checked, and weak write blocker set up
@@ -416,31 +416,16 @@ impl<S: Storage> StorageExt for S {
 }
 
 /// Check whether the given request is aligned.
-fn is_aligned<V: IoVectorTrait>(
-    bufv: &V,
-    offset: u64,
-    mem_align: usize,
-    req_align: usize,
-    size: Option<u64>,
-) -> io::Result<bool> {
+fn is_aligned<V: IoVectorTrait>(bufv: &V, offset: u64, mem_align: usize, req_align: usize) -> bool {
     debug_assert!(mem_align.is_power_of_two() && req_align.is_power_of_two());
 
     let req_align_mask = req_align as u64 - 1;
 
-    Ok(if offset & req_align_mask != 0 {
+    if offset & req_align_mask != 0 {
         false
     } else if bufv.len() & req_align_mask == 0 {
-        bufv.is_aligned(mem_align, req_align, false)
-    } else if bufv.is_aligned(mem_align, req_align, true) {
-        if let Some(size) = size {
-            let end = offset
-                .checked_add(bufv.len())
-                .ok_or_else(|| io::Error::other("Write wrap-around"))?;
-            end == size
-        } else {
-            false
-        }
+        bufv.is_aligned(mem_align, req_align)
     } else {
         false
-    })
+    }
 }
