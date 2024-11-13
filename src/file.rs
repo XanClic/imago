@@ -118,19 +118,11 @@ impl Storage for File {
     }
 
     #[cfg(unix)]
-    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
-        let sz: u64 = self.size.load(Ordering::Relaxed);
-        let end = offset
-            .checked_add(bufv.len())
-            .ok_or_else(|| io::Error::other("Read offset overflow"))?;
-        let mut bufv = if end > sz {
-            let (head, mut tail) = bufv.split_at(sz.saturating_sub(offset));
-            tail.fill(0);
-            head
-        } else {
-            bufv
-        };
-
+    async unsafe fn pure_readv(
+        &self,
+        mut bufv: IoVectorMut<'_>,
+        mut offset: u64,
+    ) -> io::Result<()> {
         while !bufv.is_empty() {
             let iovec = unsafe { bufv.as_iovec() };
             let result = unsafe {
@@ -145,10 +137,20 @@ impl Storage for File {
             };
 
             let len = if result < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
             } else {
                 result as u64
             };
+
+            if len == 0 {
+                // End of file
+                bufv.fill(0);
+                break;
+            }
 
             bufv = bufv.split_tail_at(len);
             offset = offset
@@ -195,10 +197,19 @@ impl Storage for File {
             };
 
             let len = if result < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
             } else {
                 result as u64
             };
+
+            if result == 0 {
+                // Should not happen, i.e. is an error
+                return Err(io::ErrorKind::WriteZero.into());
+            }
 
             bufv = bufv.split_tail_at(len);
             offset = offset
