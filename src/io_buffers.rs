@@ -7,6 +7,8 @@
 //! - buffer vector types.
 
 use crate::macros::passthrough_trait_fn;
+#[cfg(feature = "vm-memory")]
+use crate::misc_helpers::ImagoAsRef;
 use futures::io::{IoSlice, IoSliceMut};
 use std::alloc::{self, GlobalAlloc};
 use std::fmt::{self, Debug, Formatter};
@@ -1195,15 +1197,21 @@ impl<'a> IoVector<'a> {
     /// In addition to a the vector, return a guard that ensures that the memory in `slices` is
     /// indeed mapped while in use.  This guard must not be dropped while this vector is in use!
     #[cfg(feature = "vm-memory")]
-    pub fn from_volatile_slice<B: vm_memory::bitmap::BitmapSlice>(
-        slices: &'a [&'a vm_memory::VolatileSlice<B>],
+    pub fn from_volatile_slice<
+        B: vm_memory::bitmap::BitmapSlice,
+        I: IntoIterator<
+            Item: ImagoAsRef<'a, vm_memory::VolatileSlice<'a, B>>,
+            IntoIter: ExactSizeIterator,
+        >,
+    >(
+        slices: I,
     ) -> (
         Self,
         VolatileSliceGuard<'a, vm_memory::volatile_memory::PtrGuard, B>,
     ) {
         let ptr_guards = slices
-            .iter()
-            .map(|slice| slice.ptr_guard())
+            .into_iter()
+            .map(|slice| slice.as_ref().ptr_guard())
             .collect::<Vec<_>>();
         let buffers = ptr_guards
             .iter()
@@ -1306,16 +1314,30 @@ impl<'a> IoVectorMut<'a> {
     /// In addition to a the vector, return a guard that ensures that the memory in `slices` is
     /// indeed mapped while in use.  This guard must not be dropped while this vector is in use!
     #[cfg(feature = "vm-memory")]
-    pub fn from_volatile_slice<B: vm_memory::bitmap::BitmapSlice>(
-        slices: &'a [&'a vm_memory::VolatileSlice<B>],
+    pub fn from_volatile_slice<
+        B: vm_memory::bitmap::BitmapSlice,
+        I: IntoIterator<
+            Item: ImagoAsRef<'a, vm_memory::VolatileSlice<'a, B>>,
+            IntoIter: ExactSizeIterator,
+        >,
+    >(
+        slices: I,
     ) -> (
         Self,
         VolatileSliceGuard<'a, vm_memory::volatile_memory::PtrGuardMut, B>,
     ) {
-        let ptr_guards = slices
-            .iter()
-            .map(|slice| slice.ptr_guard_mut())
-            .collect::<Vec<_>>();
+        let slices = slices.into_iter();
+        let slice_count = slices.len();
+        let mut ptr_guards = Vec::with_capacity(slice_count);
+        let mut dirty_on_drop = Vec::with_capacity(slice_count);
+
+        for slice in slices {
+            let slice = slice.as_ref();
+            ptr_guards.push(slice.ptr_guard_mut());
+            // `IoVector` is mutable, so we can assume it will all be written
+            dirty_on_drop.push((slice.bitmap(), slice.len()));
+        }
+
         let buffers = ptr_guards
             .iter()
             .map(|pg| {
@@ -1329,13 +1351,7 @@ impl<'a> IoVectorMut<'a> {
         let vector = IoVectorMut::from(buffers);
         let guard = VolatileSliceGuard {
             _ptr_guards: ptr_guards,
-            // `IoVector` is mutable, so we can assume it will all be written
-            dirty_on_drop: Some(
-                slices
-                    .iter()
-                    .map(|slice| (slice.bitmap(), slice.len()))
-                    .collect(),
-            ),
+            dirty_on_drop: Some(dirty_on_drop),
         };
 
         (vector, guard)

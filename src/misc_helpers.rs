@@ -45,3 +45,30 @@ impl<V, E: ErrorContext> ResultErrorContext for Result<V, E> {
         self.map_err(|err| err.context(context()))
     }
 }
+
+/// Similar to `AsRef`, but for types where `AsRef` is not implemented.
+///
+/// When we need `AsRef` for a type but it is not implemented in its origin crate, there is no way
+/// but to provide a local trait that we can implement here.  Because there are no negative trait
+/// bounds, we cannot implement this for `AsRef` (to have a common trait).
+///
+/// Also includes a lifetime so that it is possible to borrow things for longer.
+pub trait ImagoAsRef<'a, T: ?Sized> {
+    /// Return a simple reference for `self`.
+    fn as_ref(&self) -> &'a T;
+}
+
+impl<'a, T: ?Sized, U: ImagoAsRef<'a, T>> ImagoAsRef<'a, T> for &'a U {
+    fn as_ref(&self) -> &'a T {
+        <U as ImagoAsRef<T>>::as_ref(self)
+    }
+}
+
+#[cfg(feature = "vm-memory")]
+impl<'a, B: vm_memory::bitmap::BitmapSlice> ImagoAsRef<'a, vm_memory::VolatileSlice<'a, B>>
+    for &'a vm_memory::VolatileSlice<'a, B>
+{
+    fn as_ref(&self) -> &'a vm_memory::VolatileSlice<'a, B> {
+        self
+    }
+}
