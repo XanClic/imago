@@ -159,7 +159,8 @@ impl Drop for IoBuffer {
 }
 
 /// Common functions for both `IoBufferRef` and `IoBufferMut`.
-pub trait IoBufferRefTrait<'a>: Sized {
+#[allow(dead_code)]
+pub(crate) trait IoBufferRefTrait<'a>: Sized {
     /// `&[T]` or `&mut [T]`.
     type SliceType<T: Copy + Sized + 'a>;
 
