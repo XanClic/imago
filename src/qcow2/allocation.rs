@@ -5,6 +5,7 @@
 
 use super::cache::RefBlockCacheBackend;
 use super::*;
+use std::mem;
 use tokio::sync::MutexGuard;
 use tracing::{event, warn, Level};
 
@@ -431,10 +432,10 @@ impl<S: Storage> Allocator<S> {
             .await?;
 
         // Must set new reftable before calling `free_clusters()`
-        self.reftable = new_rt;
-        if let Some(old_rt_cluster) = self.reftable.get_cluster() {
-            let old_rt_size = self.reftable.cluster_count(cb);
-            self.reftable.unset_cluster();
+        let mut old_reftable = mem::replace(&mut self.reftable, new_rt);
+        if let Some(old_rt_cluster) = old_reftable.get_cluster() {
+            let old_rt_size = old_reftable.cluster_count(cb);
+            old_reftable.unset_cluster();
             self.free_clusters(old_rt_cluster, old_rt_size).await;
         }
 
