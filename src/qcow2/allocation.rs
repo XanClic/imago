@@ -282,6 +282,10 @@ impl<S: Storage> Allocator<S> {
 
         if !self.reftable.in_bounds(rt_index) {
             self.grow_reftable(rt_index).await?;
+            // `grow_reftable` will allocate new refblocks, so check the index again
+            if let Some(rb) = self.get_rb(rt_index).await? {
+                return Ok(rb);
+            }
         }
 
         let mut rb = RefBlock::new_cleared(self.file.as_ref(), &self.header)?;
