@@ -3,7 +3,7 @@
 //! While not the primary purpose of this crate, to open VM images, we need to be able to access
 //! different kinds of storage objects.  Such objects are abstracted behind the `Storage` trait.
 
-pub(crate) mod drivers;
+pub mod drivers;
 pub mod ext;
 
 use crate::io_buffers::{IoBuffer, IoVector, IoVectorMut};
