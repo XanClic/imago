@@ -350,7 +350,7 @@ impl<S: Storage> Allocator<S> {
                 )
             })?;
 
-            let rb = RefBlock::load(self.file.as_ref(), &self.header, rb_cluster).await?;
+            let rb = self.rb_cache.get_or_insert(rb_cluster).await?;
             for i in rb_index..rb_entries {
                 if rb.is_zero(i) {
                     let index = HostCluster::from_ref_indices(rt_index, i, rb_bits);
@@ -378,12 +378,12 @@ impl<S: Storage> Allocator<S> {
         let rt_index_start = index.rt_index(rb_bits);
         let rt_index_end = (index + count).0.div_ceil(rb_entries as u64) as usize;
 
-        let mut refblocks = Vec::<RefBlock>::new();
+        let mut refblocks = Vec::<Arc<RefBlock>>::new();
         for rt_i in rt_index_start..rt_index_end {
             if let Some(rb_offset) = new_rt.get(rt_i).refblock_offset() {
                 // Checked in the loop above
                 let rb_cluster = rb_offset.checked_cluster(cb).unwrap();
-                let rb = RefBlock::load(self.file.as_ref(), &self.header, rb_cluster).await?;
+                let rb = self.rb_cache.get_or_insert(rb_cluster).await?;
                 refblocks.push(rb);
                 continue;
             }
@@ -391,6 +391,8 @@ impl<S: Storage> Allocator<S> {
             let mut rb = RefBlock::new_cleared(self.file.as_ref(), &self.header)?;
             rb.set_cluster(index);
             new_rt.enter_refblock(rt_i, &rb)?;
+            let rb = Arc::new(rb);
+            self.rb_cache.insert(index, Arc::clone(&rb)).await?;
             refblocks.push(rb);
             index += ClusterCount(1);
             count -= ClusterCount(1);
@@ -420,9 +422,7 @@ impl<S: Storage> Allocator<S> {
         // Any errors from here on may lead to leaked clusters if there are refblocks in
         // `refblocks` that are already part of the old reftable.
         // TODO: Try to clean that up, though it seems quite hard for little gain.
-        for rb in refblocks {
-            rb.write(self.file.as_ref()).await?;
-        }
+        self.rb_cache.flush().await?;
         new_rt.write(self.file.as_ref()).await?;
 
         self.header.set_reftable(&new_rt)?;
