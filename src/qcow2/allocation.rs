@@ -318,7 +318,7 @@ impl<S: Storage> Allocator<S> {
         let rb_entries = 1 << rb_bits;
 
         let mut new_rt = self.reftable.clone_and_grow(&self.header, at_least_index);
-        let rt_clusters = ClusterCount::from_byte_size(self.reftable.byte_size(), cb);
+        let rt_clusters = ClusterCount::from_byte_size(new_rt.byte_size(), cb);
 
         // Find free range
         let (mut rt_index, mut rb_index) = self.first_free_cluster.rt_rb_indices(rb_bits);
