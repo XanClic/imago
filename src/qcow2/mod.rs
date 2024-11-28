@@ -142,12 +142,6 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         Self::open_image(metadata, writable).await
     }
 
-    /// Check whether the given image file is a qcow2 file.
-    pub(crate) async fn probe(metadata: &S) -> io::Result<()> {
-        Header::load(metadata, true).await?;
-        Ok(())
-    }
-
     /// Does this qcow2 image require an external data file?
     ///
     /// Conversely, if this is `false`, this image must not use an external data file.
@@ -320,6 +314,18 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 #[async_trait(?Send)]
 impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     type Storage = S;
+
+    async fn probe(metadata: &S) -> io::Result<bool>
+    where
+        Self: Sized,
+    {
+        let mut magic_version = [0u8; 8];
+        metadata.read(&mut magic_version[..], 0).await?;
+
+        let magic = u32::from_be_bytes((&magic_version[..4]).try_into().unwrap());
+        let version = u32::from_be_bytes((&magic_version[4..]).try_into().unwrap());
+        Ok(magic == MAGIC && (version == 2 || (version == 3)))
+    }
 
     fn size(&self) -> u64 {
         self.header.size()

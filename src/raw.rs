@@ -63,6 +63,13 @@ impl<S: Storage> Raw<S> {
 impl<S: Storage> FormatDriverInstance for Raw<S> {
     type Storage = S;
 
+    async fn probe(_storage: &S) -> io::Result<bool>
+    where
+        Self: Sized,
+    {
+        Ok(true)
+    }
+
     fn size(&self) -> u64 {
         self.size
     }

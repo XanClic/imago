@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracing::error;
 
 /// Qcow header magic ("QFI\xfb").
-const MAGIC: u32 = 0x51_46_49_fb;
+pub(super) const MAGIC: u32 = 0x51_46_49_fb;
 
 /// Maximum permissible host offset.
 pub(super) const MAX_OFFSET: HostOffset = HostOffset(0x00ff_ffff_ffff_fe00u64);

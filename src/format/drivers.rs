@@ -15,6 +15,15 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// Type of storage used.
     type Storage: Storage;
 
+    /// Check whether `storage` has this format.
+    ///
+    /// This is only a rough test and does not guarantee that opening `storage` under this format
+    /// will succeed.  Generally, it will only check the magic bytes (if available).  For formats
+    /// that do not have distinct features (like raw), this will always return `true`.
+    async fn probe(storage: &Self::Storage) -> io::Result<bool>
+    where
+        Self: Sized;
+
     /// Size of the disk represented by this image.
     fn size(&self) -> u64;
 
