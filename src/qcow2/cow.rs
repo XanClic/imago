@@ -224,7 +224,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         partial_skip_cow: Option<Range<usize>>,
     ) -> io::Result<()> {
         let to = self.storage();
-        let from = from.unwrap();
+        let from = from.inner();
 
         let align = cmp::max(from.req_align(), to.req_align());
         let Some(cow_range) = self.get_cow_range(partial_skip_cow, align) else {

@@ -18,7 +18,7 @@ pub trait WrappedFormat<S: Storage>: Debug + Display + Send + Sync {
     fn wrap(inner: FormatAccess<S>) -> Self;
 
     /// Access the inner format instance.
-    fn unwrap(&self) -> &FormatAccess<S>;
+    fn inner(&self) -> &FormatAccess<S>;
 }
 
 impl<
@@ -30,7 +30,7 @@ impl<
         Self::from(inner)
     }
 
-    fn unwrap(&self) -> &FormatAccess<S> {
+    fn inner(&self) -> &FormatAccess<S> {
         self.deref()
     }
 }
@@ -40,7 +40,7 @@ impl<S: Storage> WrappedFormat<S> for FormatAccess<S> {
         inner
     }
 
-    fn unwrap(&self) -> &FormatAccess<S> {
+    fn inner(&self) -> &FormatAccess<S> {
         self
     }
 }

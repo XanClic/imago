@@ -17,7 +17,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             let len = cmp::min(offset.remaining_in_l2_table(cb), max_length);
             let mapping = if let Some(backing) = self.backing.as_ref() {
                 Mapping::Indirect {
-                    layer: backing.unwrap(),
+                    layer: backing.inner(),
                     offset: offset.0,
                     writable: false,
                 }
@@ -56,7 +56,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             L2Mapping::Backing { backing_offset } => {
                 if let Some(backing) = self.backing.as_ref() {
                     Mapping::Indirect {
-                        layer: backing.unwrap(),
+                        layer: backing.inner(),
                         offset: backing_offset + offset.in_cluster_offset(cb) as u64,
                         writable: false,
                     }

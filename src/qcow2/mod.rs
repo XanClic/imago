@@ -335,7 +335,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         let mut v = self
             .backing
             .as_ref()
-            .map(|b| b.unwrap().collect_storage_dependencies())
+            .map(|b| b.inner().collect_storage_dependencies())
             .unwrap_or_default();
 
         v.push(&self.metadata);

@@ -533,6 +533,7 @@ impl Header {
     /// Checks whether fields we consider immutable have remained the same, and updates mutable
     /// fields.
     pub fn update(&self, new_header: &Header) -> io::Result<()> {
+        /// Verify that the given field matches in `self` and `new_header`.
         macro_rules! check_field {
             ($($field:ident).*) => {
                 (self.$($field).* == new_header.$($field).*).then_some(()).ok_or_else(|| {
