@@ -356,6 +356,15 @@ impl Storage for File {
         self.file.write().unwrap().sync_all()
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // TODO: Figure out what to do.  Generally, `std::fs::File` does not have internal buffers,
+        // so we don’t need to invalidate anything; we could close and reopen, but that would still
+        // flush, and is difficult to do in a platform-independent way (/proc/self/fd would allow
+        // this on Linux).  Using e.g. the filename is not safe.
+        // Right now, it’s best not to do anything.
+        Ok(())
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         &self.common_storage_helper
     }

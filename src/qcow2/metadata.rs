@@ -226,7 +226,7 @@ numerical_enum! {
 }
 
 /// Header extensions (high-level representation).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) enum HeaderExtension {
     /// Backing file format string.
     BackingFileFormat(String),
@@ -272,6 +272,7 @@ impl Header {
     ///
     /// If `read_only` is true, do not perform any modifications (e.g. clearing auto-clear bits).
     pub async fn load<S: Storage>(image: &S, read_only: bool) -> io::Result<Self> {
+        // TODO: More sanity checks.
         let bincode = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_big_endian();
@@ -326,6 +327,26 @@ impl Header {
         };
 
         let cluster_size = 1u64 << header.cluster_bits;
+
+        let l1_offset = HostOffset(header.l1_table_offset.load(Ordering::Relaxed));
+        l1_offset
+            .checked_cluster(header.cluster_bits)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unaligned L1 table: {l1_offset}"),
+                )
+            })?;
+
+        let rt_offset = HostOffset(header.refcount_table_offset.load(Ordering::Relaxed));
+        rt_offset
+            .checked_cluster(header.cluster_bits)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unaligned refcount table: {rt_offset}"),
+                )
+            })?;
 
         let backing_filename = if header.backing_file_offset != 0 {
             let (offset, length) = (header.backing_file_offset, header.backing_file_size);
@@ -505,6 +526,79 @@ impl Header {
         }
 
         image.write(&full_buf, 0).await
+    }
+
+    /// Update from a newly loaded header.
+    ///
+    /// Checks whether fields we consider immutable have remained the same, and updates mutable
+    /// fields.
+    pub fn update(&self, new_header: &Header) -> io::Result<()> {
+        macro_rules! check_field {
+            ($($field:ident).*) => {
+                (self.$($field).* == new_header.$($field).*).then_some(()).ok_or_else(|| {
+                    io::Error::other(format!(
+                        "Incompatible header modification on {}: {} != {}",
+                        stringify!($($field).*),
+                        self.$($field).*,
+                        new_header.$($field).*
+                    ))
+                })
+            };
+        }
+
+        check_field!(v2.magic)?;
+        check_field!(v2.version)?;
+        check_field!(v2.backing_file_offset)?; // TODO: Should be mutable
+        check_field!(v2.backing_file_size)?; // TODO: Should be mutable
+        check_field!(v2.cluster_bits)?;
+        check_field!(v2.size)?; // TODO: Should be mutable
+                                // L1 position is mutable
+                                // Reftable position is mutable
+        check_field!(v2.crypt_method)?;
+        check_field!(v2.nb_snapshots)?; // TODO: Should be mutable
+        check_field!(v2.snapshots_offset)?; // TODO: Should be mutable
+        check_field!(v3.incompatible_features)?; // TODO: Should be mutable
+        check_field!(v3.compatible_features)?; // TODO: Should be mutable
+        check_field!(v3.autoclear_features)?; // TODO: Should be mutable
+        check_field!(v3.refcount_order)?;
+        // header length is OK to ignore (as long as it’s valid)
+
+        // TODO: Should be mutable
+        (self.unknown_header_fields == new_header.unknown_header_fields)
+            .then_some(())
+            .ok_or_else(|| io::Error::other("Unknown header fields modified"))?;
+        // TODO: Should be mutable
+        (self.backing_filename == new_header.backing_filename)
+            .then_some(())
+            .ok_or_else(|| io::Error::other("Backing filename modified"))?;
+        // TODO: Should be mutable
+        (self.extensions == new_header.extensions)
+            .then_some(())
+            .ok_or_else(|| io::Error::other("Header extensions modified"))?;
+
+        check_field!(external_data_file)?;
+
+        self.v2.l1_table_offset.store(
+            new_header.v2.l1_table_offset.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.v2.l1_size.store(
+            new_header.v2.l1_size.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.v2.refcount_table_offset.store(
+            new_header.v2.refcount_table_offset.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.v2.refcount_table_clusters.store(
+            new_header
+                .v2
+                .refcount_table_clusters
+                .load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+
+        Ok(())
     }
 
     /// Guest disk size.

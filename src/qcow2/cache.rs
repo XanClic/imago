@@ -55,6 +55,14 @@ impl<S: Storage> AsyncLruCacheBackend for L2CacheBackend<S> {
         }
         Ok(())
     }
+
+    unsafe fn evict(&self, _l2_cluster: HostCluster, l2_table: L2Table) {
+        trace!(
+            "Evicting L2 table {}",
+            l2_table.get_offset().unwrap_or(HostOffset(0))
+        );
+        l2_table.clear_modified();
+    }
 }
 
 impl<S: Storage> RefBlockCacheBackend<S> {
@@ -80,5 +88,9 @@ impl<S: Storage> AsyncLruCacheBackend for RefBlockCacheBackend<S> {
             refblock.write(self.file.as_ref()).await?;
         }
         Ok(())
+    }
+
+    unsafe fn evict(&self, _rb_cluster: HostCluster, refblock: RefBlock) {
+        refblock.clear_modified();
     }
 }

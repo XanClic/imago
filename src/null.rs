@@ -70,6 +70,11 @@ impl Storage for Null {
         Ok(())
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // Nothing to do, there are no buffers
+        Ok(())
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         &self.common_storage_helper
     }

@@ -143,6 +143,9 @@ impl<S: Storage> SyncFormatAccess<S> {
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
     /// you want to call `sync()` afterwards.
+    ///
+    /// Note that this will not drop the buffers, so they may still be used to serve later
+    /// accesses.  Use [`SyncFormatAccess::invalidate_cache()`] to drop all buffers.
     pub fn flush(&self) -> io::Result<()> {
         self.runtime.block_on(self.inner.flush())
     }
@@ -153,6 +156,18 @@ impl<S: Storage> SyncFormatAccess<S> {
     /// `sync()`, consider whether you want to call `flush()` before it.
     pub fn sync(&self) -> io::Result<()> {
         self.runtime.block_on(self.inner.sync())
+    }
+
+    /// Drop internal buffers.
+    ///
+    /// This drops all internal buffers, but does not flush them!  All cached data is reloaded from
+    /// disk on subsequent accesses.
+    ///
+    /// # Safety
+    /// Not flushing internal buffers may cause image corruption.  You must ensure the on-disk
+    /// state is consistent.
+    pub unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        self.runtime.block_on(self.inner.invalidate_cache())
     }
 }
 

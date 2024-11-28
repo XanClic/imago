@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::{io, mem};
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use tracing::{error, span, trace, Level};
 
@@ -94,6 +94,17 @@ pub(crate) trait AsyncLruCacheBackend: Send + Sync {
     /// all evicted cache entries, regardless of whether they actually are dirty or not.
     #[allow(async_fn_in_trait)] // No need for Send
     async fn flush(&self, key: Self::Key, value: Arc<Self::Value>) -> io::Result<()>;
+
+    /// Drop the given object without flushing.
+    ///
+    /// The cache owner is invalidating the cache, evicting all objects without flushing them.  If
+    /// dropping the object as-is would cause problems (e.g. because it is verified not to be
+    /// dirty), those problems need to be resolved here.
+    ///
+    /// # Safety
+    /// Depending on the nature of the cache, this operation may be unsafe.  Must only be performed
+    /// if the cache owner requested it and guarantees it is safe.
+    unsafe fn evict(&self, key: Self::Key, value: Self::Value);
 }
 
 impl<
@@ -135,6 +146,17 @@ impl<
     /// Those entries are not evicted, but remain in the cache.
     pub async fn flush(&self) -> io::Result<()> {
         self.0.flush().await
+    }
+
+    /// Evict all cache entries.
+    ///
+    /// Evicts all cache entries without flushing them.
+    ///
+    /// # Safety
+    /// Depending on the nature of the cache, this operation may be unsafe.  Perform at your own
+    /// risk.
+    pub async unsafe fn invalidate(&self) -> io::Result<()> {
+        unsafe { self.0.invalidate() }.await
     }
 }
 
@@ -396,6 +418,60 @@ impl<
         }
 
         futs.discarding_join().await
+    }
+
+    /// Evict all cache entries.
+    ///
+    /// Evicts all cache entries without flushing them.
+    ///
+    /// # Safety
+    /// Depending on the nature of the cache, this operation may be unsafe.  Perform at your own
+    /// risk.
+    async unsafe fn invalidate(&self) -> io::Result<()> {
+        let _span = span!(
+            Level::TRACE,
+            "AsyncLruCache::invalidate",
+            self = &self as *const _ as usize
+        )
+        .entered();
+
+        let mut in_use = Vec::new();
+
+        let mut map = self.map.write().await;
+        // Clear the map; we could use `.drain()`, but doing this allows the following loop to put
+        // objects back into the new map in case they cannot be evicted.
+        let old_map = mem::take(&mut *map);
+        for (key, mut entry) in old_map {
+            let object = entry.value.take().unwrap();
+            trace!("Evicting {key:?}");
+            match Arc::try_unwrap(object) {
+                Ok(object) => {
+                    // Caller guarantees this is safe
+                    unsafe { self.backend.evict(key, object) };
+                }
+
+                Err(arc) => {
+                    trace!("Entry is still in use, retaining it");
+                    entry.value = Some(arc);
+                    map.insert(key, entry);
+                    in_use.push(key);
+                }
+            }
+        }
+
+        if in_use.is_empty() {
+            self.flush_before.lock().await.clear();
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "Cannot invalidate cache, entries still in use: {}",
+                in_use
+                    .iter()
+                    .map(|key| format!("{key:?}"))
+                    .collect::<Vec<String>>()
+                    .join(", "),
+            )))
+        }
     }
 }
 

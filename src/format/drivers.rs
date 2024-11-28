@@ -73,7 +73,8 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
 
     /// Flush internal buffers.
     ///
-    /// Does not need to ensure those buffers are synced to disk (hardware).
+    /// Does not need to ensure those buffers are synced to disk (hardware), and does not need to
+    /// drop them, i.e. they may still be used on later accesses.
     async fn flush(&self) -> io::Result<()>;
 
     /// Sync data already written to the storage hardware.
@@ -81,6 +82,16 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// Does not need to ensure internal buffers are written, i.e. should generally just be passed
     /// through to `Storage::sync()` for all underlying storage objects.
     async fn sync(&self) -> io::Result<()>;
+
+    /// Drop internal buffers.
+    ///
+    /// Drop all internal buffers, but do not flush them!  All internal data must then be reloaded
+    /// from disk.
+    ///
+    /// # Safety
+    /// Not flushing internal buffers may cause image corruption.  The caller must ensure the
+    /// on-disk state is consistent.
+    async unsafe fn invalidate_cache(&self) -> io::Result<()>;
 }
 
 /// Non-recursive mapping information.

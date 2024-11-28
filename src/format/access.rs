@@ -363,6 +363,9 @@ impl<S: Storage> FormatAccess<S> {
     ///
     /// Because of the current lack of stable `async_drop`, you must manually call this before
     /// dropping a `FormatAccess` instance!  (Not necessarily for read-only images, though.)
+    ///
+    /// Note that this will not drop the buffers, so they may still be used to serve later
+    /// accesses.  Use [`FormatAccess::invalidate_cache()`] to drop all buffers.
     #[allow(async_fn_in_trait)] // No need for Send
     pub async fn flush(&self) -> io::Result<()> {
         self.inner.flush().await
@@ -375,6 +378,19 @@ impl<S: Storage> FormatAccess<S> {
     #[allow(async_fn_in_trait)] // No need for Send
     pub async fn sync(&self) -> io::Result<()> {
         self.inner.sync().await
+    }
+
+    /// Drop internal buffers.
+    ///
+    /// This drops all internal buffers, but does not flush them!  All cached data is reloaded from
+    /// disk on subsequent accesses.
+    ///
+    /// # Safety
+    /// Not flushing internal buffers may cause image corruption.  You must ensure the on-disk
+    /// state is consistent.
+    #[allow(async_fn_in_trait)] // No need for Send
+    pub async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        self.inner.invalidate_cache().await
     }
 }
 

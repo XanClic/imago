@@ -170,6 +170,9 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
     /// you want to call `sync()` afterwards.
+    ///
+    /// Note that this will not drop the buffers, so they may still be used to serve later
+    /// accesses.  Use [`Storage::invalidate_cache()`] to drop all buffers.
     #[allow(async_fn_in_trait)] // No need for Send
     async fn flush(&self) -> io::Result<()>;
 
@@ -179,6 +182,17 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// `sync()`, consider whether you want to call `flush()` before it.
     #[allow(async_fn_in_trait)] // No need for Send
     async fn sync(&self) -> io::Result<()>;
+
+    /// Drop internal buffers.
+    ///
+    /// This drops all internal buffers, but does not flush them!  All cached data is reloaded on
+    /// subsequent accesses.
+    ///
+    /// # Safety
+    /// Not flushing internal buffers may cause corruption.  You must ensure the underlying storage
+    /// state is consistent.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async unsafe fn invalidate_cache(&self) -> io::Result<()>;
 
     /// Return the storage helper object (used by the [`StorageExt`] implementation).
     fn get_storage_helper(&self) -> &CommonStorageHelper;
@@ -259,6 +273,12 @@ pub trait DynStorage: Debug + Display + Send + Sync {
     /// Object-safe wrapper around [`Storage::sync()`].
     fn sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 
+    /// Object-safe wrapper around [`Storage::invalidate_cache()`].
+    ///
+    /// # Safety
+    /// Same considerations are for [`Storage::invalidate_cache()`] apply.
+    unsafe fn invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
     /// Wrapper around [`Storage::get_storage_helper()`].
     fn get_storage_helper(&self) -> &CommonStorageHelper;
 }
@@ -306,6 +326,10 @@ impl<S: Storage> Storage for &S {
 
     async fn sync(&self) -> io::Result<()> {
         (*self).sync().await
+    }
+
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        unsafe { (*self).invalidate_cache().await }
     }
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {
@@ -374,6 +398,10 @@ impl<S: Storage> DynStorage for S {
         Box::pin(S::sync(self))
     }
 
+    unsafe fn invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(unsafe { S::invalidate_cache(self) })
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         S::get_storage_helper(self)
     }
@@ -431,6 +459,10 @@ impl Storage for Box<dyn DynStorage> {
         <Self as DynStorage>::sync(self).await
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        unsafe { <Self as DynStorage>::invalidate_cache(self).await }
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         <Self as DynStorage>::get_storage_helper(self)
     }
@@ -486,6 +518,10 @@ impl Storage for Arc<dyn DynStorage> {
 
     async fn sync(&self) -> io::Result<()> {
         <Self as DynStorage>::sync(self).await
+    }
+
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        unsafe { <Self as DynStorage>::invalidate_cache(self).await }
     }
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {

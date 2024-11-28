@@ -406,6 +406,56 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         // Backing file is read-only, so need not be synced from us.
         Ok(())
     }
+
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        // Safe: Caller says we should do this
+        unsafe { self.l2_cache.invalidate() }.await?;
+        if let Some(allocator) = self.allocator.as_ref() {
+            let allocator = allocator.lock().await;
+            // Safe: Caller says we should do this
+            unsafe { allocator.invalidate_rb_cache() }.await?;
+        }
+
+        // Safe: Caller says we should do this
+        unsafe { self.metadata.invalidate_cache() }.await?;
+        if let Some(storage) = self.storage.as_ref() {
+            // Safe: Caller says we should do this
+            unsafe { storage.invalidate_cache() }.await?;
+        }
+        if let Some(backing) = self.backing.as_ref() {
+            // Safe: Caller says we should do this
+            unsafe { backing.inner().invalidate_cache() }.await?;
+        }
+
+        // TODO: Ideally we would reload the whole image header, but that would require putting it
+        // in a lock.  We probably do not want to put things like cluster_bits behind a lock.  For
+        // the time being, all we need to reload are things that are mutable at runtime anyway
+        // (because the source instance would not have been able to change other things), so just
+        // reload the L1 and refcount table positions.
+        let new_header = Header::load(self.metadata.as_ref(), false).await?;
+        self.header.update(&new_header)?;
+
+        if let Some(allocator) = self.allocator.as_ref() {
+            *allocator.lock().await =
+                Allocator::new(Arc::clone(&self.metadata), Arc::clone(&self.header)).await?;
+        }
+
+        // Alignment checked in `load()`
+        let l1_cluster = self
+            .header
+            .l1_table_offset()
+            .cluster(self.header.cluster_bits());
+
+        *self.l1_table.write().await = L1Table::load(
+            self.metadata.as_ref(),
+            &self.header,
+            l1_cluster,
+            self.header.l1_table_entries(),
+        )
+        .await?;
+
+        Ok(())
+    }
 }
 
 impl<S: Storage + 'static, F: WrappedFormat<S>> Debug for Qcow2<S, F> {

@@ -140,6 +140,10 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         self.inner.sync().await
     }
 
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        self.inner.invalidate_cache().await
+    }
+
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         // Share storage helper from inner (to e.g. get same request serialization)
         self.inner.get_storage_helper()
