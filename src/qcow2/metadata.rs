@@ -416,6 +416,36 @@ impl Header {
             extensions.push(extension);
         }
 
+        // Check for header extension conflicts
+        let backing_fmt = extensions
+            .iter()
+            .find(|ext| matches!(ext, HeaderExtension::BackingFileFormat(_)));
+        if let Some(backing_fmt) = backing_fmt {
+            let conflicting = extensions.iter().find(|ext| {
+                matches!(ext, HeaderExtension::BackingFileFormat(_)) && ext != &backing_fmt
+            });
+            if let Some(conflicting) = conflicting {
+                return Err(io::Error::other(format!(
+                    "Found conflicting backing file formats: {:?} != {:?}",
+                    backing_fmt, conflicting
+                )));
+            }
+        }
+        let ext_data_file = extensions
+            .iter()
+            .find(|ext| matches!(ext, HeaderExtension::ExternalDataFileName(_)));
+        if let Some(ext_data_file) = ext_data_file {
+            let conflicting = extensions.iter().find(|ext| {
+                matches!(ext, HeaderExtension::ExternalDataFileName(_)) && ext != &ext_data_file
+            });
+            if let Some(conflicting) = conflicting {
+                return Err(io::Error::other(format!(
+                    "Found conflicting external data file names: {:?} != {:?}",
+                    ext_data_file, conflicting
+                )));
+            }
+        }
+
         let mut incompatible_features = v3header_base.incompatible_features;
         let autoclear_features = v3header_base.autoclear_features;
 
