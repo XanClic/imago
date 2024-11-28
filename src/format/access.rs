@@ -84,6 +84,11 @@ impl<S: Storage> FormatAccess<S> {
         }
     }
 
+    /// Return the contained format driver instance.
+    pub fn inner(&self) -> &dyn FormatDriverInstance<Storage = S> {
+        self.inner.as_ref()
+    }
+
     /// Return the disk size in bytes.
     pub fn size(&self) -> u64 {
         self.inner.size()
