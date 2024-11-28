@@ -357,43 +357,49 @@ impl Header {
             None
         };
 
-        let mut ext_offset: u64 = v3header_base.header_length as u64;
-        let mut extensions = Vec::<HeaderExtension>::new();
-        loop {
-            if ext_offset + HeaderExtensionHeader::RAW_SIZE as u64 > cluster_size {
-                return Err(io::Error::new(
-                    InvalidData,
-                    "Header extensions exceed the first cluster",
-                ));
+        let extensions = if header.version == 2 {
+            Vec::new()
+        } else {
+            let mut ext_offset: u64 = v3header_base.header_length as u64;
+            let mut extensions = Vec::<HeaderExtension>::new();
+            loop {
+                if ext_offset + HeaderExtensionHeader::RAW_SIZE as u64 > cluster_size {
+                    return Err(io::Error::new(
+                        InvalidData,
+                        "Header extensions exceed the first cluster",
+                    ));
+                }
+
+                let mut ext_hdr_buf = vec![0; HeaderExtensionHeader::RAW_SIZE];
+                image.read(&mut ext_hdr_buf, ext_offset).await?;
+
+                ext_offset += HeaderExtensionHeader::RAW_SIZE as u64;
+
+                let ext_hdr: HeaderExtensionHeader = bincode
+                    .deserialize(&ext_hdr_buf)
+                    .map_err(|err| io::Error::new(InvalidData, err))?;
+                if ext_offset + ext_hdr.length as u64 > cluster_size {
+                    return Err(io::Error::new(
+                        InvalidData,
+                        "Header extensions exceed the first cluster",
+                    ));
+                }
+
+                let mut ext_data = vec![0; ext_hdr.length as usize];
+                image.read(&mut ext_data, ext_offset).await?;
+
+                ext_offset += (ext_hdr.length as u64).next_multiple_of(8);
+
+                let Some(extension) =
+                    HeaderExtension::deserialize(ext_hdr.extension_type, ext_data)?
+                else {
+                    break;
+                };
+
+                extensions.push(extension);
             }
-
-            let mut ext_hdr_buf = vec![0; HeaderExtensionHeader::RAW_SIZE];
-            image.read(&mut ext_hdr_buf, ext_offset).await?;
-
-            ext_offset += HeaderExtensionHeader::RAW_SIZE as u64;
-
-            let ext_hdr: HeaderExtensionHeader = bincode
-                .deserialize(&ext_hdr_buf)
-                .map_err(|err| io::Error::new(InvalidData, err))?;
-            if ext_offset + ext_hdr.length as u64 > cluster_size {
-                return Err(io::Error::new(
-                    InvalidData,
-                    "Header extensions exceed the first cluster",
-                ));
-            }
-
-            let mut ext_data = vec![0; ext_hdr.length as usize];
-            image.read(&mut ext_data, ext_offset).await?;
-
-            ext_offset += (ext_hdr.length as u64).next_multiple_of(8);
-
-            let Some(extension) = HeaderExtension::deserialize(ext_hdr.extension_type, ext_data)?
-            else {
-                break;
-            };
-
-            extensions.push(extension);
-        }
+            extensions
+        };
 
         // Check for header extension conflicts
         let backing_fmt = extensions
