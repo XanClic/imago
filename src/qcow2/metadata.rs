@@ -1907,37 +1907,40 @@ impl RefBlock {
         self.set_modified();
     }
 
+    /// Calculate sub-byte refcount access parameters.
+    ///
+    /// For a given refcount index, return its:
+    /// - byte index,
+    /// - access mask,
+    /// - in-byte shift.
+    fn sub_byte_refcount_access(&self, index: usize) -> (usize, u8, usize) {
+        let order = self.refcount_order;
+        debug_assert!(order < 3);
+
+        // Note that `order` is in bits, i.e. `1 << order` is the number of bits.  `index` is in
+        // units of refcounts, so `index << order` is the bit index, and `index << (order - 3)` is
+        // then the byte index, which is equal to `index >> (3 - order)`.
+        let byte_index = index >> (3 - order);
+        // `1 << order` is the bits per refcount (bprc), so `(1 << bprc) - 1` is the mask for one
+        // refcount (its maximum value).
+        let mask = (1 << (1 << order)) - 1;
+        // `index` is in units of refcounts, so `index << order` is the bit index.  `% 8`, we get
+        // the base index inside of a byte.
+        let shift = (index << order) % 8;
+
+        (byte_index, mask, shift)
+    }
+
     /// Get the given cluster’s refcount.
     pub fn get(&self, index: usize) -> u64 {
         match self.refcount_order {
-            // refcount_bits == 1
-            0 => {
+            // refcount_bits == 1, 2, 4
+            0..=2 => {
+                let (index, mask, shift) = self.sub_byte_refcount_access(index);
                 let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u8>() };
-                let atomic = unsafe {
-                    AtomicU8::from_ptr(&raw_data_slice[index / 8] as *const u8 as *mut u8)
-                };
-                let byte = atomic.load(Ordering::Relaxed);
-                ((byte >> (index % 8)) & 0b0000_0001) as u64
-            }
-
-            // refcount_bits == 2
-            1 => {
-                let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u8>() };
-                let atomic = unsafe {
-                    AtomicU8::from_ptr(&raw_data_slice[index / 4] as *const u8 as *mut u8)
-                };
-                let byte = atomic.load(Ordering::Relaxed);
-                ((byte >> (index % 4)) & 0b0000_0011) as u64
-            }
-
-            // refcount_bits == 4
-            2 => {
-                let raw_data_slice = unsafe { self.raw_data.as_ref().into_typed_slice::<u8>() };
-                let atomic = unsafe {
-                    AtomicU8::from_ptr(&raw_data_slice[index / 2] as *const u8 as *mut u8)
-                };
-                let byte = atomic.load(Ordering::Relaxed);
-                ((byte >> (index % 2)) & 0b0000_1111) as u64
+                let atomic =
+                    unsafe { AtomicU8::from_ptr(&raw_data_slice[index] as *const u8 as *mut u8) };
+                ((atomic.load(Ordering::Relaxed) >> shift) & mask) as u64
             }
 
             // refcount_bits == 8
@@ -2039,7 +2042,7 @@ impl RefBlockWriteGuard<'_> {
                     format!("Requested refcount change of {change} is too big for the image’s refcount width"),
                 )
             })?;
-            old.checked_add(change)
+            old.checked_sub(change)
         };
         let new = new.ok_or_else(|| {
             io::Error::new(
@@ -2047,7 +2050,7 @@ impl RefBlockWriteGuard<'_> {
                 format!("Changing refcount from {old} by {change} would overflow"),
             )
         })?;
-        if new > mask {
+        if new > base_mask {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Changing refcount from {old} to {new} (by {change}) would overflow"),
@@ -2099,34 +2102,14 @@ impl RefBlockWriteGuard<'_> {
     /// Modify the given cluster’s refcount.
     fn modify(&mut self, index: usize, change: i64) -> io::Result<u64> {
         let result = match self.rb.refcount_order {
-            // refcount_bits == 1
-            0 => {
+            // refcount_bits == 1, 2, 4
+            0..=2 => {
+                let (index, mask, shift) = self.rb.sub_byte_refcount_access(index);
                 let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u8>() };
-                let atomic = unsafe {
-                    AtomicU8::from_ptr(&raw_data_slice[index / 8] as *const u8 as *mut u8)
-                };
+                let atomic =
+                    unsafe { AtomicU8::from_ptr(&raw_data_slice[index] as *const u8 as *mut u8) };
                 // Safe: `RefBlockWriteGuard` ensures there are no concurrent writers.
-                unsafe { Self::fetch_update_bitset(atomic, change, 0b1, index % 8) }
-            }
-
-            // refcount_bits == 2
-            1 => {
-                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u8>() };
-                let atomic = unsafe {
-                    AtomicU8::from_ptr(&raw_data_slice[index / 4] as *const u8 as *mut u8)
-                };
-                // Safe: `RefBlockWriteGuard` ensures there are no concurrent writers.
-                unsafe { Self::fetch_update_bitset(atomic, change, 0b11, index % 4) }
-            }
-
-            // refcount_bits == 4
-            2 => {
-                let raw_data_slice = unsafe { self.rb.raw_data.as_ref().into_typed_slice::<u8>() };
-                let atomic = unsafe {
-                    AtomicU8::from_ptr(&raw_data_slice[index / 2] as *const u8 as *mut u8)
-                };
-                // Safe: `RefBlockWriteGuard` ensures there are no concurrent writers.
-                unsafe { Self::fetch_update_bitset(atomic, change, 0b1111, index % 2) }
+                unsafe { Self::fetch_update_bitset(atomic, change, mask, shift) }
             }
 
             // refcount_bits == 8
