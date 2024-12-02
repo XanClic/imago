@@ -1,6 +1,7 @@
 //! Qcow2 implementation.
 
 mod allocation;
+mod builder;
 mod cache;
 mod compressed;
 mod cow;
@@ -12,7 +13,9 @@ mod sync_wrappers;
 mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
+use crate::format::builder::FormatDriverBuilder;
 use crate::format::drivers::{FormatDriverInstance, Mapping};
+use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
 use crate::format::Format;
 use crate::io_buffers::IoVectorMut;
@@ -21,6 +24,7 @@ use crate::raw::Raw;
 use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
+pub use builder::Qcow2OpenBuilder;
 use cache::L2CacheBackend;
 use metadata::*;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -52,6 +56,8 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
     backing_set: bool,
     /// Backing image.
     backing: Option<F>,
+    /// Base options to be used for implicitly opened storage objects.
+    storage_open_options: StorageOpenOptions,
 
     /// Qcow2 header.
     header: Arc<Header>,
@@ -68,19 +74,24 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
 }
 
 impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
-    /// Opens a qcow2 file.
+    /// Create a new [`FormatDriverBuilder`] instance for the given image.
+    pub fn builder(image: S) -> Qcow2OpenBuilder<S, F> {
+        Qcow2OpenBuilder::new(image)
+    }
+
+    /// Create a new [`FormatDriverBuilder`] instance for an image under the given path.
+    pub fn builder_path<P: AsRef<Path>>(image_path: P) -> Qcow2OpenBuilder<S, F> {
+        Qcow2OpenBuilder::new_path(image_path)
+    }
+
+    /// Internal implementation for opening a qcow2 image.
     ///
-    /// `metadata` is the file containing the qcow2 metadata.  If `writable` is not set, no
-    /// modifications are permitted.
-    ///
-    /// This will not open any other storage objects needed, i.e. no backing image, no external
-    /// data file.  If you want to handle those manually, check whether an external data file is
-    /// needed via [`Qcow2::requires_external_data_file()`], and, if necessary, assign one via
-    /// [`Qcow2::set_data_file()`]; and assign a backing image via [`Qcow2::set_backing()`].
-    ///
-    /// If you want to use the implicit references given in the image header, use
-    /// [`Qcow2::open_implicit_dependencies()`].
-    pub async fn open_image(metadata: S, writable: bool) -> io::Result<Self> {
+    /// Does not open external dependencies.
+    async fn do_open(
+        metadata: S,
+        writable: bool,
+        storage_open_options: StorageOpenOptions,
+    ) -> io::Result<Self> {
         let header = Arc::new(Header::load(&metadata, writable).await?);
 
         let cb = header.cluster_bits();
@@ -116,6 +127,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             storage: None,
             backing_set: false,
             backing: None,
+            storage_open_options,
 
             header,
             l1_table: RwLock::new(l1_table),
@@ -123,6 +135,22 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             l2_cache,
             allocator,
         })
+    }
+
+    /// Opens a qcow2 file.
+    ///
+    /// `metadata` is the file containing the qcow2 metadata.  If `writable` is not set, no
+    /// modifications are permitted.
+    ///
+    /// This will not open any other storage objects needed, i.e. no backing image, no external
+    /// data file.  If you want to handle those manually, check whether an external data file is
+    /// needed via [`Qcow2::requires_external_data_file()`], and, if necessary, assign one via
+    /// [`Qcow2::set_data_file()`]; and assign a backing image via [`Qcow2::set_backing()`].
+    ///
+    /// If you want to use the implicit references given in the image header, use
+    /// [`Qcow2::open_implicit_dependencies()`].
+    pub async fn open_image(metadata: S, writable: bool) -> io::Result<Self> {
+        Self::do_open(metadata, writable, StorageOpenOptions::new()).await
     }
 
     /// Open a qcow2 file at the given path.
@@ -140,7 +168,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     pub async fn open_path<P: AsRef<Path>>(path: P, writable: bool) -> io::Result<Self> {
         let storage_opts = StorageOpenOptions::new().write(writable).filename(path);
         let metadata = S::open(storage_opts).await?;
-        Self::open_image(metadata, writable).await
+        Self::do_open(metadata, writable, StorageOpenOptions::new()).await
     }
 
     /// Does this qcow2 image require an external data file?
@@ -200,7 +228,10 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     }
 
     /// Return the image’s implicit data file (as given in the image header).
-    async fn open_implicit_data_file(&self) -> io::Result<Option<S>> {
+    async fn open_implicit_data_file<G: ImplicitOpenGate<S>>(
+        &self,
+        gate: &mut G,
+    ) -> io::Result<Option<S>> {
         if !self.header.external_data_file() {
             return Ok(None);
         }
@@ -216,31 +247,50 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .resolve_relative_path(filename)
             .err_context(|| format!("Cannot resolve external data file name {filename}"))?;
 
-        let opts = StorageOpenOptions::new()
+        let opts = self
+            .storage_open_options
+            .clone()
             .write(true)
             .filename(absolute.clone());
 
-        Ok(Some(S::open(opts).await.err_context(|| {
-            format!("External data file {absolute:?}")
-        })?))
+        let file = gate
+            .open_storage(opts)
+            .await
+            .err_context(|| format!("External data file {absolute:?}"))?;
+        Ok(Some(file))
     }
 
     /// Wrap `file` in the `Raw` format.  Helper for [`Qcow2::implicit_backing_file()`].
-    async fn open_raw_backing_file(&self, file: S) -> io::Result<F> {
-        let raw = Raw::open_image(file, false).await?;
+    async fn open_raw_backing_file<G: ImplicitOpenGate<S>>(
+        &self,
+        file: S,
+        gate: &mut G,
+    ) -> io::Result<F> {
+        let opts = Raw::builder(file).storage_open_options(self.storage_open_options.clone());
+        let raw = gate.open_format(opts).await?;
         Ok(F::wrap(FormatAccess::new(raw)))
     }
 
     /// Wrap `file` in the `Qcow2` format.  Helper for [`Qcow2::implicit_backing_file()`].
-    async fn open_qcow2_backing_file(&self, file: S) -> io::Result<F> {
-        let mut qcow2 = Self::open_image(file, false).await?;
+    async fn open_qcow2_backing_file<G: ImplicitOpenGate<S>>(
+        &self,
+        file: S,
+        gate: &mut G,
+    ) -> io::Result<F> {
+        let opts =
+            Qcow2::<S>::builder(file).storage_open_options(self.storage_open_options.clone());
         // Recursive, so needs to be boxed
-        Box::pin(qcow2.open_implicit_dependencies()).await?;
+        let qcow2 = Box::pin(gate.open_format(opts)).await?;
         Ok(F::wrap(FormatAccess::new(qcow2)))
     }
 
     /// Return the image’s implicit backing image (as given in the image header).
-    async fn open_implicit_backing_file(&self) -> io::Result<Option<F>> {
+    ///
+    /// Anything opened will be passed through `gate`.
+    async fn open_implicit_backing_file<G: ImplicitOpenGate<S>>(
+        &self,
+        gate: &mut G,
+    ) -> io::Result<Option<F>> {
         let Some(filename) = self.header.backing_filename() else {
             return Ok(None);
         };
@@ -250,20 +300,26 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .resolve_relative_path(filename)
             .err_context(|| format!("Cannot resolve backing file name {filename}"))?;
 
-        let opts = StorageOpenOptions::new().filename(absolute.clone());
-        let file = S::open(opts)
+        let file_opts = self
+            .storage_open_options
+            .clone()
+            .filename(absolute.clone())
+            .write(false);
+
+        let file = gate
+            .open_storage(file_opts)
             .await
             .err_context(|| format!("Backing file {absolute:?}"))?;
 
         let result = match self.header.backing_format().map(|f| f.as_str()) {
-            Some("qcow2") => self.open_qcow2_backing_file(file).await.map(Some),
-            Some("raw") | Some("file") => self.open_raw_backing_file(file).await.map(Some),
+            Some("qcow2") => self.open_qcow2_backing_file(file, gate).await.map(Some),
+            Some("raw") | Some("file") => self.open_raw_backing_file(file, gate).await.map(Some),
 
             Some(fmt) => Err(io::Error::other(format!("Unknown backing format {fmt}"))),
 
             None => match Self::probe(&file).await {
-                Ok(true) => self.open_qcow2_backing_file(file).await.map(Some),
-                Ok(false) => self.open_raw_backing_file(file).await.map(Some),
+                Ok(true) => self.open_qcow2_backing_file(file, gate).await.map(Some),
+                Ok(false) => self.open_raw_backing_file(file, gate).await.map(Some),
                 Err(err) => Err(err),
             },
         };
@@ -288,18 +344,38 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// image, which we call *implicit* dependencies.  This function opens all such implicit
     /// dependencies if they have not been overridden with prior calls to
     /// [`Qcow2::set_data_file()`] or [`Qcow2::set_backing()`], respectively.
-    pub async fn open_implicit_dependencies(&mut self) -> io::Result<()> {
+    ///
+    /// Any image or file is opened through `gate`.
+    pub async fn open_implicit_dependencies_gated<G: ImplicitOpenGate<S>>(
+        &mut self,
+        mut gate: G,
+    ) -> io::Result<()> {
         if !self.storage_set {
-            self.storage = self.open_implicit_data_file().await?.map(Into::into);
+            self.storage = self
+                .open_implicit_data_file(&mut gate)
+                .await?
+                .map(Into::into);
             self.storage_set = true;
         }
 
         if !self.backing_set {
-            self.backing = self.open_implicit_backing_file().await?;
+            self.backing = self.open_implicit_backing_file(&mut gate).await?;
             self.backing_set = true;
         }
 
         Ok(())
+    }
+
+    /// Open all implicit dependencies, ungated.
+    ///
+    /// Same as [`Qcow2::open_implicit_dependencies_gated`], but does not perform any gating on
+    /// implicitly opened images/files.
+    ///
+    /// See the cautionary notes on [`PermissiveImplicitOpenGate`] on
+    /// [`FormatDriverInstance::probe()`] on why this may be dangerous.
+    pub async fn open_implicit_dependencies(&mut self) -> io::Result<()> {
+        self.open_implicit_dependencies_gated(PermissiveImplicitOpenGate::default())
+            .await
     }
 
     /// Require write access, i.e. return an error for read-only images.

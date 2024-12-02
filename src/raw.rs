@@ -2,7 +2,9 @@
 //!
 //! Allows accessing generic storage objects (`Storage`) as images (i.e. `FormatAccess`).
 
+use crate::format::builder::{FormatDriverBuilder, FormatDriverBuilderBase};
 use crate::format::drivers::{FormatDriverInstance, Mapping};
+use crate::format::gate::ImplicitOpenGate;
 use crate::format::Format;
 use crate::{Storage, StorageOpenOptions};
 use async_trait::async_trait;
@@ -24,6 +26,16 @@ pub struct Raw<S: Storage> {
 }
 
 impl<S: Storage> Raw<S> {
+    /// Create a new [`FormatDriverBuilder`] instance for the given image.
+    pub fn builder(image: S) -> RawOpenBuilder<S> {
+        RawOpenBuilder::new(image)
+    }
+
+    /// Create a new [`FormatDriverBuilder`] instance for an image under the given path.
+    pub fn builder_path<P: AsRef<Path>>(image_path: P) -> RawOpenBuilder<S> {
+        RawOpenBuilder::new_path(image_path)
+    }
+
     /// Wrap `inner`, allowing it to be used as a disk image in raw format.
     pub async fn open_image(inner: S, writable: bool) -> io::Result<Self> {
         let size = inner.size()?;
@@ -142,5 +154,49 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
 impl<S: Storage> Display for Raw<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "raw[{}]", self.inner)
+    }
+}
+
+/// Options builder for opening a raw image.
+pub struct RawOpenBuilder<S: Storage>(FormatDriverBuilderBase<S>);
+
+impl<S: Storage> FormatDriverBuilder<S> for RawOpenBuilder<S> {
+    type Format = Raw<S>;
+    const FORMAT: Format = Format::Raw;
+
+    fn new(image: S) -> Self {
+        RawOpenBuilder(FormatDriverBuilderBase::new(image))
+    }
+
+    fn new_path<P: AsRef<Path>>(path: P) -> Self {
+        RawOpenBuilder(FormatDriverBuilderBase::new_path(path))
+    }
+
+    fn write(mut self, writable: bool) -> Self {
+        self.0.set_write(writable);
+        self
+    }
+
+    fn storage_open_options(mut self, options: StorageOpenOptions) -> Self {
+        self.0.set_storage_open_options(options);
+        self
+    }
+
+    async fn open<G: ImplicitOpenGate<S>>(self, mut gate: G) -> io::Result<Self::Format> {
+        let writable = self.0.get_writable();
+        let file = self.0.open_image(&mut gate).await?;
+        Raw::open_image(file, writable).await
+    }
+
+    fn get_image_path(&self) -> Option<&Path> {
+        self.0.get_image_path()
+    }
+
+    fn get_writable(&self) -> bool {
+        self.0.get_writable()
+    }
+
+    fn get_storage_open_options(&self) -> Option<&StorageOpenOptions> {
+        self.0.get_storage_opts()
     }
 }
