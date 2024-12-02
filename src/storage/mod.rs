@@ -213,6 +213,9 @@ pub trait DynStorage: Debug + Display + Send + Sync {
     /// Wrapper around [`Storage::size()`].
     fn size(&self) -> io::Result<u64>;
 
+    /// Wrapper around [`Storage::resolve_relative_path()`].
+    fn resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf>;
+
     /// Object-safe wrapper around [`Storage::pure_readv()`].
     ///
     /// # Safety
@@ -284,6 +287,10 @@ impl<S: Storage> Storage for &S {
         (*self).size()
     }
 
+    fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
+        (*self).resolve_relative_path(relative)
+    }
+
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         unsafe { (*self).pure_readv(bufv, offset).await }
     }
@@ -332,6 +339,10 @@ impl<S: Storage> DynStorage for S {
 
     fn size(&self) -> io::Result<u64> {
         S::size(self)
+    }
+
+    fn resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf> {
+        S::resolve_relative_path(self, relative)
     }
 
     unsafe fn pure_readv<'a>(
@@ -407,6 +418,10 @@ impl Storage for Box<dyn DynStorage> {
         <Self as DynStorage>::size(self)
     }
 
+    fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
+        <Self as DynStorage>::resolve_relative_path(self, relative.as_ref())
+    }
+
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         unsafe { <Self as DynStorage>::pure_readv(self, bufv, offset).await }
     }
@@ -462,6 +477,10 @@ impl Storage for Arc<dyn DynStorage> {
 
     fn size(&self) -> io::Result<u64> {
         <Self as DynStorage>::size(self)
+    }
+
+    fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
+        <Self as DynStorage>::resolve_relative_path(self, relative.as_ref())
     }
 
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
