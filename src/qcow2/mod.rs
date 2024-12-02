@@ -260,13 +260,11 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
             Some(fmt) => Err(io::Error::other(format!("Unknown backing format {fmt}"))),
 
-            None => {
-                if Self::probe(&file).await.is_ok() {
-                    self.open_qcow2_backing_file(file).await.map(Some)
-                } else {
-                    self.open_raw_backing_file(file).await.map(Some)
-                }
-            }
+            None => match Self::probe(&file).await {
+                Ok(true) => self.open_qcow2_backing_file(file).await.map(Some),
+                Ok(false) => self.open_raw_backing_file(file).await.map(Some),
+                Err(err) => Err(err),
+            },
         };
 
         result.err_context(|| format!("Backing file {absolute:?}"))
