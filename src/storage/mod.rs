@@ -532,4 +532,19 @@ impl StorageOpenOptions {
         self.direct = direct;
         self
     }
+
+    /// Get the set filename (if any).
+    pub fn get_filename(&self) -> Option<&Path> {
+        self.filename.as_deref()
+    }
+
+    /// Return the set writable state.
+    pub fn get_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Return the set direct state.
+    pub fn get_direct(&self) -> bool {
+        self.direct
+    }
 }
