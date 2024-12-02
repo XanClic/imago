@@ -109,6 +109,10 @@ impl Storage for File {
         Ok(dirname.join(relative))
     }
 
+    fn get_filename(&self) -> Option<&Path> {
+        self.filename.as_deref()
+    }
+
     #[cfg(unix)]
     async unsafe fn pure_readv(
         &self,

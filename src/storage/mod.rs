@@ -89,6 +89,14 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// Return a filename, if possible.
+    ///
+    /// Using the filename for [`StorageOpenOptions::filename()`] should open the same storage
+    /// object.
+    fn get_filename(&self) -> Option<&Path> {
+        None
+    }
+
     /// Read data at `offset` into `bufv`.
     ///
     /// Reads until `bufv` is filled completely, i.e. will not do short reads.  When reaching the
@@ -230,6 +238,9 @@ pub trait DynStorage: Debug + Display + Send + Sync {
     /// Wrapper around [`Storage::resolve_relative_path()`].
     fn resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf>;
 
+    /// Wrapper around [`Storage::get_filename()`]
+    fn get_filename(&self) -> Option<&Path>;
+
     /// Object-safe wrapper around [`Storage::pure_readv()`].
     ///
     /// # Safety
@@ -311,6 +322,10 @@ impl<S: Storage> Storage for &S {
         (*self).resolve_relative_path(relative)
     }
 
+    fn get_filename(&self) -> Option<&Path> {
+        (*self).get_filename()
+    }
+
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         unsafe { (*self).pure_readv(bufv, offset).await }
     }
@@ -367,6 +382,10 @@ impl<S: Storage> DynStorage for S {
 
     fn resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf> {
         S::resolve_relative_path(self, relative)
+    }
+
+    fn get_filename(&self) -> Option<&Path> {
+        S::get_filename(self)
     }
 
     unsafe fn pure_readv<'a>(
@@ -450,6 +469,10 @@ impl Storage for Box<dyn DynStorage> {
         <Self as DynStorage>::resolve_relative_path(self, relative.as_ref())
     }
 
+    fn get_filename(&self) -> Option<&Path> {
+        <Self as DynStorage>::get_filename(self)
+    }
+
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         unsafe { <Self as DynStorage>::pure_readv(self, bufv, offset).await }
     }
@@ -513,6 +536,10 @@ impl Storage for Arc<dyn DynStorage> {
 
     fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
         <Self as DynStorage>::resolve_relative_path(self, relative.as_ref())
+    }
+
+    fn get_filename(&self) -> Option<&Path> {
+        <Self as DynStorage>::get_filename(self)
     }
 
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
