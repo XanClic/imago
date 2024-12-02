@@ -14,6 +14,7 @@ mod types;
 use crate::async_lru_cache::AsyncLruCache;
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::wrapped::WrappedFormat;
+use crate::format::Format;
 use crate::io_buffers::IoVectorMut;
 use crate::misc_helpers::ResultErrorContext;
 use crate::raw::Raw;
@@ -312,6 +313,10 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 #[async_trait(?Send)]
 impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     type Storage = S;
+
+    fn format(&self) -> Format {
+        Format::Qcow2
+    }
 
     async fn probe(metadata: &S) -> io::Result<bool>
     where

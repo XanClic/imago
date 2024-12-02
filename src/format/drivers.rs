@@ -3,6 +3,7 @@
 //! Provides the internal interface for image format drivers to provide their services, on which
 //! the publically visible interface [`FormatAccess`] is built.
 
+use super::Format;
 use crate::io_buffers::IoVectorMut;
 use crate::{FormatAccess, Storage};
 use async_trait::async_trait;
@@ -14,6 +15,9 @@ use std::io;
 pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// Type of storage used.
     type Storage: Storage;
+
+    /// Return which format this is.
+    fn format(&self) -> Format;
 
     /// Check whether `storage` has this format.
     ///

@@ -3,6 +3,7 @@
 //! Allows accessing generic storage objects (`Storage`) as images (i.e. `FormatAccess`).
 
 use crate::format::drivers::{FormatDriverInstance, Mapping};
+use crate::format::Format;
 use crate::{Storage, StorageOpenOptions};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
@@ -62,6 +63,10 @@ impl<S: Storage> Raw<S> {
 #[async_trait(?Send)]
 impl<S: Storage> FormatDriverInstance for Raw<S> {
     type Storage = S;
+
+    fn format(&self) -> Format {
+        Format::Raw
+    }
 
     async fn probe(_storage: &S) -> io::Result<bool>
     where
