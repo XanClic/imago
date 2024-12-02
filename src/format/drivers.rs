@@ -24,7 +24,33 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// This is only a rough test and does not guarantee that opening `storage` under this format
     /// will succeed.  Generally, it will only check the magic bytes (if available).  For formats
     /// that do not have distinct features (like raw), this will always return `true`.
-    async fn probe(storage: &Self::Storage) -> io::Result<bool>
+    ///
+    /// # Safety
+    /// Probing is inherently dangerous: Image formats like qcow2 allow referencing external files;
+    /// if you use imago to give untrusted parties (like VM guests) access to VM disk image files,
+    /// this will give those parties access to data in those files.  Opening images from untrusted
+    /// sources can therefore be quite dangerous.  Gating
+    /// ([`ImplicitOpenGate`](super::gate::ImplicitOpenGate)) can help mitigate this.
+    ///
+    /// If you do not know an image’s format, that is a sign it does not come from a trusted
+    /// source, and so opening it in a non-raw format may be quite dangerous.
+    ///
+    /// Perhaps most important to note is that giving an untrusted party (like a VM guest) access
+    /// to a raw image file allows that party to modify the whole file.  It may write image headers
+    /// into this image file, causing a subsequent probe operation to recognize it as a non-raw
+    /// image, referencing arbitrary files on the host filesystem!
+    ///
+    /// When using imago to give an untrusted third party access to VM disk images, the guidelines
+    /// for probing are thus:
+    /// - Do not probe.  If at all possible, obtain an image’s format from a trusted side channel.
+    /// - If there is no other way, probe each given image only once, before that untrusted third
+    ///   party (like a VM guest) had write access to it; remember the probed format, and open the
+    ///   image exclusively as that format.
+    ///
+    /// When working with even potentially untrusted images, you should always use an
+    /// [`ImplicitOpenGate`](super::gate::ImplicitOpenGate) to prevent access to files you do not
+    /// wish to access.
+    async unsafe fn probe(storage: &Self::Storage) -> io::Result<bool>
     where
         Self: Sized;
 

@@ -317,7 +317,10 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
             Some(fmt) => Err(io::Error::other(format!("Unknown backing format {fmt}"))),
 
-            None => match Self::probe(&file).await {
+            // Reasonably safe: The backing image is supposed to be read-only.  We could run into
+            // trouble if a guest is on a raw image, which is then snapshotted, and now we see a
+            // qcow2 image; but let’s rely on such images always having a backing format set.
+            None => match unsafe { Self::probe(&file) }.await {
                 Ok(true) => self.open_qcow2_backing_file(file, gate).await.map(Some),
                 Ok(false) => self.open_raw_backing_file(file, gate).await.map(Some),
                 Err(err) => Err(err),
@@ -394,7 +397,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         Format::Qcow2
     }
 
-    async fn probe(metadata: &S) -> io::Result<bool>
+    async unsafe fn probe(metadata: &S) -> io::Result<bool>
     where
         Self: Sized,
     {

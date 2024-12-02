@@ -80,7 +80,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         Format::Raw
     }
 
-    async fn probe(_storage: &S) -> io::Result<bool>
+    async unsafe fn probe(_storage: &S) -> io::Result<bool>
     where
         Self: Sized,
     {
