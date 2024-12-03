@@ -78,6 +78,17 @@ pub trait FormatDriverBuilder<S: Storage>: Sized {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn open<G: ImplicitOpenGate<S>>(self, gate: G) -> io::Result<Self::Format>;
 
+    /// Synchronous wrapper around [`FormatDriverBuilder::open()`].
+    ///
+    /// This creates an async runtime, so the [`ImplicitOpenGate`] implementation is still supposed
+    /// to be async.
+    #[cfg(feature = "sync-wrappers")]
+    fn open_sync<G: ImplicitOpenGate<S>>(self, gate: G) -> io::Result<Self::Format> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(self.open(gate))
+    }
+
     /// If possible, get the image’s path.
     fn get_image_path(&self) -> Option<&Path>;
 

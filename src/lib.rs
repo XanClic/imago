@@ -11,12 +11,12 @@
 //! # || -> std::io::Result<()> {
 //! use imago::file::File;
 //! use imago::qcow2::Qcow2;
-//! use imago::SyncFormatAccess;
+//! use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate, SyncFormatAccess};
 //! use std::fs::OpenOptions;
 //!
 //! // Produce read-only qcow2 instance using purely `File` for storage
-//! let mut qcow2 = Qcow2::<File>::open_path_sync("image.qcow2", false)?;
-//! qcow2.open_implicit_dependencies_sync()?;
+//! let mut qcow2 = Qcow2::<File>::builder_path("image.qcow2")
+//!     .open_sync(PermissiveImplicitOpenGate::default())?;
 //!
 //! let qcow2 = SyncFormatAccess::new(qcow2)?;
 //!
