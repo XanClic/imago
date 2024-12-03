@@ -51,6 +51,7 @@ impl<S: Storage> Raw<S> {
         })
     }
 
+    #[cfg(feature = "sync-wrappers")]
     /// Synchronous wrapper around [`Raw::open_path()`].
     pub fn open_path_sync<P: AsRef<Path>>(path: P, writable: bool) -> io::Result<Self> {
         tokio::runtime::Builder::new_current_thread()
