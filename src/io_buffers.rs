@@ -9,10 +9,10 @@
 use crate::macros::passthrough_trait_fn;
 #[cfg(feature = "vm-memory")]
 use crate::misc_helpers::ImagoAsRef;
-use futures::io::{IoSlice, IoSliceMut};
 use std::alloc::{self, GlobalAlloc};
 use std::fmt::{self, Debug, Formatter};
 use std::io;
+use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 #[cfg(unix)]
 use std::mem;
