@@ -5,7 +5,7 @@
 //! unaligned requests and provides write serialization.
 
 use super::drivers::RangeBlockedGuard;
-use crate::io_buffers::{IoBuffer, IoVector, IoVectorBounceBuffers, IoVectorMut, IoVectorTrait};
+use crate::io_buffers::{IoBuffer, IoVector, IoVectorMut, IoVectorTrait};
 use crate::Storage;
 use std::ops::Range;
 use std::{cmp, io};
@@ -89,7 +89,7 @@ pub trait StorageExt: Storage {
 }
 
 impl<S: Storage> StorageExt for S {
-    async fn readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+    async fn readv(&self, mut bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         if bufv.is_empty() {
             return Ok(());
         }
@@ -102,8 +102,6 @@ impl<S: Storage> StorageExt for S {
             return unsafe { self.pure_readv(bufv, offset) }.await;
         }
 
-        let req_align_mask = req_align as u64 - 1;
-
         trace!(
             "Unaligned read: 0x{:x} + {} (size: {:#x})",
             offset,
@@ -111,34 +109,38 @@ impl<S: Storage> StorageExt for S {
             self.size().unwrap()
         );
 
+        let req_align_mask = req_align as u64 - 1;
+        // Length must be aligned to both memory and request alignments
+        let len_align_mask = req_align_mask | (mem_align as u64 - 1);
+        debug_assert!((len_align_mask + 1) % (req_align as u64) == 0);
+
         let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !req_align_mask;
         // This will over-align at the end of file (aligning to exactly the end of file would be
         // sufficient), but it is easier this way.
         let padded_end = (unpadded_end + req_align_mask) & !req_align_mask;
+        // Now also align to memory alignment
+        let padded_len = (padded_end - padded_offset + len_align_mask) & !(len_align_mask);
+        let padded_end = padded_offset + padded_len;
 
-        trace!(
-            "Padded read: 0x{:x} + {}",
-            padded_offset,
-            padded_end - padded_offset
-        );
+        let padded_len: usize = (padded_end - padded_offset)
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Cannot realign read: {e}")))?;
 
-        let pad_head_len = (offset - padded_offset) as usize;
-        let mut pad_tail_len = (padded_end - unpadded_end) as usize;
+        trace!("Padded read: {padded_offset:#x} + {padded_len}");
 
-        trace!("Head length: {pad_head_len}; tail length: {pad_tail_len}");
-
-        let mut bounce = IoVectorBounceBuffers::default();
-        let bufv = bufv.enforce_alignment_for_read(
-            mem_align,
-            req_align,
-            pad_head_len,
-            &mut pad_tail_len,
-            &mut bounce,
-        )?;
+        let mut bounce_buf = IoBuffer::new(padded_len, mem_align)?;
 
         // Safe: Alignment enforced
-        unsafe { self.pure_readv(bufv, padded_offset) }.await
+        unsafe { self.pure_readv(bounce_buf.as_mut().into(), padded_offset) }.await?;
+
+        let in_buf_ofs = (offset - padded_offset) as usize;
+        // Must fit in `usize` because `padded_len: usize`
+        let in_buf_end = (unpadded_end - padded_offset) as usize;
+
+        bufv.copy_from_slice(bounce_buf.as_ref_range(in_buf_ofs..in_buf_end).into_slice());
+
+        Ok(())
     }
 
     async fn writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
@@ -156,8 +158,6 @@ impl<S: Storage> StorageExt for S {
             return unsafe { self.pure_writev(bufv, offset) }.await;
         }
 
-        let req_align_mask = req_align as u64 - 1;
-
         trace!(
             "Unaligned write: {:#x} + {} (size: {:#x})",
             offset,
@@ -165,34 +165,31 @@ impl<S: Storage> StorageExt for S {
             self.size().unwrap()
         );
 
+        let req_align_mask = req_align - 1;
+        // Length must be aligned to both memory and request alignments
+        let len_align_mask = req_align_mask | (mem_align - 1);
+        let len_align = req_align_mask + 1;
+        debug_assert!(len_align % req_align == 0);
+
         let unpadded_end = offset + bufv.len();
-        let padded_offset = offset & !req_align_mask;
+        let padded_offset = offset & !(req_align_mask as u64);
         // This will over-align at the end of file (aligning to exactly the end of file would be
         // sufficient), but it is easier this way.  Small TODO, as this will indeed increase the
         // file length (which the over-alignment in `unaligned_readv()` does not).
-        let padded_end = (unpadded_end + req_align_mask) & !req_align_mask;
+        let padded_end = (unpadded_end + req_align_mask as u64) & !(req_align_mask as u64);
+        // Now also align to memory alignment
+        let padded_len =
+            (padded_end - padded_offset + len_align_mask as u64) & !(len_align_mask as u64);
+        let padded_end = padded_offset + padded_len;
 
-        trace!(
-            "Padded write: {:#x} + {}",
-            padded_offset,
-            padded_end - padded_offset
-        );
+        let padded_len: usize = (padded_end - padded_offset)
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Cannot realign write: {e}")))?;
 
-        let pad_head_len = (offset - padded_offset) as usize;
-        let mut pad_tail_len = (padded_end - unpadded_end) as usize;
+        trace!("Padded write: {padded_offset:#x} + {padded_len}");
 
-        trace!("Head length: {pad_head_len}; tail length: {pad_tail_len}");
-
-        let mut bounce = IoVectorBounceBuffers::default();
-        let (bufv, unaligned_head, unaligned_tail) = bufv.enforce_alignment_for_write(
-            mem_align,
-            req_align,
-            pad_head_len,
-            &mut pad_tail_len,
-            &mut bounce,
-        )?;
-
-        let padded_end = padded_offset + bufv.len();
+        let mut bounce_buf = IoBuffer::new(padded_len, mem_align)?;
+        assert!(padded_len >= len_align && padded_len & len_align_mask == 0);
 
         // For the strong blocker, just the RMW regions (head and tail) would be enough.  However,
         // we don’t expect any concurrent writes to the non-RMW (pure write) regions (it is
@@ -202,132 +199,42 @@ impl<S: Storage> StorageExt for S {
         // Instating fewer blockers makes them less expensive to check, though.
         let _sw_guard = self.strong_write_blocker(padded_offset..padded_end).await;
 
-        let bufv_unwrapped = bufv.into_inner();
+        let in_buf_ofs = (offset - padded_offset) as usize;
+        // Must fit in `usize` because `padded_len: usize`
+        let in_buf_end = (unpadded_end - padded_offset) as usize;
 
-        if pad_head_len > 0 && pad_tail_len > 0 && bufv_unwrapped.len() == 1 {
-            let unaligned = unaligned_head.unwrap();
-            // Covered by `unaligned_head`.
-            assert!(unaligned_tail.is_none());
+        // RMW part 1: Read
 
-            // Single buffer for both head and tail.  Must be a bounce buffer because of
-            // `pad_head_len > 0`, so we can make it mutable.
-            let buf = bufv_unwrapped.first().unwrap();
-            let buf = unsafe { std::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len()) };
+        let head_len = in_buf_ofs;
+        let aligned_head_len = (head_len + len_align_mask) & !len_align_mask;
 
-            let retain_start = pad_head_len;
-            let retain_end = retain_start + unaligned.len() as usize;
-            // from the head case below
-            let read_len1 = retain_start.next_multiple_of(cmp::max(mem_align, req_align));
-            let read_start1 = 0;
-            let read_end1 = read_start1 + read_len1;
-            // from the tail case below
-            let read_len2 = pad_tail_len.next_multiple_of(cmp::max(mem_align, req_align));
-            let read_end2 = buf.len();
-            let read_start2 = read_end2.checked_sub(read_len2).unwrap();
-            trace!(
-                "Single buffer RMW, full length: {}; read ranges: {}..{} (from {:#x}) and {}..{} (from {:#x}); retain range: {}..{}",
-                buf.len(),
-                read_start1,
-                read_end1,
-                padded_offset,
-                read_start2,
-                read_end2,
-                padded_end - read_len2 as u64,
-                retain_start,
-                retain_end,
-            );
+        let tail_len = padded_len - in_buf_end;
+        let aligned_tail_len = (tail_len + len_align_mask) & !len_align_mask;
 
-            if read_start2 <= read_end1 {
-                trace!(
-                    "Unifying read to {}..{} (from {:#x})",
-                    read_start1,
-                    read_end2,
-                    padded_offset
-                );
-                self.read(&mut buf[read_start1..read_end2], padded_offset)
-                    .await?;
-            } else {
-                self.read(&mut buf[read_start1..read_end1], padded_offset)
-                    .await?;
-                self.read(
-                    &mut buf[read_start2..read_end2],
-                    padded_end - read_len2 as u64,
-                )
-                .await?;
-            }
-            unaligned.copy_into_slice(&mut buf[retain_start..retain_end]);
+        if aligned_head_len + aligned_tail_len == padded_len {
+            // Must read the whole bounce buffer
+            // Safe: Alignment enforced
+            unsafe { self.pure_readv(bounce_buf.as_mut().into(), padded_offset) }.await?;
         } else {
-            if pad_head_len > 0 {
-                let unaligned_head = unaligned_head.unwrap();
-
-                // There must be a head bounce buffer because `pad_head_len > 0`.
-                let head_buf = bufv_unwrapped.first().unwrap();
-                let head_buf = unsafe {
-                    std::slice::from_raw_parts_mut(head_buf.as_ptr() as *mut u8, head_buf.len())
-                };
-
-                let retain_start = pad_head_len;
-                let retain_end = head_buf.len();
-                let read_len = retain_start.next_multiple_of(cmp::max(mem_align, req_align));
-                let read_start = 0;
-                let read_end = read_start + read_len;
-                trace!(
-                    "Head buffer RMW, head length: {}; read range: {}..{} (from {:#x}; retain range: {}..{}",
-                    head_buf.len(),
-                    read_start,
-                    read_end,
-                    padded_offset,
-                    retain_start,
-                    retain_end,
-                );
-
-                assert!(read_end <= head_buf.len());
-                self.read(&mut head_buf[read_start..read_end], padded_offset)
-                    .await?;
-
-                assert_eq!(retain_end - retain_start, unaligned_head.len() as usize);
-                unaligned_head.copy_into_slice(&mut head_buf[retain_start..retain_end]);
+            if aligned_head_len > 0 {
+                let head_bufv = bounce_buf.as_mut_range(0..aligned_head_len).into();
+                // Safe: Alignment enforced
+                unsafe { self.pure_readv(head_bufv, padded_offset) }.await?;
             }
-
-            if pad_tail_len > 0 {
-                let unaligned_tail = unaligned_tail.unwrap();
-
-                // There must be a tail bounce buffer one because `pad_tail_len > 0`.
-                let tail_buf = bufv_unwrapped.last().unwrap();
-                let tail_buf = unsafe {
-                    std::slice::from_raw_parts_mut(tail_buf.as_ptr() as *mut u8, tail_buf.len())
-                };
-
-                let retain_start = 0;
-                let retain_end = tail_buf.len() - pad_tail_len;
-                let read_len = pad_tail_len.next_multiple_of(cmp::max(mem_align, req_align));
-                let read_end = tail_buf.len();
-                let read_start = read_end.checked_sub(read_len).unwrap();
-                trace!(
-                    "Tail buffer RMW, tail length: {}; read range: {}..{} (from {:#x}); retain range: {}..{}",
-                    tail_buf.len(),
-                    read_start,
-                    read_end,
-                    padded_end - read_len as u64,
-                    retain_start,
-                    retain_end,
-                );
-
-                self.read(
-                    &mut tail_buf[read_start..read_end],
-                    padded_end - read_len as u64,
-                )
-                .await?;
-
-                assert_eq!(retain_end - retain_start, unaligned_tail.len() as usize);
-                unaligned_tail.copy_into_slice(&mut tail_buf[retain_start..retain_end]);
+            if aligned_tail_len > 0 {
+                let tail_start = padded_len - aligned_tail_len;
+                let tail_bufv = bounce_buf.as_mut_range(tail_start..padded_len).into();
+                // Safe: Alignment enforced
+                unsafe { self.pure_readv(tail_bufv, padded_offset + tail_start as u64) }.await?;
             }
         }
 
-        let bufv = bufv_unwrapped.into();
+        // RMW part 2: Modify
+        bufv.copy_into_slice(bounce_buf.as_mut_range(in_buf_ofs..in_buf_end).into_slice());
 
+        // RMW part 3: Write
         // Safe: Alignment enforced, and strong write blocker set up
-        unsafe { self.pure_writev(bufv, padded_offset) }.await
+        unsafe { self.pure_writev(bounce_buf.as_ref().into(), padded_offset) }.await
     }
 
     async fn read(&self, buf: impl Into<IoVectorMut<'_>>, offset: u64) -> io::Result<()> {

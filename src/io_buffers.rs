@@ -19,7 +19,6 @@ use std::mem;
 use std::mem::{size_of, size_of_val};
 use std::ops::Range;
 use std::{cmp, ptr, slice};
-use tracing::trace;
 
 /// Owned memory buffer.
 pub struct IoBuffer {
@@ -460,32 +459,6 @@ impl<'a> From<IoBufferMut<'a>> for IoSliceMut<'a> {
     }
 }
 
-/// Internal helper for memory alignment adherence.
-///
-/// Collects bounce buffers that are created when enforcing minimum memory alignment requirements
-/// on I/O vectors.
-///
-/// For read requests, dropping this object will automatically copy the data back to the original
-/// guest buffers.
-#[derive(Default)]
-pub(crate) struct IoVectorBounceBuffers<'a> {
-    /// Collection of bounce buffers; references to these are put into the re-aligned IoVector*
-    /// object.
-    buffers: Vec<IoBuffer>,
-
-    /// Waste head length (i.e. do not copy this back).
-    pad_head_len: usize,
-
-    /// Waste tail length (i.e. do not copy this back).
-    pad_tail_len: usize,
-
-    /// For read requests (hence the IoSliceMut type): Collection of unaligned buffers (which have
-    /// been replaced by bounce buffers in the re-aligned IoVectorMut), to which we need to return
-    /// the data from the bounce buffers once the request is done (i.e., e.g., when this object is
-    /// dropped).
-    copy_back_into: Option<Vec<IoSliceMut<'a>>>,
-}
-
 /// Common functions for both `IoVector` and `IoVectorMut`.
 #[allow(dead_code)]
 pub(crate) trait IoVectorTrait: Sized {
@@ -829,196 +802,6 @@ macro_rules! impl_io_vector {
 
                 (head, tail)
             }
-
-            /// Consume `self`, returning an I/O vector that fulfills the given alignment
-            /// requirements.
-            ///
-            /// All bounce buffers that are created for this purpose are stored into
-            /// `bounce_buffers` (which must have been created just for this function, i.e. must be
-            /// empty).
-            ///
-            /// Waste buffers will be created for head and/or tail according to `pad_head_len` and
-            /// `pad_tail_len`.
-            ///
-            /// If `copy_into` is true, the bounce buffers are initialized with data from the input
-            /// vector.
-            ///
-            /// If `copy_back` is true, all unaligned buffers are collected in a `Vec` (instead of
-            /// discarding them) and returned as the second element of the tuple.  The caller
-            /// should store this `Vec` in the same `IoVectorBounceBuffers` that holds
-            /// `bounce_buffers`, so that the data is copied back from the bounce buffers once the
-            /// `IoVectorBounceBuffers` object is dropped.  (Implementation detail: This function
-            /// cannot operate on `IoVectorBounceBuffers` objects directly, because its
-            /// `copy_back_into` field holds `IoSliceMut`s, which may not be what `$inner_type` is
-            /// in the implementing macro.)
-            ///
-            /// This function has the returned vector’s lifetime be limited to how long the
-            /// `bounce_buffers` object lives.
-            ///
-            /// `.2` and `.3` are the unaligned head and tail, if any (only returned when
-            /// `copy_into == true`).  These are not copied from `self` (despite `copy_into ==
-            /// true`), because the caller will need to use the aligned head and tail bounce
-            /// buffers for RMW, and then copy the data from `.2` and `.3` into there.  Note that
-            /// if the unaligned head and tail are covered by the same bounce buffer, only one
-            /// vector for both will be returned (in `.2`).
-            #[allow(clippy::too_many_arguments)]
-            fn create_aligned_buffer<'b>(
-                self,
-                mem_alignment: usize,
-                req_alignment: usize,
-                pad_head_len: usize,
-                pad_tail_len: &mut usize,
-                bounce_buffers: &'b mut Vec<IoBuffer>,
-                copy_into: bool,
-                copy_back: bool,
-            ) -> io::Result<($type<'b>, Option<Vec<$inner_type<'a>>>, Option<Self>, Option<Self>)>
-            where
-                'a: 'b,
-            {
-                if self.len() == 0 {
-                    panic!("Must not call create_aligned_buffer() for a length of 0");
-                }
-
-                debug_assert!(copy_into || copy_back);
-                debug_assert!(mem_alignment.is_power_of_two() && req_alignment.is_power_of_two());
-                let base_align_mask = mem_alignment - 1;
-                let len_align_mask = base_align_mask | (req_alignment - 1);
-
-                // Up-align tail if necessary
-                let usize_len = self.len().try_into().map_err(|_| io::Error::other("I/O vector length overflow"))?;
-                let full_length = pad_head_len
-                    .checked_add(usize_len)
-                    .and_then(|l| l.checked_add(*pad_tail_len))
-                    .ok_or_else(|| io::Error::other("I/O vector length overflow"))?;
-                let missing = (
-                    full_length
-                        .checked_add(len_align_mask)
-                        .ok_or_else(|| io::Error::other("I/O vector length overflow"))?
-                        & !len_align_mask
-                    ) - full_length;
-                if missing > 0 {
-                    trace!(
-                        "Increasing waste tail length by {} (full length was {} + {} + {} = {})",
-                        missing,
-                        pad_head_len,
-                        self.len(),
-                        *pad_tail_len,
-                        full_length,
-                    );
-                    *pad_tail_len += missing;
-                }
-                let full_length = full_length + missing;
-                debug_assert_eq!(pad_head_len + usize_len + *pad_tail_len, full_length);
-                debug_assert_eq!(full_length & len_align_mask, 0);
-
-                // First, create all bounce buffers as necessary and put them into
-                // `bounce_buffers`.  Thus, `bounce_buffers` no longer needs to be mutable after
-                // this loop, which allows us to take `$inner_type<b>` references from those
-                // buffers while they are in the `Vec<IoBuffer>`.
-
-                let mut unaligned_length_collection = pad_head_len;
-                for buffer in &self.vector {
-                    let base = buffer.as_ptr() as usize;
-                    let len = buffer.len();
-
-                    if base & base_align_mask != 0 || len & len_align_mask != 0 || unaligned_length_collection != 0 {
-                        unaligned_length_collection += len;
-
-                        let unaligned_len = unaligned_length_collection;
-                        if unaligned_len & len_align_mask == 0 {
-                            bounce_buffers.push(IoBuffer::new(unaligned_len, mem_alignment)?);
-                            unaligned_length_collection = 0;
-                        }
-                    }
-                }
-
-                let unaligned_len = unaligned_length_collection + *pad_tail_len;
-                if unaligned_len != 0 {
-                    // `pad_head_len` and `pad_tail_len` must result in the whole length being
-                    // aligned
-                    assert_eq!(unaligned_len & len_align_mask, 0);
-                    bounce_buffers.push(IoBuffer::new(unaligned_len, mem_alignment)?);
-                }
-
-                // Second, create the I/O vector that is returned: Interleave already aligned
-                // vector buffers with references to the newly created buffers (which have the
-                // proper lifetime `'b`), and copy data into those new buffers if `copy_into`.  If
-                // `copy_back`, collect the replaced buffers in `copy_back_vector`.
-
-                let mut realigned_vector = Vec::<$inner_type<'b>>::new();
-                let mut unaligned_collection: Option<Self> = None;
-                let mut head_buf = pad_head_len != 0;
-                let mut buffer_iter = bounce_buffers.iter_mut();
-                let mut copy_back_vector = copy_back.then(|| Vec::<$inner_type<'a>>::new());
-                let mut unaligned_head: Option<Self> = None;
-                let mut unaligned_tail: Option<Self> = None;
-                let buffer_count = self.vector.len();
-
-                unaligned_length_collection = pad_head_len;
-
-                for (i, buffer) in self.vector.into_iter().enumerate() {
-                    let base = buffer.as_ptr() as usize;
-                    let len = buffer.len();
-                    let last_buffer = i == buffer_count - 1;
-
-                    if base & base_align_mask != 0 || len & len_align_mask != 0 || unaligned_length_collection != 0 || last_buffer {
-                        let collection = unaligned_collection.get_or_insert_with(|| Self::new());
-                        unaligned_length_collection += buffer.len();
-                        collection.push_ioslice(buffer);
-
-                        if last_buffer {
-                            unaligned_length_collection += *pad_tail_len;
-                            // Padding must align the tail
-                            debug_assert_eq!(unaligned_length_collection & len_align_mask, 0);
-                        }
-
-                        let unaligned_len = unaligned_length_collection;
-                        if unaligned_len & len_align_mask == 0 {
-                            let new_buf: &'b mut IoBuffer = buffer_iter.next().unwrap();
-                            if copy_into {
-                                if head_buf {
-                                    assert!(unaligned_head.is_none());
-                                    unaligned_head = Some(unaligned_collection.take().unwrap());
-                                    head_buf = false;
-                                } else if last_buffer && *pad_tail_len != 0 {
-                                    assert!(unaligned_tail.is_none());
-                                    unaligned_tail = Some(unaligned_collection.take().unwrap());
-                                } else {
-                                    collection.copy_into_slice(new_buf.as_mut().into_slice());
-                                }
-                            } else if let Some(copy_back_vector) = copy_back_vector.as_mut() {
-                                let mut collection = unaligned_collection.take().unwrap();
-                                copy_back_vector.append(&mut collection.vector);
-                            }
-
-                            unaligned_collection = None;
-                            unaligned_length_collection = 0;
-
-                            // Get a reference from `bounce_buffers` to ensure the lifetime
-                            realigned_vector.push($inner_type::new(new_buf.as_mut().into_slice()));
-                        }
-                    } else {
-                        realigned_vector.push(buffer);
-                    }
-                }
-
-                assert!(unaligned_collection.is_none());
-
-                debug_assert_eq!(
-                    realigned_vector.iter().map(|buf| buf.len()).fold(0, |x, y| x + y),
-                    full_length
-                );
-
-                Ok((
-                    $type {
-                        vector: realigned_vector,
-                        total_size: full_length as u64,
-                    },
-                    copy_back_vector,
-                    unaligned_head,
-                    unaligned_tail,
-                ))
-            }
         }
 
         impl<'a> IoVectorTrait for $type<'a> {
@@ -1123,67 +906,12 @@ impl_io_vector!(
     &'b mut [u8]
 );
 
+#[cfg(feature = "vm-memory")]
 impl<'a> IoVector<'a> {
-    /// Ensure that all buffers in the vector adhere to the given alignment.
-    ///
-    /// Buffers’ addresses must be aligned to `mem_alignment`, and their lengths must be aligned to
-    /// both `mem_alignment` and `req_alignment`.
-    ///
-    /// `pad_head_len` and `pad_tail_len` may specify whether bounce buffers should be appended to
-    /// head or tail, respectively (to match the request alignment).  Note that these are not
-    /// initialized; the caller is expected to fill those areas for RMW, like so:
-    /// - This function will not copy data from `self` into the unaligned part of head and tail.
-    /// - This unaligned part of head and tail is returned (if any), these are `.1` and `.2` of the
-    ///   return value.
-    /// - The caller is expected to read head and tail into the bounce buffers (which are
-    ///   referenced by the returned vector), and then copy `.1` and `.2` into there, too.
-    ///
-    /// (Note that if the unaligned head and tail are covered by the same bounce buffer, only one
-    /// vector for both will be returned (in `.1`).)
-    ///
-    /// To align everything, bounce buffers are created and filled with data from the
-    /// buffers in the vector (which is why this is only for writes).  These bounce buffers
-    /// are stored in `bounce_buffers`, and the lifetime `'b` ensures this object will
-    /// outlive the returned new vector.
-    ///
-    /// `bounce_buffers` must have been created specifically for this single function call through
-    /// `IoVectorBounceBuffers::default()`.
-    pub(crate) fn enforce_alignment_for_write<'b>(
-        self,
-        mem_alignment: usize,
-        req_alignment: usize,
-        pad_head_len: usize,
-        pad_tail_len: &mut usize,
-        bounce_buffers: &'b mut IoVectorBounceBuffers<'static>,
-    ) -> io::Result<(IoVector<'b>, Option<IoVector<'a>>, Option<IoVector<'a>>)>
-    where
-        'a: 'b,
-    {
-        debug_assert!(bounce_buffers.is_empty());
-
-        let (aligned, copy_back_buffers, unaligned_head, unaligned_tail) = self
-            .create_aligned_buffer(
-                mem_alignment,
-                req_alignment,
-                pad_head_len,
-                pad_tail_len,
-                &mut bounce_buffers.buffers,
-                true,
-                false,
-            )?;
-        debug_assert!(copy_back_buffers.is_none());
-
-        bounce_buffers.pad_head_len = pad_head_len;
-        bounce_buffers.pad_tail_len = *pad_tail_len;
-
-        Ok((aligned, unaligned_head, unaligned_tail))
-    }
-
     /// Converts a `VolatileSlice` array (from vm-memory) into an `IoVector`.
     ///
     /// In addition to a the vector, return a guard that ensures that the memory in `slices` is
     /// indeed mapped while in use.  This guard must not be dropped while this vector is in use!
-    #[cfg(feature = "vm-memory")]
     pub fn from_volatile_slice<
         B: vm_memory::bitmap::BitmapSlice,
         I: IntoIterator<
@@ -1221,7 +949,7 @@ impl<'a> IoVector<'a> {
     }
 }
 
-impl<'a> IoVectorMut<'a> {
+impl IoVectorMut<'_> {
     /// Fill all buffers in the vector with the given byte pattern.
     pub fn fill(&mut self, value: u8) {
         for slice in self.vector.iter_mut() {
@@ -1246,61 +974,14 @@ impl<'a> IoVectorMut<'a> {
             offset = next_offset;
         }
     }
+}
 
-    /// Ensure that all buffers in the vector adhere to the given alignment.
-    ///
-    /// Buffers’ addresses must be aligned to `mem_alignment`, and their lengths must be aligned to
-    /// both `mem_alignment` and `req_alignment`.
-    ///
-    /// `pad_head_len` and `pad_tail_len` may specify whether waste buffers should be appended to
-    /// head or tail, respectively (to match the request alignment).
-    ///
-    /// To align everything, bounce buffers are created without initializing them (which is
-    /// why this is only for reads).  These bounce buffers are stored in `bounce_buffers`,
-    /// and the lifetime `'b` ensures this object will outlive the returned new vector.
-    /// When `bounce_buffers` is dropped, the data in those bounce buffers (filled by the read
-    /// operation) will automatically be copied back into the original guest buffers.
-    ///
-    /// `bounce_buffers` must have been created specifically for this single function call through
-    /// `IoVectorBounceBuffers::default()`.
-    pub(crate) fn enforce_alignment_for_read<'b>(
-        self,
-        mem_alignment: usize,
-        req_alignment: usize,
-        pad_head_len: usize,
-        pad_tail_len: &mut usize,
-        bounce_buffers: &'b mut IoVectorBounceBuffers<'a>,
-    ) -> io::Result<IoVectorMut<'b>>
-    where
-        'a: 'b,
-    {
-        debug_assert!(bounce_buffers.is_empty());
-
-        let (aligned, copy_back_buffers, head, tail) = self.create_aligned_buffer(
-            mem_alignment,
-            req_alignment,
-            pad_head_len,
-            pad_tail_len,
-            &mut bounce_buffers.buffers,
-            false,
-            true,
-        )?;
-
-        debug_assert!(head.is_none());
-        debug_assert!(tail.is_none());
-
-        bounce_buffers.copy_back_into = copy_back_buffers;
-        bounce_buffers.pad_head_len = pad_head_len;
-        bounce_buffers.pad_tail_len = *pad_tail_len;
-
-        Ok(aligned)
-    }
-
+#[cfg(feature = "vm-memory")]
+impl<'a> IoVectorMut<'a> {
     /// Converts a `VolatileSlice` array (from vm-memory) into an `IoVectorMut`.
     ///
     /// In addition to a the vector, return a guard that ensures that the memory in `slices` is
     /// indeed mapped while in use.  This guard must not be dropped while this vector is in use!
-    #[cfg(feature = "vm-memory")]
     pub fn from_volatile_slice<
         B: vm_memory::bitmap::BitmapSlice,
         I: IntoIterator<
@@ -1396,55 +1077,6 @@ impl<P, B: vm_memory::bitmap::Bitmap> Drop for VolatileSliceGuard<'_, P, B> {
                 // Every bitmap is a window into the full bitmap for its specific `VolatileSlice`,
                 // so marking the whole thing is dirty is correct.
                 bitmap.mark_dirty(0, len);
-            }
-        }
-    }
-}
-
-impl IoVectorBounceBuffers<'_> {
-    /// Check if empty.
-    pub fn is_empty(&self) -> bool {
-        self.buffers.is_empty() && self.copy_back_into.is_none()
-    }
-}
-
-impl Drop for IoVectorBounceBuffers<'_> {
-    /// If the data in the bounce buffers is to be copied back into the original guest buffers (for
-    /// read operations), do so when the bounce buffers are dropped.
-    fn drop(&mut self) {
-        if let Some(copy_back_into) = self.copy_back_into.take() {
-            let input_buffer_count = self.buffers.len();
-            let mut input_i = 0;
-            let mut input_offset = self.pad_head_len;
-
-            for mut target_buffer in copy_back_into {
-                let next_input_offset = input_offset + target_buffer.len();
-                let input_buffer = self.buffers[input_i].as_ref().into_slice();
-
-                trace!(
-                    "Bounce buffer: Copying back from {:#x}[{}..{}] into {:#x}",
-                    input_buffer.as_ptr() as usize,
-                    input_offset,
-                    next_input_offset,
-                    target_buffer.as_ptr() as usize,
-                );
-
-                target_buffer.copy_from_slice(&input_buffer[input_offset..next_input_offset]);
-                input_offset = next_input_offset;
-
-                debug_assert!(input_offset <= input_buffer.len());
-                if input_offset == input_buffer.len() {
-                    input_i += 1;
-                    input_offset = 0;
-                }
-            }
-
-            if input_i < input_buffer_count {
-                debug_assert_eq!(input_i, input_buffer_count - 1);
-                debug_assert_eq!(
-                    input_offset + self.pad_tail_len,
-                    self.buffers[input_i].len()
-                );
             }
         }
     }
