@@ -48,6 +48,7 @@ use crate::{Storage, StorageOpenOptions};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 
 /// Annotating wrapper around storage objects.
 ///
@@ -110,6 +111,14 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
 
     fn size(&self) -> io::Result<u64> {
         self.inner.size()
+    }
+
+    fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
+        self.inner.resolve_relative_path(relative)
+    }
+
+    fn get_filename(&self) -> Option<&Path> {
+        self.inner.get_filename()
     }
 
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
