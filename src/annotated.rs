@@ -44,7 +44,7 @@
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
-use crate::{Storage, StorageOpenOptions};
+use crate::{PreallocateMode, Storage, StorageOpenOptions};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
 use std::ops::{Deref, DerefMut};
@@ -156,6 +156,10 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         // Share storage helper from inner (to e.g. get same request serialization)
         self.inner.get_storage_helper()
+    }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.inner.resize(new_size, prealloc_mode).await
     }
 }
 
