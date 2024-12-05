@@ -106,7 +106,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::mem_align()`] and [`Self::req_align()`], and safeguards we want to implement for
     /// safe concurrent access may not be available.
     ///
-    /// Use [`StorageExt::readv()`] instead.
+    /// Use [`StorageExt::readv()`](crate::StorageExt::readv()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()>;
 
@@ -123,7 +123,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::mem_align()`] and [`Self::req_align()`], and safeguards we want to implement for
     /// safe concurrent access may not be available.
     ///
-    /// Use [`StorageExt::writev()`] instead.
+    /// Use [`StorageExt::writev()`](crate::StorageExt::writev()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()>;
 
@@ -137,7 +137,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::zero_align()`], and safeguards we want to implement for safe concurrent access may
     /// not be available.
     ///
-    /// Use [`StorageExt::write_zeroes()`] instead.
+    /// Use [`StorageExt::write_zeroes()`](crate::StorageExt::write_zeroes()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         ext::write_full_zeroes(self, offset, length).await
@@ -155,7 +155,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::discard_align()`], and safeguards we want to implement for safe concurrent access
     /// may not be available.
     ///
-    /// Use [`StorageExt::discard()`] instead.
+    /// Use [`StorageExt::discard()`](crate::StorageExt::discard()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_discard(&self, _offset: u64, _length: u64) -> io::Result<()> {
         Ok(())
@@ -189,7 +189,8 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn invalidate_cache(&self) -> io::Result<()>;
 
-    /// Return the storage helper object (used by the [`StorageExt`] implementation).
+    /// Return the storage helper object (used by the [`StorageExt`](crate::StorageExt)
+    /// implementation).
     fn get_storage_helper(&self) -> &CommonStorageHelper;
 
     /// Resize to the given size.
