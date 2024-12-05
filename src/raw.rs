@@ -6,7 +6,7 @@ use crate::format::builder::{FormatDriverBuilder, FormatDriverBuilderBase};
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::gate::ImplicitOpenGate;
 use crate::format::Format;
-use crate::{Storage, StorageOpenOptions};
+use crate::{Storage, StorageExt, StorageOpenOptions};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -134,6 +134,51 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         }
 
         Ok((&self.inner, offset, length))
+    }
+
+    async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        let zero_align = self.inner.zero_align();
+        assert!(zero_align.is_power_of_two());
+
+        let zero_align_mask = zero_align as u64 - 1;
+
+        let aligned_end = (offset + length) & !zero_align_mask;
+        let aligned_offset = (offset + zero_align_mask) & !zero_align_mask;
+        let aligned_length = aligned_end.saturating_sub(aligned_offset);
+        if aligned_length == 0 {
+            return Ok((aligned_offset, 0));
+        }
+
+        // FIXME: Introduce request flags, and request no fallback
+        self.inner
+            .write_zeroes(aligned_offset, aligned_length)
+            .await?;
+        Ok((aligned_offset, aligned_length))
+    }
+
+    async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.ensure_zero_mapping(offset, length).await
+    }
+
+    async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        let discard_align = self.inner.discard_align();
+        assert!(discard_align.is_power_of_two());
+
+        let discard_align_mask = discard_align as u64 - 1;
+
+        let aligned_end = (offset + length) & !discard_align_mask;
+        let aligned_offset = (offset + discard_align_mask) & !discard_align_mask;
+        let aligned_length = aligned_end.saturating_sub(aligned_offset);
+        if aligned_length == 0 {
+            return Ok((aligned_offset, 0));
+        }
+
+        self.inner.discard(aligned_offset, aligned_length).await?;
+        Ok((aligned_offset, aligned_length))
+    }
+
+    async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.discard_to_zero(offset, length).await
     }
 
     async fn flush(&self) -> io::Result<()> {

@@ -98,12 +98,67 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     ///
     /// If `overwrite` is true, the contents in the range are supposed to be overwritten and may be
     /// discarded.  Otherwise, they must be kept.
+    ///
+    /// Should not break existing data mappings, i.e. not discard or repurpose existing data
+    /// mappings.  Making them unused, but retaining them as allocated so they can safely be
+    /// written to (albeit with no effect) is OK; discarding them so that they may be reused for
+    /// other mappings is not.
     async fn ensure_data_mapping<'a>(
         &'a self,
         offset: u64,
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&'a Self::Storage, u64, u64)>;
+
+    /// Ensure that the given range is efficiently mapped as zeroes.
+    ///
+    /// Must not write any data.  Return the range (offset and length) that could actually be
+    /// zeroed, which must be a subset of the range given by `offset` and `length`.  The returned
+    /// offset must be as close to `offset` as possible, i.e. no zero mapping is possible between
+    /// `offset` and the returned offset (e.g. because of format-inherent granularity).
+    ///
+    /// The returned length may be zero in case zeroing would theoretically be possible, but not
+    /// for this range at this granularity.
+    ///
+    /// Should not break existing data mappings, i.e. not discard or repurpose existing data
+    /// mappings.  Making them unused, but retaining them as allocated so they can safely be
+    /// written to (albeit with no effect) is OK; discarding them so that they may be reused for
+    /// other mappings is not.
+    async fn ensure_zero_mapping(&self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Effectively the same as [`FormatDriverInstance::ensure_zero_mapping()`], but may break
+    /// existing data mappings thanks to the mutable `self` reference, which ensures that old data
+    /// mappings returned by [`FormatDriverInstance::get_mapping()`] cannot be held onto.
+    async fn discard_to_zero(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// Discard the given range.
+    ///
+    /// Effectively the same as [`FormatDriverInstance::discard_to_zero()`], but the discarded area
+    /// may read as any data.  Backing file data should not reappear, however.
+    async fn discard_to_any(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Deallocate the range such that in deallocated blocks, the backing image’s data (if one
+    /// exists) will show, i.e. [`FormatDriverInstance::get_mapping()`] should return an indirect
+    /// mapping.  When there is no backing image, those blocks should appear as zero.
+    ///
+    /// Return the range (offset and length) that could actually be discarded, which must be a
+    /// subset of `offset` and `length`, and the returned offset must be as close to `offset` as
+    /// possible (like for [`FormatDriverInstance::discard_to_backing()`].
+    ///
+    /// May break existing data mappings thanks to the mutable `self` reference.
+    async fn discard_to_backing(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
     /// Read data from a `Mapping::Special` area.
     async fn readv_special(&self, _bufv: IoVectorMut<'_>, _offset: u64) -> io::Result<()> {
