@@ -387,6 +387,20 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .then_some(())
             .ok_or_else(|| io::Error::other("Image is read-only"))
     }
+
+    /// Check whether `length + offset` is within the disk size.
+    fn check_disk_bounds<D: Display>(&self, length: u64, offset: u64, req: D) -> io::Result<()> {
+        let size = self.header.size();
+        let length_until_eof = size.saturating_sub(offset);
+        if length_until_eof >= length {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size}"),
+            ))
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -453,10 +467,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&'a S, u64, u64)> {
-        let length_until_eof = self.header.size().saturating_sub(offset);
-        if length_until_eof < length {
-            return Err(io::Error::other("Cannot allocate beyond the disk size"));
-        }
+        self.check_disk_bounds(offset, length, "allocate")?;
 
         if length == 0 {
             return Ok((self.storage(), 0, 0));
