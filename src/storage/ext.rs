@@ -334,3 +334,34 @@ fn is_aligned<V: IoVectorTrait>(bufv: &V, offset: u64, mem_align: usize, req_ali
         false
     }
 }
+
+/// Write zero data to the given area.
+///
+/// In contrast to `write_zeroes()` functions, this one will actually write zero data, fully
+/// allocated.
+pub(crate) async fn write_full_zeroes<S: StorageExt>(
+    storage: S,
+    mut offset: u64,
+    mut length: u64,
+) -> io::Result<()> {
+    let buflen = cmp::min(length, 1048576) as usize;
+    let mut buf = IoBuffer::new(buflen, storage.mem_align())?;
+    buf.as_mut().into_slice().fill(0);
+
+    let req_align = storage.req_align();
+    let req_align_mask = (req_align - 1) as u64;
+
+    while length > 0 {
+        let mut chunk_length = cmp::min(length, 1048576) as usize;
+        if offset & req_align_mask != 0 {
+            chunk_length = cmp::min(chunk_length, req_align - (offset & req_align_mask) as usize);
+        }
+        storage
+            .write(buf.as_ref_range(0..chunk_length), offset)
+            .await?;
+        offset += chunk_length as u64;
+        length -= chunk_length as u64;
+    }
+
+    Ok(())
+}
