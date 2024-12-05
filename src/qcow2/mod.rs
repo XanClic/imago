@@ -8,6 +8,7 @@ mod cow;
 mod io_func;
 mod mappings;
 mod metadata;
+mod preallocation;
 #[cfg(feature = "sync-wrappers")]
 mod sync_wrappers;
 mod types;
@@ -17,11 +18,11 @@ use crate::format::builder::FormatDriverBuilder;
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
-use crate::format::Format;
+use crate::format::{Format, PreallocateMode};
 use crate::io_buffers::IoVectorMut;
 use crate::misc_helpers::ResultErrorContext;
 use crate::raw::Raw;
-use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
+use crate::{storage, FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
 pub use builder::Qcow2OpenBuilder;
@@ -603,6 +604,76 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         .await?;
 
         Ok(())
+    }
+
+    async fn resize_grow(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.need_writable()?;
+
+        let old_size = self.size();
+        let grown_length = new_size.saturating_sub(old_size);
+        if grown_length == 0 {
+            return Ok(()); // only grow, else do nothing
+        }
+
+        // Grow before preallocating (so we can preallocate)
+        self.header.set_size(new_size);
+
+        match prealloc_mode {
+            PreallocateMode::None => Ok(()),
+            PreallocateMode::Zero => self.preallocate_zero(old_size, grown_length).await,
+            PreallocateMode::FormatAllocate => {
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::Zero)
+                    .await
+            }
+            PreallocateMode::FullAllocate => {
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::Allocate)
+                    .await
+            }
+            PreallocateMode::WriteData => self.preallocate_write_data(old_size, grown_length).await,
+        }
+        .inspect_err(|_| {
+            // Better reset to old size then
+            self.header.set_size(old_size)
+        })?;
+
+        // Do this last because we may not be able to undo it
+        self.header
+            .write_size(self.metadata.as_ref())
+            .await
+            .inspect_err(|_| {
+                // Reset to old size
+                self.header.set_size(old_size)
+            })
+    }
+
+    async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
+        self.need_writable()?;
+
+        let old_size = self.size();
+        if new_size >= old_size {
+            return Ok(()); // only shrink, else do nothing
+        }
+
+        let mut offset = new_size;
+        while offset < old_size {
+            match self.discard_to_backing(offset, old_size - offset).await {
+                Ok((dofs, dlen)) => offset = dofs + dlen,
+                // Basically ignore errors, but stop trying to discard
+                Err(_) => break,
+            }
+        }
+
+        // Shrink after discarding (so we can discard)
+        self.header.set_size(new_size);
+
+        // Do this last because we may not be able to undo it
+        self.header
+            .write_size(self.metadata.as_ref())
+            .await
+            .inspect_err(|_| {
+                // Reset to old size
+                self.header.set_size(old_size);
+            })
     }
 }
 

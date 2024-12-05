@@ -3,6 +3,7 @@
 //! Provides access to different image formats via `FormatAccess` objects.
 
 use super::drivers::{self, FormatDriverInstance};
+use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::ext::write_full_zeroes;
 use crate::vector_select::FutureVector;
@@ -554,7 +555,6 @@ impl<S: Storage> FormatAccess<S> {
     ///
     /// Note that this will not drop the buffers, so they may still be used to serve later
     /// accesses.  Use [`FormatAccess::invalidate_cache()`] to drop all buffers.
-    #[allow(async_fn_in_trait)] // No need for Send
     pub async fn flush(&self) -> io::Result<()> {
         self.inner.flush().await
     }
@@ -563,7 +563,6 @@ impl<S: Storage> FormatAccess<S> {
     ///
     /// This does not necessarily include flushing internal buffers, i.e. `flush`.  When using
     /// `sync()`, consider whether you want to call `flush()` before it.
-    #[allow(async_fn_in_trait)] // No need for Send
     pub async fn sync(&self) -> io::Result<()> {
         self.inner.sync().await
     }
@@ -576,9 +575,63 @@ impl<S: Storage> FormatAccess<S> {
     /// # Safety
     /// Not flushing internal buffers may cause image corruption.  You must ensure the on-disk
     /// state is consistent.
-    #[allow(async_fn_in_trait)] // No need for Send
     pub async unsafe fn invalidate_cache(&self) -> io::Result<()> {
         self.inner.invalidate_cache().await
+    }
+
+    /// Resize to the given size.
+    ///
+    /// Set the disk size to `new_size`.  If `new_size` is smaller than the current size, ignore
+    /// both preallocation modes and discard the data after `new_size`.
+    ///
+    /// If `new_size` is larger than the current size, `prealloc_mode` determines whether and how
+    /// the new range should be allocated; depending on the image format, is possible some
+    /// preallocation modes are not supported, in which case an [`std::io::ErrorKind::Unsupported`]
+    /// is returned.
+    ///
+    /// This may break existing data mappings, so needs a mutable reference to `self`, which
+    /// ensures that existing data references (which have the lifetime of an immutable `self`
+    /// reference) cannot be kept.
+    ///
+    /// See also [`FormatAccess::resize_grow()`] and [`FormatAccess::resize_shrink()`], whose more
+    /// specialized interface may be useful when you know whether you want to grow or shrink the
+    /// image.
+    pub async fn resize(
+        &mut self,
+        new_size: u64,
+        prealloc_mode: PreallocateMode,
+    ) -> io::Result<()> {
+        match new_size.cmp(&self.size()) {
+            std::cmp::Ordering::Less => self.resize_shrink(new_size).await,
+            std::cmp::Ordering::Equal => Ok(()),
+            std::cmp::Ordering::Greater => self.resize_grow(new_size, prealloc_mode).await,
+        }
+    }
+
+    /// Resize to the given size, which must be greater than the current size.
+    ///
+    /// Set the disk size to `new_size`, preallocating the new space according to `prealloc_mode`.
+    /// Depending on the image format, it is possible some preallocation modes are not supported,
+    /// in which case an [`std::io::ErrorKind::Unsupported`] is returned.
+    ///
+    /// If the current size is already `new_size` or greater, do nothing.
+    pub async fn resize_grow(
+        &self,
+        new_size: u64,
+        prealloc_mode: PreallocateMode,
+    ) -> io::Result<()> {
+        self.inner.resize_grow(new_size, prealloc_mode).await
+    }
+
+    /// Truncate to the given size, which must be smaller than the current size.
+    ///
+    /// Set the disk size to `new_size`, discarding the data after `new_size`.
+    ///
+    /// May break existing data mappings thanks to the mutable `self` reference.
+    ///
+    /// If the current size is already `new_size` or smaller, do nothing.
+    pub async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
+        self.inner.resize_shrink(new_size).await
     }
 }
 

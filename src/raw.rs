@@ -5,12 +5,13 @@
 use crate::format::builder::{FormatDriverBuilder, FormatDriverBuilderBase};
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::gate::ImplicitOpenGate;
-use crate::format::Format;
-use crate::{Storage, StorageExt, StorageOpenOptions};
+use crate::format::{Format, PreallocateMode};
+use crate::{storage, Storage, StorageExt, StorageOpenOptions};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Wraps a storage object without any translation.
 #[derive(Debug)]
@@ -22,7 +23,7 @@ pub struct Raw<S: Storage> {
     writable: bool,
 
     /// Disk size, which is the file size when this object was created.
-    size: u64,
+    size: AtomicU64,
 }
 
 impl<S: Storage> Raw<S> {
@@ -42,7 +43,7 @@ impl<S: Storage> Raw<S> {
         Ok(Raw {
             inner,
             writable,
-            size,
+            size: size.into(),
         })
     }
 
@@ -60,7 +61,7 @@ impl<S: Storage> Raw<S> {
         Ok(Raw {
             inner,
             writable,
-            size,
+            size: size.into(),
         })
     }
 
@@ -89,7 +90,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
     }
 
     fn size(&self) -> u64 {
-        self.size
+        self.size.load(Ordering::Relaxed)
     }
 
     fn collect_storage_dependencies(&self) -> Vec<&S> {
@@ -105,7 +106,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         offset: u64,
         max_length: u64,
     ) -> io::Result<(Mapping<'a, S>, u64)> {
-        let remaining = match self.size.checked_sub(offset) {
+        let remaining = match self.size().checked_sub(offset) {
             None | Some(0) => return Ok((Mapping::Eof, 0)),
             Some(remaining) => remaining,
         };
@@ -126,7 +127,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         length: u64,
         _overwrite: bool,
     ) -> io::Result<(&'a S, u64, u64)> {
-        let Some(remaining) = self.size.checked_sub(offset) else {
+        let Some(remaining) = self.size().checked_sub(offset) else {
             return Err(io::Error::other("Cannot allocate past the end of file"));
         };
         if length > remaining {
@@ -194,6 +195,48 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         // No internal buffers to drop
         // Safe: Caller says we should do this
         unsafe { self.inner.invalidate_cache() }.await
+    }
+
+    async fn resize_grow(
+        &self,
+        new_size: u64,
+        format_prealloc_mode: PreallocateMode,
+    ) -> io::Result<()> {
+        if self
+            .size
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                (new_size > old).then_some(new_size)
+            })
+            .is_err()
+        {
+            return Ok(()); // only grow, else do nothing
+        }
+
+        let storage_prealloc_mode = match format_prealloc_mode {
+            PreallocateMode::None => storage::PreallocateMode::None,
+            PreallocateMode::Zero | PreallocateMode::FormatAllocate => {
+                storage::PreallocateMode::Zero
+            }
+            PreallocateMode::FullAllocate => storage::PreallocateMode::Allocate,
+            PreallocateMode::WriteData => storage::PreallocateMode::WriteData,
+        };
+        self.inner.resize(new_size, storage_prealloc_mode).await
+    }
+
+    async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
+        if self
+            .size
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                (new_size < old).then_some(new_size)
+            })
+            .is_err()
+        {
+            return Ok(()); // only shrink, else do nothing
+        }
+
+        self.inner
+            .resize(new_size, storage::PreallocateMode::None)
+            .await
     }
 }
 

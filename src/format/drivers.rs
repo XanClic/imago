@@ -3,7 +3,7 @@
 //! Provides the internal interface for image format drivers to provide their services, on which
 //! the publically visible interface [`FormatAccess`] is built.
 
-use super::Format;
+use super::{Format, PreallocateMode};
 use crate::io_buffers::IoVectorMut;
 use crate::{FormatAccess, Storage};
 use async_trait::async_trait;
@@ -186,6 +186,24 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
     /// Not flushing internal buffers may cause image corruption.  The caller must ensure the
     /// on-disk state is consistent.
     async unsafe fn invalidate_cache(&self) -> io::Result<()>;
+
+    /// Resize to the given size, which must be greater than the current size.
+    ///
+    /// Set the disk size to `new_size`, preallocating the new space according to `prealloc_mode`.
+    /// Depending on the image format, it is possible some preallocation modes are not supported,
+    /// in which case an [`std::io::ErrorKind::Unsupported`] is returned.
+    ///
+    /// If the current size is already `new_size` or greater, do nothing.
+    async fn resize_grow(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()>;
+
+    /// Truncate to the given size, which must be smaller than the current size.
+    ///
+    /// Set the disk size to `new_size`, discarding the data after `new_size`.
+    ///
+    /// May break existing data mappings thanks to the mutable `self` reference.
+    ///
+    /// If the current size is already `new_size` or smaller, do nothing.
+    async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()>;
 }
 
 /// Non-recursive mapping information.

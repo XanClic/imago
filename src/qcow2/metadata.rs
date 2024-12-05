@@ -58,7 +58,7 @@ struct V2Header {
     /// byte cluster size, it is unable to populate a virtual size larger than 128 GB (37 bits).
     /// Meanwhile, L1/L2 table layouts limit an image to no more than 64 PB (56 bits) of populated
     /// clusters, and an image may hit other limits first (such as a file system’s maximum size).
-    size: u64,
+    size: AtomicU64,
 
     /// Encryption method:
     ///
@@ -588,9 +588,9 @@ impl Header {
         check_field!(v2.backing_file_offset)?; // TODO: Should be mutable
         check_field!(v2.backing_file_size)?; // TODO: Should be mutable
         check_field!(v2.cluster_bits)?;
-        check_field!(v2.size)?; // TODO: Should be mutable
-                                // L1 position is mutable
-                                // Reftable position is mutable
+        // Size is mutable
+        // L1 position is mutable
+        // Reftable position is mutable
         check_field!(v2.crypt_method)?;
         check_field!(v2.nb_snapshots)?; // TODO: Should be mutable
         check_field!(v2.snapshots_offset)?; // TODO: Should be mutable
@@ -614,6 +614,11 @@ impl Header {
             .ok_or_else(|| io::Error::other("Header extensions modified"))?;
 
         check_field!(external_data_file)?;
+
+        self.v2.size.store(
+            new_header.v2.size.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
 
         self.v2.l1_table_offset.store(
             new_header.v2.l1_table_offset.load(Ordering::Relaxed),
@@ -640,7 +645,7 @@ impl Header {
 
     /// Guest disk size.
     pub fn size(&self) -> u64 {
-        self.v2.size
+        self.v2.size.load(Ordering::Relaxed)
     }
 
     /// Require a minimum qcow2 version.
@@ -656,6 +661,11 @@ impl Header {
                 format!("qcow2 version {minimum} required, image has version {version}"),
             ))
         }
+    }
+
+    /// Set the guest disk size.
+    pub fn set_size(&self, new_size: u64) {
+        self.v2.size.store(new_size, Ordering::Relaxed)
     }
 
     /// log2 of the cluster size.
@@ -874,6 +884,12 @@ impl Header {
     /// Write the L1 table pointer (offset and size) to disk.
     pub async fn write_l1_table_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
         // TODO: Just write the L1 table offset and size
+        self.write_v2_header(image).await
+    }
+
+    /// Write the guest disk size to disk.
+    pub async fn write_size<S: Storage>(&self, image: &S) -> io::Result<()> {
+        // TODO: Just write the size
         self.write_v2_header(image).await
     }
 }

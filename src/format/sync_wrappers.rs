@@ -1,6 +1,7 @@
 //! Synchronous wrapper around [`FormatAccess`].
 
 use super::drivers::FormatDriverInstance;
+use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::{FormatAccess, Mapping, Storage};
 use std::io;
@@ -144,6 +145,12 @@ impl<S: Storage> SyncFormatAccess<S> {
     /// May use efficient zeroing for a subset of the given range, if supported by the format.
     /// Will not discard anything, which keeps existing data mappings usable, albeit writing to
     /// mappings that are now zeroed may have no effect.
+    ///
+    /// Check if [`SyncFormatAccess::discard_to_zero()`] better suits your needs: It may work
+    /// better on a wider range of formats (`write_zeroes()` requires support for preallocated zero
+    /// clusters, which qcow2 does have, but other formats may not), and can actually free up
+    /// space.  However, because it can break existing data mappings, it requires a mutable `self`
+    /// reference.
     pub fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         self.runtime
             .block_on(self.inner.write_zeroes(offset, length))
@@ -151,7 +158,7 @@ impl<S: Storage> SyncFormatAccess<S> {
 
     /// Discard the given range, ensure it is read back as zeroes.
     ///
-    /// Effectively the same as [`FormatAccess::write_zeroes()`], but discard as much of the
+    /// Effectively the same as [`SyncFormatAccess::write_zeroes()`], but discard as much of the
     /// existing allocation as possible.  This breaks existing data mappings, so needs a mutable
     /// reference to `self`, which ensures that existing data references (which have the lifetime
     /// of an immutable `self` reference) cannot be kept.
@@ -167,7 +174,7 @@ impl<S: Storage> SyncFormatAccess<S> {
     ///
     /// Discard as much of the given range as possible, and keep the rest as-is.  Does not
     /// guarantee any specific data on read-back, in contrast to
-    /// [`FormatAccess::discard_to_zero()`].
+    /// [`SyncFormatAccess::discard_to_zero()`].
     ///
     /// Discarding being unsupported by this format is still returned as an error
     /// ([`std::io::ErrorKind::Unsupported`])
@@ -216,6 +223,47 @@ impl<S: Storage> SyncFormatAccess<S> {
     /// state is consistent.
     pub unsafe fn invalidate_cache(&self) -> io::Result<()> {
         self.runtime.block_on(self.inner.invalidate_cache())
+    }
+
+    /// Resize to the given size.
+    ///
+    /// Set the disk size to `new_size`.  If `new_size` is smaller than the current size, ignore
+    /// both preallocation modes and discard the data after `new_size`.
+    ///
+    /// If `new_size` is larger than the current size, `prealloc_mode` determines whether and how
+    /// the new range should be allocated; depending on the image format, is possible some
+    /// preallocation modes are not supported, in which case an [`std::io::ErrorKind::Unsupported`]
+    /// is returned.
+    ///
+    /// This may break existing data mappings, so needs a mutable reference to `self`, which
+    /// ensures that existing data references (which have the lifetime of an immutable `self`
+    /// reference) cannot be kept.
+    ///
+    /// See also [`SyncFormatAccess::resize_grow()`] and [`SyncFormatAccess::resize_shrink()`],
+    /// whose more specialized interface may be useful when you know whether you want to grow or
+    /// shrink the image.
+    pub fn resize(&mut self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.resize(new_size, prealloc_mode))
+    }
+
+    /// Resize to the given size, which must be greater than the current size.
+    ///
+    /// Set the disk size to `new_size`, preallocating the new space according to `prealloc_mode`.
+    /// Depending on the image format, it is possible some preallocation modes are not supported,
+    /// in which case an [`std::io::ErrorKind::Unsupported`] is returned.
+    pub fn resize_grow(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.resize_grow(new_size, prealloc_mode))
+    }
+
+    /// Truncate to the given size, which must be smaller than the current size.
+    ///
+    /// Set the disk size to `new_size`, discarding the data after `new_size`.
+    ///
+    /// May break existing data mappings thanks to the mutable `self` reference.
+    pub fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
+        self.runtime.block_on(self.inner.resize_shrink(new_size))
     }
 }
 
