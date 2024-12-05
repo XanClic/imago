@@ -15,12 +15,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         &self,
         buf: &mut [u8],
         compressed_offset: HostOffset,
-        compressed_length: usize,
+        compressed_length: u64,
     ) -> io::Result<()> {
         debug_assert!(buf.len() == self.header.cluster_size());
 
         let storage = self.storage();
 
+        // Must fit (really shouldn’t be compressed if this exceeds the cluster size anyway)
+        let compressed_length = compressed_length.try_into().map_err(io::Error::other)?;
         let mut compressed_buf = IoBuffer::new(compressed_length, storage.mem_align())?;
         storage
             .read(&mut compressed_buf, compressed_offset.0)
