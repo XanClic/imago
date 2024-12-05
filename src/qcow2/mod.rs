@@ -8,6 +8,7 @@ mod cow;
 mod io_func;
 mod mappings;
 mod metadata;
+mod preallocation;
 #[cfg(feature = "sync-wrappers")]
 mod sync_wrappers;
 mod types;
@@ -17,15 +18,16 @@ use crate::format::builder::FormatDriverBuilder;
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
-use crate::format::Format;
+use crate::format::{Format, PreallocateMode};
 use crate::io_buffers::IoVectorMut;
 use crate::misc_helpers::ResultErrorContext;
 use crate::raw::Raw;
-use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
+use crate::{storage, FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
 pub use builder::Qcow2OpenBuilder;
 use cache::L2CacheBackend;
+use mappings::FixedMapping;
 use metadata::*;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
@@ -387,6 +389,20 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .then_some(())
             .ok_or_else(|| io::Error::other("Image is read-only"))
     }
+
+    /// Check whether `length + offset` is within the disk size.
+    fn check_disk_bounds<D: Display>(&self, length: u64, offset: u64, req: D) -> io::Result<()> {
+        let size = self.header.size();
+        let length_until_eof = size.saturating_sub(offset);
+        if length_until_eof >= length {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size}"),
+            ))
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -453,10 +469,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&'a S, u64, u64)> {
-        let length_until_eof = self.header.size().saturating_sub(offset);
-        if length_until_eof < length {
-            return Err(io::Error::other("Cannot allocate beyond the disk size"));
-        }
+        self.check_disk_bounds(offset, length, "allocate")?;
 
         if length == 0 {
             return Ok((self.storage(), 0, 0));
@@ -465,6 +478,54 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.need_writable()?;
         let offset = GuestOffset(offset);
         self.do_ensure_data_mapping(offset, length, overwrite).await
+    }
+
+    async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "write")?;
+
+        let (first_cluster, count) = self
+            .ensure_fixed_mapping(
+                GuestOffset(offset),
+                length,
+                FixedMapping::ZeroRetainAllocation,
+            )
+            .await?;
+
+        let cb = self.header.cluster_bits();
+        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+    }
+
+    async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "discard")?;
+
+        // Safe to discard: We have a mutable `self` reference
+        // Note this will return an `Unsupported` error for v2 images.  That’s OK, safely
+        // discarding on them is a hairy affair, and they are really outdated by now.
+        let (first_cluster, count) = self
+            .ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
+            .await?;
+
+        let cb = self.header.cluster_bits();
+        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+    }
+
+    async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.discard_to_zero(offset, length).await
+    }
+
+    async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "discard")?;
+
+        // Safe to discard: We have a mutable `self` reference
+        let (first_cluster, count) = self
+            .ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::FullDiscard)
+            .await?;
+
+        let cb = self.header.cluster_bits();
+        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
@@ -543,6 +604,76 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         .await?;
 
         Ok(())
+    }
+
+    async fn resize_grow(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.need_writable()?;
+
+        let old_size = self.size();
+        let grown_length = new_size.saturating_sub(old_size);
+        if grown_length == 0 {
+            return Ok(()); // only grow, else do nothing
+        }
+
+        // Grow before preallocating (so we can preallocate)
+        self.header.set_size(new_size);
+
+        match prealloc_mode {
+            PreallocateMode::None => Ok(()),
+            PreallocateMode::Zero => self.preallocate_zero(old_size, grown_length).await,
+            PreallocateMode::FormatAllocate => {
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::Zero)
+                    .await
+            }
+            PreallocateMode::FullAllocate => {
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::Allocate)
+                    .await
+            }
+            PreallocateMode::WriteData => self.preallocate_write_data(old_size, grown_length).await,
+        }
+        .inspect_err(|_| {
+            // Better reset to old size then
+            self.header.set_size(old_size)
+        })?;
+
+        // Do this last because we may not be able to undo it
+        self.header
+            .write_size(self.metadata.as_ref())
+            .await
+            .inspect_err(|_| {
+                // Reset to old size
+                self.header.set_size(old_size)
+            })
+    }
+
+    async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
+        self.need_writable()?;
+
+        let old_size = self.size();
+        if new_size >= old_size {
+            return Ok(()); // only shrink, else do nothing
+        }
+
+        let mut offset = new_size;
+        while offset < old_size {
+            match self.discard_to_backing(offset, old_size - offset).await {
+                Ok((dofs, dlen)) => offset = dofs + dlen,
+                // Basically ignore errors, but stop trying to discard
+                Err(_) => break,
+            }
+        }
+
+        // Shrink after discarding (so we can discard)
+        self.header.set_size(new_size);
+
+        // Do this last because we may not be able to undo it
+        self.header
+            .write_size(self.metadata.as_ref())
+            .await
+            .inspect_err(|_| {
+                // Reset to old size
+                self.header.set_size(old_size);
+            })
     }
 }
 

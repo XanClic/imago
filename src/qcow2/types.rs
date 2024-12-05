@@ -48,6 +48,15 @@ impl GuestOffset {
         GuestCluster(self.0 >> cluster_bits)
     }
 
+    /// If this offset points to the start of a cluster, get its index.
+    ///
+    /// If this offset points inside of a cluster, return `None`.  As oposed to just `cluster()`,
+    /// this will not discard information: `self.checked_cluster(cb).unwrap().offset() == self`,
+    /// because there is no in-cluster offset that could be lost.
+    pub fn checked_cluster(self, cluster_bits: u32) -> Option<GuestCluster> {
+        (self.in_cluster_offset(cluster_bits) == 0).then_some(self.cluster(cluster_bits))
+    }
+
     /// How many bytes remain in this cluster after this offset.
     pub fn remaining_in_cluster(self, cluster_bits: u32) -> u64 {
         ((1 << cluster_bits) - self.in_cluster_offset(cluster_bits)) as u64
@@ -181,9 +190,53 @@ impl ClusterCount {
         ClusterCount(byte_size.div_ceil(1 << cluster_bits))
     }
 
+    /// Get how many clusters are in `byte_size`.
+    ///
+    /// Checks that `byte_size` is a multiple of the cluster size, or will return `None`.
+    pub fn checked_from_byte_size(byte_size: u64, cluster_bits: u32) -> Option<Self> {
+        (byte_size & ((1 << cluster_bits) - 1) == 0)
+            .then_some(ClusterCount(byte_size >> cluster_bits))
+    }
+
     /// Return the full byte size of this many clusters.
     pub fn byte_size(self, cluster_bits: u32) -> u64 {
         self.0 << cluster_bits
+    }
+}
+
+impl Add<ClusterCount> for GuestCluster {
+    type Output = Self;
+
+    fn add(self, rhs: ClusterCount) -> Self {
+        GuestCluster(self.0 + rhs.0)
+    }
+}
+
+impl AddAssign<ClusterCount> for GuestCluster {
+    fn add_assign(&mut self, rhs: ClusterCount) {
+        self.0 += rhs.0;
+    }
+}
+
+impl Sub<ClusterCount> for GuestCluster {
+    type Output = Self;
+
+    fn sub(self, rhs: ClusterCount) -> Self {
+        GuestCluster(self.0 - rhs.0)
+    }
+}
+
+impl SubAssign<ClusterCount> for GuestCluster {
+    fn sub_assign(&mut self, rhs: ClusterCount) {
+        self.0 -= rhs.0;
+    }
+}
+
+impl Sub<GuestCluster> for GuestCluster {
+    type Output = ClusterCount;
+
+    fn sub(self, rhs: Self) -> ClusterCount {
+        ClusterCount(self.0 - rhs.0)
     }
 }
 
@@ -248,6 +301,30 @@ impl Sub<ClusterCount> for ClusterCount {
 impl SubAssign<ClusterCount> for ClusterCount {
     fn sub_assign(&mut self, rhs: ClusterCount) {
         self.0 -= rhs.0;
+    }
+}
+
+impl Add<u64> for GuestOffset {
+    type Output = Self;
+
+    fn add(self, rhs: u64) -> Self {
+        GuestOffset(self.0 + rhs)
+    }
+}
+
+impl Sub<u64> for GuestOffset {
+    type Output = Self;
+
+    fn sub(self, rhs: u64) -> Self {
+        GuestOffset(self.0 - rhs)
+    }
+}
+
+impl Sub<GuestOffset> for GuestOffset {
+    type Output = u64;
+
+    fn sub(self, rhs: Self) -> u64 {
+        self.0 - rhs.0
     }
 }
 

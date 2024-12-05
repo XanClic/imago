@@ -4,7 +4,7 @@
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
-use crate::Storage;
+use crate::{PreallocateMode, Storage};
 use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,6 +77,11 @@ impl Storage for Null {
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         &self.common_storage_helper
+    }
+
+    async fn resize(&self, new_size: u64, _prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.size.store(new_size, Ordering::Relaxed);
+        Ok(())
     }
 }
 

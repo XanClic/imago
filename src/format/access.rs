@@ -3,7 +3,9 @@
 //! Provides access to different image formats via `FormatAccess` objects.
 
 use super::drivers::{self, FormatDriverInstance};
+use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
+use crate::storage::ext::write_full_zeroes;
 use crate::vector_select::FutureVector;
 use crate::{Storage, StorageExt};
 use std::fmt::{self, Display, Formatter};
@@ -361,6 +363,188 @@ impl<S: Storage> FormatAccess<S> {
         self.writev(buf.into(), offset).await
     }
 
+    /// Ensure the given range reads as zeroes, without write-zeroes support.
+    ///
+    /// Does not require support for efficient zeroing, instead writing zeroes when the range is
+    /// not zero yet.  If `allocate` is true, areas that are not currently allocated will be
+    /// allocated to write zeroes there; if it is false, unallocated areas that currently read as
+    /// zero are left alone.
+    async fn soft_ensure_zero(
+        &self,
+        mut offset: u64,
+        mut length: u64,
+        allocate: bool,
+    ) -> io::Result<()> {
+        while length > 0 {
+            let (mapping, mlen) = self.inner.get_mapping(offset, length).await?;
+            let mlen = cmp::min(mlen, length);
+
+            let mapping = match mapping {
+                drivers::Mapping::Raw {
+                    storage,
+                    offset,
+                    writable,
+                } => writable.then_some((storage, offset)),
+                drivers::Mapping::Indirect {
+                    layer: _,
+                    offset: _,
+                    writable: _,
+                } => None,
+                drivers::Mapping::Zero => {
+                    if allocate {
+                        None
+                    } else {
+                        offset += mlen;
+                        length -= mlen;
+                        continue;
+                    }
+                }
+                drivers::Mapping::Eof => {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                drivers::Mapping::Special { offset: _ } => None,
+            };
+
+            let (file, mofs, mlen) = if let Some((file, mofs)) = mapping {
+                (file, mofs, mlen)
+            } else {
+                self.ensure_data_mapping(offset, length, true).await?
+            };
+
+            write_full_zeroes(file, mofs, mlen).await?;
+            offset += mlen;
+            length -= mlen;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure the given range reads as zeroes.
+    ///
+    /// May use efficient zeroing for a subset of the given range, if supported by the format.
+    /// Will not discard anything, which keeps existing data mappings usable, albeit writing to
+    /// mappings that are now zeroed may have no effect.
+    ///
+    /// Check if [`FormatAccess::discard_to_zero()`] better suits your needs: It may work better on
+    /// a wider range of formats (`write_zeroes()` requires support for preallocated zero clusters,
+    /// which qcow2 does have, but other formats may not), and can actually free up space.
+    /// However, because it can break existing data mappings, it requires a mutable `self`
+    /// reference.
+    pub async fn write_zeroes(&self, mut offset: u64, length: u64) -> io::Result<()> {
+        let max_offset = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Write-zeroes range overflow")
+        })?;
+
+        while offset < max_offset {
+            let (zofs, zlen) = self
+                .inner
+                .ensure_zero_mapping(offset, max_offset - offset)
+                .await?;
+            if zlen == 0 {
+                break;
+            }
+            // Fill up head, i.e. the range [offset, zofs)
+            self.soft_ensure_zero(offset, zofs - offset, true).await?;
+            offset = zofs + zlen;
+        }
+
+        // Fill up tail, i.e. the remaining range [offset, max_offset)
+        self.soft_ensure_zero(offset, max_offset - offset, true)
+            .await?;
+        Ok(())
+    }
+
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Effectively the same as [`FormatAccess::write_zeroes()`], but discard as much of the
+    /// existing allocation as possible.  This breaks existing data mappings, so needs a mutable
+    /// reference to `self`, which ensures that existing data references (which have the lifetime
+    /// of an immutable `self` reference) cannot be kept.
+    ///
+    /// Areas that cannot be discarded (because of format-inherent alignment restrictions) are
+    /// still overwritten with zeroes, unless discarding is not supported altogether.
+    pub async fn discard_to_zero(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+        let max_offset = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Discard-to-zero range overflow",
+            )
+        })?;
+
+        while offset < max_offset {
+            let (zofs, zlen) = self
+                .inner
+                .discard_to_zero(offset, max_offset - offset)
+                .await?;
+            if zlen == 0 {
+                break;
+            }
+            // Fill up head, i.e. the range [offset, zofs)
+            self.soft_ensure_zero(offset, zofs - offset, false).await?;
+            offset = zofs + zlen;
+        }
+
+        // Fill up tail, i.e. the remaining range [offset, max_offset)
+        self.soft_ensure_zero(offset, max_offset - offset, false)
+            .await?;
+        Ok(())
+    }
+
+    /// Discard the given range, not guaranteeing specific data on read-back.
+    ///
+    /// Discard as much of the given range as possible, and keep the rest as-is.  Does not
+    /// guarantee any specific data on read-back, in contrast to
+    /// [`FormatAccess::discard_to_zero()`].
+    ///
+    /// Discarding being unsupported by this format is still returned as an error
+    /// ([`std::io::ErrorKind::Unsupported`])
+    pub async fn discard_to_any(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+        let max_offset = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Discard-to-any range overflow")
+        })?;
+
+        while offset < max_offset {
+            let (dofs, dlen) = self
+                .inner
+                .discard_to_any(offset, max_offset - offset)
+                .await?;
+            if dlen == 0 {
+                break;
+            }
+            offset = dofs + dlen;
+        }
+
+        Ok(())
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Discard as much of the given range as possible so that a backing image’s data becomes
+    /// visible, and keep the rest as-is.  This breaks existing data mappings, so needs a mutable
+    /// reference to `self`, which ensures that existing data references (which have the lifetime
+    /// of an immutable `self` reference) cannot be kept.
+    pub async fn discard_to_backing(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+        let max_offset = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Discard-to-backing range overflow",
+            )
+        })?;
+
+        while offset < max_offset {
+            let (dofs, dlen) = self
+                .inner
+                .discard_to_backing(offset, max_offset - offset)
+                .await?;
+            if dlen == 0 {
+                break;
+            }
+            offset = dofs + dlen;
+        }
+
+        Ok(())
+    }
+
     /// Flush internal buffers.  Always call this before drop!
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
@@ -371,7 +555,6 @@ impl<S: Storage> FormatAccess<S> {
     ///
     /// Note that this will not drop the buffers, so they may still be used to serve later
     /// accesses.  Use [`FormatAccess::invalidate_cache()`] to drop all buffers.
-    #[allow(async_fn_in_trait)] // No need for Send
     pub async fn flush(&self) -> io::Result<()> {
         self.inner.flush().await
     }
@@ -380,7 +563,6 @@ impl<S: Storage> FormatAccess<S> {
     ///
     /// This does not necessarily include flushing internal buffers, i.e. `flush`.  When using
     /// `sync()`, consider whether you want to call `flush()` before it.
-    #[allow(async_fn_in_trait)] // No need for Send
     pub async fn sync(&self) -> io::Result<()> {
         self.inner.sync().await
     }
@@ -393,9 +575,63 @@ impl<S: Storage> FormatAccess<S> {
     /// # Safety
     /// Not flushing internal buffers may cause image corruption.  You must ensure the on-disk
     /// state is consistent.
-    #[allow(async_fn_in_trait)] // No need for Send
     pub async unsafe fn invalidate_cache(&self) -> io::Result<()> {
         self.inner.invalidate_cache().await
+    }
+
+    /// Resize to the given size.
+    ///
+    /// Set the disk size to `new_size`.  If `new_size` is smaller than the current size, ignore
+    /// both preallocation modes and discard the data after `new_size`.
+    ///
+    /// If `new_size` is larger than the current size, `prealloc_mode` determines whether and how
+    /// the new range should be allocated; depending on the image format, is possible some
+    /// preallocation modes are not supported, in which case an [`std::io::ErrorKind::Unsupported`]
+    /// is returned.
+    ///
+    /// This may break existing data mappings, so needs a mutable reference to `self`, which
+    /// ensures that existing data references (which have the lifetime of an immutable `self`
+    /// reference) cannot be kept.
+    ///
+    /// See also [`FormatAccess::resize_grow()`] and [`FormatAccess::resize_shrink()`], whose more
+    /// specialized interface may be useful when you know whether you want to grow or shrink the
+    /// image.
+    pub async fn resize(
+        &mut self,
+        new_size: u64,
+        prealloc_mode: PreallocateMode,
+    ) -> io::Result<()> {
+        match new_size.cmp(&self.size()) {
+            std::cmp::Ordering::Less => self.resize_shrink(new_size).await,
+            std::cmp::Ordering::Equal => Ok(()),
+            std::cmp::Ordering::Greater => self.resize_grow(new_size, prealloc_mode).await,
+        }
+    }
+
+    /// Resize to the given size, which must be greater than the current size.
+    ///
+    /// Set the disk size to `new_size`, preallocating the new space according to `prealloc_mode`.
+    /// Depending on the image format, it is possible some preallocation modes are not supported,
+    /// in which case an [`std::io::ErrorKind::Unsupported`] is returned.
+    ///
+    /// If the current size is already `new_size` or greater, do nothing.
+    pub async fn resize_grow(
+        &self,
+        new_size: u64,
+        prealloc_mode: PreallocateMode,
+    ) -> io::Result<()> {
+        self.inner.resize_grow(new_size, prealloc_mode).await
+    }
+
+    /// Truncate to the given size, which must be smaller than the current size.
+    ///
+    /// Set the disk size to `new_size`, discarding the data after `new_size`.
+    ///
+    /// May break existing data mappings thanks to the mutable `self` reference.
+    ///
+    /// If the current size is already `new_size` or smaller, do nothing.
+    pub async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
+        self.inner.resize_shrink(new_size).await
     }
 }
 

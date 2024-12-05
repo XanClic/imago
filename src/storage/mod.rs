@@ -6,15 +6,14 @@
 pub mod drivers;
 pub mod ext;
 
-use crate::io_buffers::{IoBuffer, IoVector, IoVectorMut};
+use crate::io_buffers::{IoVector, IoVectorMut};
 use drivers::CommonStorageHelper;
-use ext::StorageExt;
 use std::fmt::{Debug, Display};
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{cmp, io};
 
 /// Parameters from which a storage object can be constructed.
 #[derive(Clone, Default)]
@@ -140,20 +139,8 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     ///
     /// Use [`StorageExt::write_zeroes()`] instead.
     #[allow(async_fn_in_trait)] // No need for Send
-    async unsafe fn pure_write_zeroes(&self, mut offset: u64, mut length: u64) -> io::Result<()> {
-        let buflen = cmp::min(length, 1048576) as usize;
-        let mut buf = IoBuffer::new(buflen, self.mem_align())?;
-        buf.as_mut().into_slice().fill(0);
-
-        while length > 0 {
-            let chunk_length = cmp::min(length, 1048576) as usize;
-            self.writev(buf.as_ref_range(0..chunk_length).into(), offset)
-                .await?;
-            offset += chunk_length as u64;
-            length -= chunk_length as u64;
-        }
-
-        Ok(())
+    async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        ext::write_full_zeroes(self, offset, length).await
     }
 
     /// Discard the given range, with undefined contents when read back.
@@ -204,6 +191,19 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
 
     /// Return the storage helper object (used by the [`StorageExt`] implementation).
     fn get_storage_helper(&self) -> &CommonStorageHelper;
+
+    /// Resize to the given size.
+    ///
+    /// Set the size of this storage object to `new_size`.  If `new_size` is smaller than the
+    /// current size, ignore `prealloc_mode` and discard the data after `new_size`.
+    ///
+    /// If `new_size` is larger than the current size, `prealloc_mode` determines whether and how
+    /// the new range should be allocated; it is possible some preallocation modes are not
+    /// supported, in which case an [`std::io::ErrorKind::Unsupported`] is returned.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn resize(&self, _new_size: u64, _prealloc_mode: PreallocateMode) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Allow dynamic use of storage objects (i.e. is object safe).
@@ -295,6 +295,42 @@ pub trait DynStorage: Debug + Display + Send + Sync {
 
     /// Wrapper around [`Storage::get_storage_helper()`].
     fn get_storage_helper(&self) -> &CommonStorageHelper;
+
+    /// Wrapper around [`Storage::resize()`].
+    fn resize(
+        &self,
+        new_size: u64,
+        prealloc_mode: PreallocateMode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+}
+
+/// Storage object preallocation modes.
+///
+/// When resizing or creating storage objects, this mode determines whether and how the new data
+/// range is to be preallocated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PreallocateMode {
+    /// No preallocation.
+    ///
+    /// Reading the new range may return random data.
+    None,
+
+    /// Ensure range reads as zeroes.
+    ///
+    /// Does not necessarily allocate data, but has to ensure the new range will read back as
+    /// zeroes.
+    Zero,
+
+    /// Extent preallocation.
+    ///
+    /// Do not write data, but ensure all new extents are allocated.
+    Allocate,
+
+    /// Full data preallocation.
+    ///
+    /// Write zeroes to the whole range.
+    WriteData,
 }
 
 impl<S: Storage> Storage for &S {
@@ -356,6 +392,10 @@ impl<S: Storage> Storage for &S {
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         (*self).get_storage_helper()
+    }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        (*self).resize(new_size, prealloc_mode).await
     }
 }
 
@@ -435,6 +475,14 @@ impl<S: Storage> DynStorage for S {
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         S::get_storage_helper(self)
     }
+
+    fn resize(
+        &self,
+        new_size: u64,
+        prealloc_mode: PreallocateMode,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(S::resize(self, new_size, prealloc_mode))
+    }
 }
 
 impl Storage for Box<dyn DynStorage> {
@@ -504,6 +552,10 @@ impl Storage for Box<dyn DynStorage> {
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         <Self as DynStorage>::get_storage_helper(self)
     }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        <Self as DynStorage>::resize(self, new_size, prealloc_mode).await
+    }
 }
 
 impl Storage for Arc<dyn DynStorage> {
@@ -572,6 +624,10 @@ impl Storage for Arc<dyn DynStorage> {
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {
         <Self as DynStorage>::get_storage_helper(self)
+    }
+
+    async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        <Self as DynStorage>::resize(self, new_size, prealloc_mode).await
     }
 }
 
