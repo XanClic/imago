@@ -328,7 +328,7 @@ impl<S: Storage> Allocator<S> {
         let rb_entries = 1 << rb_bits;
 
         let mut new_rt = self.reftable.clone_and_grow(&self.header, at_least_index);
-        let rt_clusters = ClusterCount::from_byte_size(new_rt.byte_size(), cb);
+        let rt_clusters = ClusterCount::from_byte_size(new_rt.byte_size() as u64, cb);
 
         // Find free range
         let (mut rt_index, mut rb_index) = self.first_free_cluster.rt_rb_indices(rb_bits);
@@ -347,7 +347,7 @@ impl<S: Storage> Allocator<S> {
             let Some(rb_offset) = rt_entry.refblock_offset() else {
                 let start_index = HostCluster::from_ref_indices(rt_index, 0, rb_bits);
                 free_cluster_index.get_or_insert(start_index);
-                free_cluster_count += ClusterCount(rb_entries);
+                free_cluster_count += ClusterCount(rb_entries as u64);
                 // Need to allocate this RB
                 required_clusters += ClusterCount(1);
                 continue;
@@ -465,7 +465,7 @@ impl<S: Storage> Allocator<S> {
         let (mut rt_index, mut rb_index) = start.rt_rb_indices(rb_bits);
 
         while count > ClusterCount(0) {
-            let in_rb_count = cmp::min(rb_entries - rb_index, count.0);
+            let in_rb_count = cmp::min((rb_entries - rb_index) as u64, count.0) as usize;
 
             match self.get_rb(rt_index).await {
                 Ok(Some(rb)) => {
@@ -486,7 +486,7 @@ impl<S: Storage> Allocator<S> {
                 Err(err) => event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}"),
             }
 
-            count -= ClusterCount(in_rb_count);
+            count -= ClusterCount(in_rb_count as u64);
             rb_index = 0;
             rt_index += 1;
         }

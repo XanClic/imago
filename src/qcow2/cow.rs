@@ -274,7 +274,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     async fn cow_compressed(
         &self,
         compressed_offset: HostOffset,
-        compressed_length: usize,
+        compressed_length: u64,
         to_cluster: HostCluster,
     ) -> io::Result<()> {
         let to = self.storage();

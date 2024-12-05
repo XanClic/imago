@@ -716,13 +716,13 @@ impl Header {
 
     /// Number of clusters occupied by the refcount table.
     pub fn reftable_clusters(&self) -> ClusterCount {
-        ClusterCount(self.v2.refcount_table_clusters.load(Ordering::Relaxed) as usize)
+        ClusterCount(self.v2.refcount_table_clusters.load(Ordering::Relaxed) as u64)
     }
 
     /// Number of entries in the refcount table.
     pub fn reftable_entries(&self) -> usize {
         // 3 == log2(size_of::<u64>())
-        self.reftable_clusters().byte_size(self.cluster_bits()) >> 3
+        (self.reftable_clusters().byte_size(self.cluster_bits()) >> 3) as usize
     }
 
     /// Enter a new refcount table in the image header.
@@ -1211,7 +1211,7 @@ pub(super) enum L2Mapping {
         host_offset: HostOffset,
 
         /// Upper limit on the number of bytes that comprise the compressed data.
-        length: usize,
+        length: u64,
     },
 }
 
@@ -1273,15 +1273,15 @@ impl L2Entry {
 
     /// If this entry is compressed, return the start host offset and upper limit on the compressed
     /// number of bytes.
-    pub fn compressed_range(&self, cluster_bits: u32) -> Option<(HostOffset, usize)> {
+    pub fn compressed_range(&self, cluster_bits: u32) -> Option<(HostOffset, u64)> {
         if self.is_compressed() {
             let desc = self.compressed_descriptor();
             let compressed_offset_bits = 62 - (cluster_bits - 8);
             let offset = desc & ((1 << compressed_offset_bits) - 1) & 0x00ff_ffff_ffff_ffffu64;
-            let sectors = (desc >> compressed_offset_bits) as usize;
+            let sectors = desc >> compressed_offset_bits;
             // The first sector is not considered in `sectors`, so we add it and subtract the
             // number of bytes there that do not belong to this compressed cluster
-            let length = (sectors + 1) * 512 - (offset & 511) as usize;
+            let length = (sectors + 1) * 512 - (offset & 511);
 
             Some((HostOffset(offset), length))
         } else {
@@ -1407,9 +1407,9 @@ impl L2Entry {
                 // that belong to this compressed cluster from `length`:
                 // ceil((length - (512 - (host_offset & 511))) / 512)
                 // = (length + 511 - 512 + (host_offset & 511)) / 512
-                let sectors = (length - 1 + (host_offset.0 & 511) as usize) / 512;
+                let sectors = (length - 1 + (host_offset.0 & 511)) / 512;
 
-                (1 << 62) | ((sectors as u64) << compressed_offset_bits) | host_offset.0
+                (1 << 62) | (sectors << compressed_offset_bits) | host_offset.0
             }
         };
 
@@ -2408,7 +2408,7 @@ pub trait Table: Sized {
 
     /// Number of clusters used by this table.
     fn cluster_count(&self, cluster_bits: u32) -> ClusterCount {
-        ClusterCount::from_byte_size(self.byte_size(), cluster_bits)
+        ClusterCount::from_byte_size(self.byte_size() as u64, cluster_bits)
     }
 
     /// Load a table from the image file.
