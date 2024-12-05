@@ -21,6 +21,7 @@ use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
 use cache::L2CacheBackend;
+use mappings::FixedMapping;
 use metadata::*;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
@@ -386,6 +387,54 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.need_writable()?;
         let offset = GuestOffset(offset);
         self.do_ensure_data_mapping(offset, length, overwrite).await
+    }
+
+    async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "write")?;
+
+        let (first_cluster, count) = self
+            .ensure_fixed_mapping(
+                GuestOffset(offset),
+                length,
+                FixedMapping::ZeroRetainAllocation,
+            )
+            .await?;
+
+        let cb = self.header.cluster_bits();
+        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+    }
+
+    async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "discard")?;
+
+        // Safe to discard: We have a mutable `self` reference
+        // Note this will return an `Unsupported` error for v2 images.  That’s OK, safely
+        // discarding on them is a hairy affair, and they are really outdated by now.
+        let (first_cluster, count) = self
+            .ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
+            .await?;
+
+        let cb = self.header.cluster_bits();
+        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+    }
+
+    async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.discard_to_zero(offset, length).await
+    }
+
+    async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "discard")?;
+
+        // Safe to discard: We have a mutable `self` reference
+        let (first_cluster, count) = self
+            .ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::FullDiscard)
+            .await?;
+
+        let cb = self.header.cluster_bits();
+        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {

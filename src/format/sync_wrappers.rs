@@ -139,6 +139,54 @@ impl<S: Storage> SyncFormatAccess<S> {
         self.writev(buf.into(), offset)
     }
 
+    /// Ensure the given range reads as zeroes.
+    ///
+    /// May use efficient zeroing for a subset of the given range, if supported by the format.
+    /// Will not discard anything, which keeps existing data mappings usable, albeit writing to
+    /// mappings that are now zeroed may have no effect.
+    pub fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.write_zeroes(offset, length))
+    }
+
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Effectively the same as [`FormatAccess::write_zeroes()`], but discard as much of the
+    /// existing allocation as possible.  This breaks existing data mappings, so needs a mutable
+    /// reference to `self`, which ensures that existing data references (which have the lifetime
+    /// of an immutable `self` reference) cannot be kept.
+    ///
+    /// Areas that cannot be discarded (because of format-inherent alignment restrictions) are
+    /// still overwritten with zeroes, unless discarding is not supported altogether.
+    pub fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.discard_to_zero(offset, length))
+    }
+
+    /// Discard the given range, not guaranteeing specific data on read-back.
+    ///
+    /// Discard as much of the given range as possible, and keep the rest as-is.  Does not
+    /// guarantee any specific data on read-back, in contrast to
+    /// [`FormatAccess::discard_to_zero()`].
+    ///
+    /// Discarding being unsupported by this format is still returned as an error
+    /// ([`std::io::ErrorKind::Unsupported`])
+    pub fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.discard_to_any(offset, length))
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Discard as much of the given range as possible so that a backing image’s data becomes
+    /// visible, and keep the rest as-is.  This breaks existing data mappings, so needs a mutable
+    /// reference to `self`, which ensures that existing data references (which have the lifetime
+    /// of an immutable `self` reference) cannot be kept.
+    pub fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        self.runtime
+            .block_on(self.inner.discard_to_backing(offset, length))
+    }
+
     /// Flush internal buffers.
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether

@@ -580,6 +580,21 @@ impl Header {
         self.v2.size
     }
 
+    /// Require a minimum qcow2 version.
+    ///
+    /// Return an error if the version requirement is not met.
+    pub fn require_version(&self, minimum: u32) -> io::Result<()> {
+        let version = self.v2.version;
+        if version >= minimum {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("qcow2 version {minimum} required, image has version {version}"),
+            ))
+        }
+    }
+
     /// log2 of the cluster size.
     pub fn cluster_bits(&self) -> u32 {
         self.v2.cluster_bits
@@ -1539,7 +1554,7 @@ impl L2TableWriteGuard<'_> {
     ///
     /// If the allocation is reused, `None` is returned, so this function only returns `Some(_)` if
     /// some cluster is indeed leaked.
-    #[must_use]
+    #[must_use = "Leaked allocation must be freed"]
     pub fn map_cluster(
         &mut self,
         index: usize,
@@ -1567,6 +1582,93 @@ impl L2TableWriteGuard<'_> {
         } else {
             None
         }
+    }
+
+    /// Make the given index a zero mapping.
+    ///
+    /// If `keep_allocation` is true, keep the zero cluster pre-allocated if there is a
+    /// pre-existing single-cluster allocation (i.e. data cluster or pre-allocated zero cluster).
+    /// Otherwise, the existing mapping is discarded.
+    ///
+    /// If a previous mapping is discarded, return the old allocation so its refcount can be
+    /// decreased (offset of the first cluster and number of clusters -- compressed clusters can
+    /// span across host cluster boundaries).
+    #[must_use = "Leaked allocation must be freed"]
+    pub fn zero_cluster(
+        &mut self,
+        index: usize,
+        keep_allocation: bool,
+    ) -> io::Result<Option<(HostCluster, ClusterCount)>> {
+        let cluster_copied = if keep_allocation {
+            match self.table.data[index].get().into_mapping(
+                GuestCluster(0), // only used for backing, which we ignore
+                self.table.cluster_bits,
+                self.table.external_data_file,
+            )? {
+                L2Mapping::DataFile {
+                    host_cluster,
+                    copied,
+                } => Some((host_cluster, copied)),
+                L2Mapping::Backing { backing_offset: _ } => None,
+                L2Mapping::Zero {
+                    host_cluster: Some(host_cluster),
+                    copied,
+                } => Some((host_cluster, copied)),
+                L2Mapping::Zero {
+                    host_cluster: None,
+                    copied: _,
+                } => None,
+                L2Mapping::Compressed {
+                    host_offset: _,
+                    length: _,
+                } => None,
+            }
+        } else {
+            None
+        };
+
+        let retained = cluster_copied.is_some();
+        let new = if let Some((cluster, copied)) = cluster_copied {
+            L2Mapping::Zero {
+                host_cluster: Some(cluster),
+                copied,
+            }
+        } else {
+            L2Mapping::Zero {
+                host_cluster: None,
+                copied: false,
+            }
+        };
+        let new = L2Entry::from_mapping(new, self.table.cluster_bits);
+
+        // Safe: We set a full valid mapping, and there is only one writer (thanks to
+        // `L2TableWriteGuard`).
+        let old = unsafe { self.table.data[index].swap(new) };
+        self.table.modified.store(true, Ordering::Relaxed);
+
+        let leaked = if !retained {
+            old.allocation(self.table.cluster_bits, self.table.external_data_file)
+        } else {
+            None
+        };
+        Ok(leaked)
+    }
+
+    /// Remove the given mapping, leaving it empty.
+    ///
+    /// If a previous mapping is discarded, return the old allocation so its refcount can be
+    /// decreased (offset of the first cluster and number of clusters -- compressed clusters can
+    /// span across host cluster boundaries).
+    #[must_use = "Leaked allocation must be freed"]
+    pub fn discard_cluster(&mut self, index: usize) -> Option<(HostCluster, ClusterCount)> {
+        let new = L2Entry(0);
+
+        // Safe: We set a full valid mapping, and there is only one writer (thanks to
+        // `L2TableWriteGuard`).
+        let old = unsafe { self.table.data[index].swap(new) };
+        self.table.modified.store(true, Ordering::Relaxed);
+
+        old.allocation(self.table.cluster_bits, self.table.external_data_file)
     }
 }
 

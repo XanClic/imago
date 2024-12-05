@@ -4,6 +4,7 @@
 
 use super::drivers::{self, FormatDriverInstance};
 use crate::io_buffers::{IoVector, IoVectorMut};
+use crate::storage::ext::write_full_zeroes;
 use crate::vector_select::FutureVector;
 use crate::{Storage, StorageExt};
 use std::fmt::{self, Display, Formatter};
@@ -361,6 +362,188 @@ impl<S: Storage> FormatAccess<S> {
     /// the end of file before the end of the buffer results in an error.
     pub async fn write(&self, buf: impl Into<IoVector<'_>>, offset: u64) -> io::Result<()> {
         self.writev(buf.into(), offset).await
+    }
+
+    /// Ensure the given range reads as zeroes, without write-zeroes support.
+    ///
+    /// Does not require support for efficient zeroing, instead writing zeroes when the range is
+    /// not zero yet.  If `allocate` is true, areas that are not currently allocated will be
+    /// allocated to write zeroes there; if it is false, unallocated areas that currently read as
+    /// zero are left alone.
+    async fn soft_ensure_zero(
+        &self,
+        mut offset: u64,
+        mut length: u64,
+        allocate: bool,
+    ) -> io::Result<()> {
+        while length > 0 {
+            let (mapping, mlen) = self.inner.get_mapping(offset, length).await?;
+            let mlen = cmp::min(mlen, length);
+
+            let mapping = match mapping {
+                drivers::Mapping::Raw {
+                    storage,
+                    offset,
+                    writable,
+                } => writable.then_some((storage, offset)),
+                drivers::Mapping::Indirect {
+                    layer: _,
+                    offset: _,
+                    writable: _,
+                } => None,
+                drivers::Mapping::Zero => {
+                    if allocate {
+                        None
+                    } else {
+                        offset += mlen;
+                        length -= mlen;
+                        continue;
+                    }
+                }
+                drivers::Mapping::Eof => {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                drivers::Mapping::Special { offset: _ } => None,
+            };
+
+            let (file, mofs, mlen) = if let Some((file, mofs)) = mapping {
+                (file, mofs, mlen)
+            } else {
+                self.ensure_data_mapping(offset, length, true).await?
+            };
+
+            write_full_zeroes(file, mofs, mlen).await?;
+            offset += mlen;
+            length -= mlen;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure the given range reads as zeroes.
+    ///
+    /// May use efficient zeroing for a subset of the given range, if supported by the format.
+    /// Will not discard anything, which keeps existing data mappings usable, albeit writing to
+    /// mappings that are now zeroed may have no effect.
+    ///
+    /// Check if [`FormatAccess::discard_to_zero()`] better suits your needs: It may work better on
+    /// a wider range of formats (`write_zeroes()` requires support for preallocated zero clusters,
+    /// which qcow2 does have, but other formats may not), and can actually free up space.
+    /// However, because it can break existing data mappings, it requires a mutable `self`
+    /// reference.
+    pub async fn write_zeroes(&self, mut offset: u64, length: u64) -> io::Result<()> {
+        let max_offset = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Write-zeroes range overflow")
+        })?;
+
+        while offset < max_offset {
+            let (zofs, zlen) = self
+                .inner
+                .ensure_zero_mapping(offset, max_offset - offset)
+                .await?;
+            if zlen == 0 {
+                break;
+            }
+            // Fill up head, i.e. the range [offset, zofs)
+            self.soft_ensure_zero(offset, zofs - offset, true).await?;
+            offset = zofs + zlen;
+        }
+
+        // Fill up tail, i.e. the remaining range [offset, max_offset)
+        self.soft_ensure_zero(offset, max_offset - offset, true)
+            .await?;
+        Ok(())
+    }
+
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Effectively the same as [`FormatAccess::write_zeroes()`], but discard as much of the
+    /// existing allocation as possible.  This breaks existing data mappings, so needs a mutable
+    /// reference to `self`, which ensures that existing data references (which have the lifetime
+    /// of an immutable `self` reference) cannot be kept.
+    ///
+    /// Areas that cannot be discarded (because of format-inherent alignment restrictions) are
+    /// still overwritten with zeroes, unless discarding is not supported altogether.
+    pub async fn discard_to_zero(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+        let max_offset = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Discard-to-zero range overflow",
+            )
+        })?;
+
+        while offset < max_offset {
+            let (zofs, zlen) = self
+                .inner
+                .discard_to_zero(offset, max_offset - offset)
+                .await?;
+            if zlen == 0 {
+                break;
+            }
+            // Fill up head, i.e. the range [offset, zofs)
+            self.soft_ensure_zero(offset, zofs - offset, false).await?;
+            offset = zofs + zlen;
+        }
+
+        // Fill up tail, i.e. the remaining range [offset, max_offset)
+        self.soft_ensure_zero(offset, max_offset - offset, false)
+            .await?;
+        Ok(())
+    }
+
+    /// Discard the given range, not guaranteeing specific data on read-back.
+    ///
+    /// Discard as much of the given range as possible, and keep the rest as-is.  Does not
+    /// guarantee any specific data on read-back, in contrast to
+    /// [`FormatAccess::discard_to_zero()`].
+    ///
+    /// Discarding being unsupported by this format is still returned as an error
+    /// ([`std::io::ErrorKind::Unsupported`])
+    pub async fn discard_to_any(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+        let max_offset = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Discard-to-any range overflow")
+        })?;
+
+        while offset < max_offset {
+            let (dofs, dlen) = self
+                .inner
+                .discard_to_any(offset, max_offset - offset)
+                .await?;
+            if dlen == 0 {
+                break;
+            }
+            offset = dofs + dlen;
+        }
+
+        Ok(())
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Discard as much of the given range as possible so that a backing image’s data becomes
+    /// visible, and keep the rest as-is.  This breaks existing data mappings, so needs a mutable
+    /// reference to `self`, which ensures that existing data references (which have the lifetime
+    /// of an immutable `self` reference) cannot be kept.
+    pub async fn discard_to_backing(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+        let max_offset = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Discard-to-backing range overflow",
+            )
+        })?;
+
+        while offset < max_offset {
+            let (dofs, dlen) = self
+                .inner
+                .discard_to_backing(offset, max_offset - offset)
+                .await?;
+            if dlen == 0 {
+                break;
+            }
+            offset = dofs + dlen;
+        }
+
+        Ok(())
     }
 
     /// Flush internal buffers.  Always call this before drop!
