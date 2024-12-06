@@ -7,7 +7,7 @@ use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::vector_select::FutureVector;
 use crate::{Storage, StorageExt};
 use std::fmt::{self, Display, Formatter};
-use std::{cmp, io};
+use std::{cmp, io, ptr};
 
 /// Provides access to a disk image.
 #[derive(Debug)]
@@ -215,7 +215,14 @@ impl<S: Storage> FormatAccess<S> {
 
                 drivers::Mapping::Zero => return Ok((Mapping::Zero, length)),
 
-                drivers::Mapping::Eof => return Ok((Mapping::Eof, 0)),
+                drivers::Mapping::Eof => {
+                    // Return EOF only on top layer, zero otherwise
+                    return if ptr::eq(format_layer, self) {
+                        Ok((Mapping::Eof, 0))
+                    } else {
+                        Ok((Mapping::Zero, max_length))
+                    };
+                }
 
                 drivers::Mapping::Special { offset } => {
                     return Ok((
@@ -400,7 +407,7 @@ impl<S: Storage> Display for Mapping<'_, S> {
                 writable,
             } => {
                 let writable = if *writable { "rw" } else { "ro" };
-                write!(f, "{}:0x{:x}/{}", storage, offset, writable)
+                write!(f, "{storage}:0x{offset:x}/{writable}")
             }
 
             Mapping::Zero => write!(f, "<zero>"),
@@ -408,7 +415,7 @@ impl<S: Storage> Display for Mapping<'_, S> {
             Mapping::Eof => write!(f, "<eof>"),
 
             Mapping::Special { layer, offset } => {
-                write!(f, "<special:{}:0x{:x}>", layer, offset)
+                write!(f, "<special:{layer}:0x{offset:x}>")
             }
         }
     }

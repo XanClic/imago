@@ -87,6 +87,7 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
 ///
 /// Mapping information as returned by `FormatDriverInstance::get_mapping()`, only looking at that
 /// format layer’s information.
+#[derive(Debug)]
 pub enum Mapping<'a, S: Storage> {
     /// Raw data.
     Raw {
