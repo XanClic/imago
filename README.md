@@ -6,12 +6,12 @@ Simple example (requires the `sync-wrappers` feature):
 ```rust
 use imago::file::File;
 use imago::qcow2::Qcow2;
-use imago::SyncFormatAccess;
+use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate, SyncFormatAccess};
 use std::fs::OpenOptions;
 
 // Produce read-only qcow2 instance using purely `File` for storage
-let mut qcow2 = Qcow2::<File>::open_path_sync("image.qcow2", false)?;
-qcow2.open_implicit_dependencies_sync()?;
+let mut qcow2 = Qcow2::<File>::builder_path("image.qcow2")
+    .open_sync(PermissiveImplicitOpenGate::default())?;
 
 let qcow2 = SyncFormatAccess::new(qcow2)?;
 
@@ -27,7 +27,10 @@ use imago::file::File;
 use imago::null::Null;
 use imago::qcow2::Qcow2;
 use imago::raw::Raw;
-use imago::{DynStorage, FormatAccess, Storage, StorageOpenOptions};
+use imago::{
+    DenyImplicitOpenGate, DynStorage, FormatAccess, FormatDriverBuilder, Storage,
+    StorageOpenOptions,
+};
 use std::sync::Arc;
 
 let qcow2_file_opts = StorageOpenOptions::new()
@@ -36,17 +39,18 @@ let qcow2_file_opts = StorageOpenOptions::new()
 let qcow2_file = File::open(qcow2_file_opts).await?;
 
 // Produce qcow2 instance with arbitrary (and potentially mixed) storage instances
-let mut qcow2 =
-    Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<_>>>::open_image(Box::new(qcow2_file), true)
-        .await?;
 
 let backing_storage: Box<dyn DynStorage> = Box::new(Null::new(0));
-let backing = Raw::open_image(backing_storage, false).await?;
+let backing = Raw::builder(backing_storage)
+    .open(DenyImplicitOpenGate::default())
+    .await?;
 let backing = Arc::new(FormatAccess::new(backing));
-qcow2.set_backing(Some(Arc::clone(&backing)));
 
-// Open potentially remaining dependencies (like an external data file)
-qcow2.open_implicit_dependencies().await?;
+let qcow2 = Qcow2::builder_path("image.qcow2")
+    .storage_open_options(StorageOpenOptions::new().direct(true))
+    .backing(Some(Arc::clone(&backing)))
+    .open(DenyImplicitOpenGate::default())
+    .await?;
 
 let qcow2 = FormatAccess::new(qcow2);
 
