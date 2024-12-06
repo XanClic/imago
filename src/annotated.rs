@@ -28,9 +28,7 @@
 //!
 //! let mapping = image.get_mapping(test_offset, 1).await?.0;
 //! let Mapping::Raw {
-//!     storage,
-//!     offset,
-//!     writable,
+//!     storage, offset, ..
 //! } = mapping
 //! else {
 //!     panic!("Raw mapping expected");

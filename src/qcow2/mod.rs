@@ -454,7 +454,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         max_length: u64,
     ) -> io::Result<(Mapping<'a, S>, u64)> {
         let length_until_eof = match self.header.size().checked_sub(offset) {
-            None | Some(0) => return Ok((Mapping::Eof, 0)),
+            None | Some(0) => return Ok((Mapping::Eof {}, 0)),
             Some(length) => length,
         };
 

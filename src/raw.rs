@@ -107,7 +107,7 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         max_length: u64,
     ) -> io::Result<(Mapping<'a, S>, u64)> {
         let remaining = match self.size().checked_sub(offset) {
-            None | Some(0) => return Ok((Mapping::Eof, 0)),
+            None | Some(0) => return Ok((Mapping::Eof {}, 0)),
             Some(remaining) => remaining,
         };
 

@@ -31,8 +31,10 @@ pub struct FormatAccess<S: Storage> {
 ///
 /// Mapping information that resolves down to the storage object layer (except for special data).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Mapping<'a, S: Storage> {
     /// Raw data.
+    #[non_exhaustive]
     Raw {
         /// Storage object where this data is stored.
         storage: &'a S,
@@ -51,16 +53,19 @@ pub enum Mapping<'a, S: Storage> {
     },
 
     /// Range is to be read as zeroes.
-    Zero,
+    #[non_exhaustive]
+    Zero {},
 
     /// End of file reached.
     ///
     /// The accompanying length is always 0.
-    Eof,
+    #[non_exhaustive]
+    Eof {},
 
     /// Data is encoded in some manner, e.g. compressed or encrypted.
     ///
     /// Such data cannot be accessed directly, but must be interpreted by the image format driver.
+    #[non_exhaustive]
     Special {
         /// Format layer where this special data was encountered.
         layer: &'a FormatAccess<S>,
@@ -161,7 +166,7 @@ impl<S: Storage> FormatAccess<S> {
                 writable: _,
             } => storage.readv(bufv, offset).await,
 
-            Mapping::Zero | Mapping::Eof => {
+            Mapping::Zero {} | Mapping::Eof {} => {
                 bufv.fill(0);
                 Ok(())
             }
@@ -220,14 +225,14 @@ impl<S: Storage> FormatAccess<S> {
                     max_length = length;
                 }
 
-                drivers::Mapping::Zero => return Ok((Mapping::Zero, length)),
+                drivers::Mapping::Zero {} => return Ok((Mapping::Zero {}, length)),
 
-                drivers::Mapping::Eof => {
+                drivers::Mapping::Eof {} => {
                     // Return EOF only on top layer, zero otherwise
                     return if ptr::eq(format_layer, self) {
-                        Ok((Mapping::Eof, 0))
+                        Ok((Mapping::Eof {}, 0))
                     } else {
-                        Ok((Mapping::Zero, max_length))
+                        Ok((Mapping::Zero {}, max_length))
                     };
                 }
 
@@ -397,7 +402,7 @@ impl<S: Storage> FormatAccess<S> {
                     offset: _,
                     writable: _,
                 } => None,
-                drivers::Mapping::Zero => {
+                drivers::Mapping::Zero {} => {
                     if allocate {
                         None
                     } else {
@@ -406,7 +411,7 @@ impl<S: Storage> FormatAccess<S> {
                         continue;
                     }
                 }
-                drivers::Mapping::Eof => {
+                drivers::Mapping::Eof {} => {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
                 drivers::Mapping::Special { offset: _ } => None,
@@ -645,7 +650,7 @@ impl<S: Storage> FormatAccess<S> {
 impl<S: Storage> Mapping<'_, S> {
     /// Return `true` if and only if this mapping signifies the end of file.
     pub fn is_eof(&self) -> bool {
-        matches!(self, Mapping::Eof)
+        matches!(self, Mapping::Eof {})
     }
 }
 
@@ -667,9 +672,9 @@ impl<S: Storage> Display for Mapping<'_, S> {
                 write!(f, "{}:0x{:x}/{}", storage, offset, writable)
             }
 
-            Mapping::Zero => write!(f, "<zero>"),
+            Mapping::Zero {} => write!(f, "<zero>"),
 
-            Mapping::Eof => write!(f, "<eof>"),
+            Mapping::Eof {} => write!(f, "<eof>"),
 
             Mapping::Special { layer, offset } => {
                 write!(f, "<special:{}:0x{:x}>", layer, offset)

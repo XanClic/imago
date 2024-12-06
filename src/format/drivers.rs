@@ -210,8 +210,10 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
 ///
 /// Mapping information as returned by `FormatDriverInstance::get_mapping()`, only looking at that
 /// format layer’s information.
+#[non_exhaustive]
 pub enum Mapping<'a, S: Storage> {
     /// Raw data.
+    #[non_exhaustive]
     Raw {
         /// Storage object where this data is stored.
         storage: &'a S,
@@ -230,6 +232,7 @@ pub enum Mapping<'a, S: Storage> {
     },
 
     /// Data lives in a different disk image (e.g. a backing file).
+    #[non_exhaustive]
     Indirect {
         /// Format instance where this data can be obtained.
         layer: &'a FormatAccess<S>,
@@ -248,14 +251,17 @@ pub enum Mapping<'a, S: Storage> {
     },
 
     /// Range is to be read as zeroes.
-    Zero,
+    #[non_exhaustive]
+    Zero {},
 
     /// End of file reached.
-    Eof,
+    #[non_exhaustive]
+    Eof {},
 
     /// Data is encoded in some manner, e.g. compressed or encrypted.
     ///
     /// Such data cannot be accessed directly, but must be interpreted by the image format driver.
+    #[non_exhaustive]
     Special {
         /// Original (“guest”) offset to pass to `FormatDriverInstance::readv_special()`.
         offset: u64,
