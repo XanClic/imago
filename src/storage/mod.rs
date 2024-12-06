@@ -488,11 +488,11 @@ impl<S: Storage + 'static> DynStorage for S {
 }
 
 impl Storage for Box<dyn DynStorage> {
-    async fn open(_opts: StorageOpenOptions) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Cannot open dynamic storage instances",
-        ))
+    async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
+        // TODO: When we have more drivers, choose different defaults depending on the options
+        // given.  Right now, only `File` really supports being opened through options, so it is an
+        // obvious choice.
+        Ok(Box::new(crate::file::File::open(opts).await?))
     }
 
     fn mem_align(&self) -> usize {
@@ -561,11 +561,8 @@ impl Storage for Box<dyn DynStorage> {
 }
 
 impl Storage for Arc<dyn DynStorage> {
-    async fn open(_opts: StorageOpenOptions) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Cannot open dynamic storage instances",
-        ))
+    async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
+        Box::<dyn DynStorage>::open(opts).await.map(Into::into)
     }
 
     fn mem_align(&self) -> usize {
