@@ -445,6 +445,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let cb = self.header.cluster_bits();
         let mut cluster = first_cluster;
         let end_cluster = first_cluster + count;
+        let mut done = ClusterCount(0);
 
         while cluster < end_cluster {
             let l2i = cluster.l2_index(cb);
@@ -457,13 +458,14 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 leaked_allocations.push(leaked);
             }
 
+            done += ClusterCount(1);
             let Some(next) = cluster.next_in_l2(cb) else {
                 break;
             };
             cluster = next;
         }
 
-        Ok(cluster - first_cluster)
+        Ok(done)
     }
 }
 
