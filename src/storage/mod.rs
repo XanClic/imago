@@ -223,31 +223,31 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
 /// slighly less efficient than async functions in `Storage`, hence the distinction.
 pub trait DynStorage: Any + Debug + Display + Send + Sync {
     /// Wrapper around [`Storage::mem_align()`].
-    fn mem_align(&self) -> usize;
+    fn dyn_mem_align(&self) -> usize;
 
     /// Wrapper around [`Storage::req_align()`].
-    fn req_align(&self) -> usize;
+    fn dyn_req_align(&self) -> usize;
 
     /// Wrapper around [`Storage::zero_align()`].
-    fn zero_align(&self) -> usize;
+    fn dyn_zero_align(&self) -> usize;
 
     /// Wrapper around [`Storage::discard_align()`].
-    fn discard_align(&self) -> usize;
+    fn dyn_discard_align(&self) -> usize;
 
     /// Wrapper around [`Storage::size()`].
-    fn size(&self) -> io::Result<u64>;
+    fn dyn_size(&self) -> io::Result<u64>;
 
     /// Wrapper around [`Storage::resolve_relative_path()`].
-    fn resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf>;
+    fn dyn_resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf>;
 
     /// Wrapper around [`Storage::get_filename()`]
-    fn get_filename(&self) -> Option<&Path>;
+    fn dyn_get_filename(&self) -> Option<&Path>;
 
     /// Object-safe wrapper around [`Storage::pure_readv()`].
     ///
     /// # Safety
     /// Same considerations are for [`Storage::pure_readv()`] apply.
-    unsafe fn pure_readv<'a>(
+    unsafe fn dyn_pure_readv<'a>(
         &'a self,
         bufv: IoVectorMut<'a>,
         offset: u64,
@@ -257,7 +257,7 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
     ///
     /// # Safety
     /// Same considerations are for [`Storage::pure_writev()`] apply.
-    unsafe fn pure_writev<'a>(
+    unsafe fn dyn_pure_writev<'a>(
         &'a self,
         bufv: IoVector<'a>,
         offset: u64,
@@ -267,7 +267,7 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
     ///
     /// # Safety
     /// Same considerations are for [`Storage::pure_write_zeroes()`] apply.
-    unsafe fn pure_write_zeroes(
+    unsafe fn dyn_pure_write_zeroes(
         &self,
         offset: u64,
         length: u64,
@@ -277,29 +277,29 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
     ///
     /// # Safety
     /// Same considerations are for [`Storage::pure_discard()`] apply.
-    unsafe fn pure_discard(
+    unsafe fn dyn_pure_discard(
         &self,
         offset: u64,
         length: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 
     /// Object-safe wrapper around [`Storage::flush()`].
-    fn flush(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+    fn dyn_flush(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 
     /// Object-safe wrapper around [`Storage::sync()`].
-    fn sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+    fn dyn_sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 
     /// Object-safe wrapper around [`Storage::invalidate_cache()`].
     ///
     /// # Safety
     /// Same considerations are for [`Storage::invalidate_cache()`] apply.
-    unsafe fn invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+    unsafe fn dyn_invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 
     /// Wrapper around [`Storage::get_storage_helper()`].
-    fn get_storage_helper(&self) -> &CommonStorageHelper;
+    fn dyn_get_storage_helper(&self) -> &CommonStorageHelper;
 
     /// Wrapper around [`Storage::resize()`].
-    fn resize(
+    fn dyn_resize(
         &self,
         new_size: u64,
         prealloc_mode: PreallocateMode,
@@ -402,88 +402,88 @@ impl<S: Storage> Storage for &S {
 }
 
 impl<S: Storage + 'static> DynStorage for S {
-    fn mem_align(&self) -> usize {
-        S::mem_align(self)
+    fn dyn_mem_align(&self) -> usize {
+        <S as Storage>::mem_align(self)
     }
 
-    fn req_align(&self) -> usize {
-        S::req_align(self)
+    fn dyn_req_align(&self) -> usize {
+        <S as Storage>::req_align(self)
     }
 
-    fn zero_align(&self) -> usize {
-        S::zero_align(self)
+    fn dyn_zero_align(&self) -> usize {
+        <S as Storage>::zero_align(self)
     }
 
-    fn discard_align(&self) -> usize {
-        S::discard_align(self)
+    fn dyn_discard_align(&self) -> usize {
+        <S as Storage>::discard_align(self)
     }
 
-    fn size(&self) -> io::Result<u64> {
-        S::size(self)
+    fn dyn_size(&self) -> io::Result<u64> {
+        <S as Storage>::size(self)
     }
 
-    fn resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf> {
-        S::resolve_relative_path(self, relative)
+    fn dyn_resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf> {
+        <S as Storage>::resolve_relative_path(self, relative)
     }
 
-    fn get_filename(&self) -> Option<&Path> {
-        S::get_filename(self)
+    fn dyn_get_filename(&self) -> Option<&Path> {
+        <S as Storage>::get_filename(self)
     }
 
-    unsafe fn pure_readv<'a>(
+    unsafe fn dyn_pure_readv<'a>(
         &'a self,
         bufv: IoVectorMut<'a>,
         offset: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>> {
-        Box::pin(unsafe { S::pure_readv(self, bufv, offset) })
+        Box::pin(unsafe { <S as Storage>::pure_readv(self, bufv, offset) })
     }
 
-    unsafe fn pure_writev<'a>(
+    unsafe fn dyn_pure_writev<'a>(
         &'a self,
         bufv: IoVector<'a>,
         offset: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>> {
-        Box::pin(unsafe { S::pure_writev(self, bufv, offset) })
+        Box::pin(unsafe { <S as Storage>::pure_writev(self, bufv, offset) })
     }
 
-    unsafe fn pure_write_zeroes(
+    unsafe fn dyn_pure_write_zeroes(
         &self,
         offset: u64,
         length: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
-        Box::pin(unsafe { S::pure_write_zeroes(self, offset, length) })
+        Box::pin(unsafe { <S as Storage>::pure_write_zeroes(self, offset, length) })
     }
 
-    unsafe fn pure_discard(
+    unsafe fn dyn_pure_discard(
         &self,
         offset: u64,
         length: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
-        Box::pin(unsafe { S::pure_discard(self, offset, length) })
+        Box::pin(unsafe { <S as Storage>::pure_discard(self, offset, length) })
     }
 
-    fn flush(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
-        Box::pin(S::flush(self))
+    fn dyn_flush(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(<S as Storage>::flush(self))
     }
 
-    fn sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
-        Box::pin(S::sync(self))
+    fn dyn_sync(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(<S as Storage>::sync(self))
     }
 
-    unsafe fn invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
-        Box::pin(unsafe { S::invalidate_cache(self) })
+    unsafe fn dyn_invalidate_cache(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(unsafe { <S as Storage>::invalidate_cache(self) })
     }
 
-    fn get_storage_helper(&self) -> &CommonStorageHelper {
-        S::get_storage_helper(self)
+    fn dyn_get_storage_helper(&self) -> &CommonStorageHelper {
+        <S as Storage>::get_storage_helper(self)
     }
 
-    fn resize(
+    fn dyn_resize(
         &self,
         new_size: u64,
         prealloc_mode: PreallocateMode,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
-        Box::pin(S::resize(self, new_size, prealloc_mode))
+        Box::pin(<S as Storage>::resize(self, new_size, prealloc_mode))
     }
 }
 
@@ -496,67 +496,67 @@ impl Storage for Box<dyn DynStorage> {
     }
 
     fn mem_align(&self) -> usize {
-        <Self as DynStorage>::mem_align(self)
+        self.as_ref().dyn_mem_align()
     }
 
     fn req_align(&self) -> usize {
-        <Self as DynStorage>::req_align(self)
+        self.as_ref().dyn_req_align()
     }
 
     fn zero_align(&self) -> usize {
-        <Self as DynStorage>::zero_align(self)
+        self.as_ref().dyn_zero_align()
     }
 
     fn discard_align(&self) -> usize {
-        <Self as DynStorage>::discard_align(self)
+        self.as_ref().dyn_discard_align()
     }
 
     fn size(&self) -> io::Result<u64> {
-        <Self as DynStorage>::size(self)
+        self.as_ref().dyn_size()
     }
 
     fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
-        <Self as DynStorage>::resolve_relative_path(self, relative.as_ref())
+        self.as_ref().dyn_resolve_relative_path(relative.as_ref())
     }
 
     fn get_filename(&self) -> Option<&Path> {
-        <Self as DynStorage>::get_filename(self)
+        self.as_ref().dyn_get_filename()
     }
 
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::pure_readv(self, bufv, offset).await }
+        unsafe { self.as_ref().dyn_pure_readv(bufv, offset).await }
     }
 
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::pure_writev(self, bufv, offset).await }
+        unsafe { self.as_ref().dyn_pure_writev(bufv, offset).await }
     }
 
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::pure_write_zeroes(self, offset, length).await }
+        unsafe { self.as_ref().dyn_pure_write_zeroes(offset, length).await }
     }
 
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::pure_discard(self, offset, length).await }
+        unsafe { self.as_ref().dyn_pure_discard(offset, length).await }
     }
 
     async fn flush(&self) -> io::Result<()> {
-        <Self as DynStorage>::flush(self).await
+        self.as_ref().dyn_flush().await
     }
 
     async fn sync(&self) -> io::Result<()> {
-        <Self as DynStorage>::sync(self).await
+        self.as_ref().dyn_sync().await
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::invalidate_cache(self).await }
+        unsafe { self.as_ref().dyn_invalidate_cache().await }
     }
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {
-        <Self as DynStorage>::get_storage_helper(self)
+        self.as_ref().dyn_get_storage_helper()
     }
 
     async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
-        <Self as DynStorage>::resize(self, new_size, prealloc_mode).await
+        self.as_ref().dyn_resize(new_size, prealloc_mode).await
     }
 }
 
@@ -569,67 +569,67 @@ impl Storage for Arc<dyn DynStorage> {
     }
 
     fn mem_align(&self) -> usize {
-        <Self as DynStorage>::mem_align(self)
+        self.as_ref().dyn_mem_align()
     }
 
     fn req_align(&self) -> usize {
-        <Self as DynStorage>::req_align(self)
+        self.as_ref().dyn_req_align()
     }
 
     fn zero_align(&self) -> usize {
-        <Self as DynStorage>::zero_align(self)
+        self.as_ref().dyn_zero_align()
     }
 
     fn discard_align(&self) -> usize {
-        <Self as DynStorage>::discard_align(self)
+        self.as_ref().dyn_discard_align()
     }
 
     fn size(&self) -> io::Result<u64> {
-        <Self as DynStorage>::size(self)
+        self.as_ref().dyn_size()
     }
 
     fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
-        <Self as DynStorage>::resolve_relative_path(self, relative.as_ref())
+        self.as_ref().dyn_resolve_relative_path(relative.as_ref())
     }
 
     fn get_filename(&self) -> Option<&Path> {
-        <Self as DynStorage>::get_filename(self)
+        self.as_ref().dyn_get_filename()
     }
 
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::pure_readv(self, bufv, offset) }.await
+        unsafe { self.as_ref().dyn_pure_readv(bufv, offset) }.await
     }
 
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::pure_writev(self, bufv, offset) }.await
+        unsafe { self.as_ref().dyn_pure_writev(bufv, offset) }.await
     }
 
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::pure_write_zeroes(self, offset, length) }.await
+        unsafe { self.as_ref().dyn_pure_write_zeroes(offset, length) }.await
     }
 
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::pure_discard(self, offset, length) }.await
+        unsafe { self.as_ref().dyn_pure_discard(offset, length) }.await
     }
 
     async fn flush(&self) -> io::Result<()> {
-        <Self as DynStorage>::flush(self).await
+        self.as_ref().dyn_flush().await
     }
 
     async fn sync(&self) -> io::Result<()> {
-        <Self as DynStorage>::sync(self).await
+        self.as_ref().dyn_sync().await
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
-        unsafe { <Self as DynStorage>::invalidate_cache(self).await }
+        unsafe { self.as_ref().dyn_invalidate_cache().await }
     }
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {
-        <Self as DynStorage>::get_storage_helper(self)
+        self.as_ref().dyn_get_storage_helper()
     }
 
     async fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
-        <Self as DynStorage>::resize(self, new_size, prealloc_mode).await
+        self.as_ref().dyn_resize(new_size, prealloc_mode).await
     }
 }
 
