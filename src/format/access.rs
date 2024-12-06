@@ -407,7 +407,7 @@ impl<S: Storage> Display for Mapping<'_, S> {
                 writable,
             } => {
                 let writable = if *writable { "rw" } else { "ro" };
-                write!(f, "{}:0x{:x}/{}", storage, offset, writable)
+                write!(f, "{storage}:0x{offset:x}/{writable}")
             }
 
             Mapping::Zero => write!(f, "<zero>"),
@@ -415,7 +415,7 @@ impl<S: Storage> Display for Mapping<'_, S> {
             Mapping::Eof => write!(f, "<eof>"),
 
             Mapping::Special { layer, offset } => {
-                write!(f, "<special:{}:0x{:x}>", layer, offset)
+                write!(f, "<special:{layer}:0x{offset:x}>")
             }
         }
     }
