@@ -13,7 +13,7 @@ use std::{cmp, io, ptr};
 
 /// Provides access to a disk image.
 #[derive(Debug)]
-pub struct FormatAccess<S: Storage> {
+pub struct FormatAccess<S: Storage + 'static> {
     /// Image format driver.
     inner: Box<dyn FormatDriverInstance<Storage = S>>,
 
@@ -32,7 +32,7 @@ pub struct FormatAccess<S: Storage> {
 /// Mapping information that resolves down to the storage object layer (except for special data).
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Mapping<'a, S: Storage> {
+pub enum Mapping<'a, S: Storage + 'static> {
     /// Raw data.
     #[non_exhaustive]
     Raw {
@@ -101,7 +101,7 @@ pub enum Mapping<'a, S: Storage> {
 }
 
 // When adding new public methods, don’t forget to add them to sync_wrappers, too.
-impl<S: Storage> FormatAccess<S> {
+impl<S: Storage + 'static> FormatAccess<S> {
     /// Wrap a format driver instance in `FormatAccess`.
     ///
     /// `FormatAccess` provides I/O access to disk images, based on the functionality offered by
@@ -119,6 +119,11 @@ impl<S: Storage> FormatAccess<S> {
     /// Return the contained format driver instance.
     pub fn inner(&self) -> &dyn FormatDriverInstance<Storage = S> {
         self.inner.as_ref()
+    }
+
+    /// Return the contained format driver instance.
+    pub fn inner_mut(&mut self) -> &mut dyn FormatDriverInstance<Storage = S> {
+        self.inner.as_mut()
     }
 
     /// Return the disk size in bytes.

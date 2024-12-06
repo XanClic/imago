@@ -22,7 +22,7 @@ pub trait WrappedFormat<S: Storage>: Debug + Display + Send + Sync {
 }
 
 impl<
-        S: Storage,
+        S: Storage + 'static,
         D: Deref<Target = FormatAccess<S>> + Debug + Display + From<FormatAccess<S>> + Send + Sync,
     > WrappedFormat<S> for D
 {

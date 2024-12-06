@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Wraps a storage object without any translation.
 #[derive(Debug)]
-pub struct Raw<S: Storage> {
+pub struct Raw<S: Storage + 'static> {
     /// Wrapped storage object.
     inner: S,
 
@@ -26,7 +26,7 @@ pub struct Raw<S: Storage> {
     size: AtomicU64,
 }
 
-impl<S: Storage> Raw<S> {
+impl<S: Storage + 'static> Raw<S> {
     /// Create a new [`FormatDriverBuilder`] instance for the given image.
     pub fn builder(image: S) -> RawOpenBuilder<S> {
         RawOpenBuilder::new(image)
@@ -75,7 +75,7 @@ impl<S: Storage> Raw<S> {
 }
 
 #[async_trait(?Send)]
-impl<S: Storage> FormatDriverInstance for Raw<S> {
+impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
     type Storage = S;
 
     fn format(&self) -> Format {
@@ -240,16 +240,16 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
     }
 }
 
-impl<S: Storage> Display for Raw<S> {
+impl<S: Storage + 'static> Display for Raw<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "raw[{}]", self.inner)
     }
 }
 
 /// Options builder for opening a raw image.
-pub struct RawOpenBuilder<S: Storage>(FormatDriverBuilderBase<S>);
+pub struct RawOpenBuilder<S: Storage + 'static>(FormatDriverBuilderBase<S>);
 
-impl<S: Storage> FormatDriverBuilder<S> for RawOpenBuilder<S> {
+impl<S: Storage + 'static> FormatDriverBuilder<S> for RawOpenBuilder<S> {
     type Format = Raw<S>;
     const FORMAT: Format = Format::Raw;
 

@@ -7,12 +7,13 @@ use super::{Format, PreallocateMode};
 use crate::io_buffers::IoVectorMut;
 use crate::{FormatAccess, Storage};
 use async_trait::async_trait;
+use std::any::Any;
 use std::fmt::{Debug, Display};
 use std::io;
 
 /// Implementation of a disk image format.
 #[async_trait(?Send)]
-pub trait FormatDriverInstance: Debug + Display + Send + Sync {
+pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// Type of storage used.
     type Storage: Storage;
 
@@ -212,7 +213,7 @@ pub trait FormatDriverInstance: Debug + Display + Send + Sync {
 /// format layer’s information.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Mapping<'a, S: Storage> {
+pub enum Mapping<'a, S: Storage + 'static> {
     /// Raw data.
     #[non_exhaustive]
     Raw {
