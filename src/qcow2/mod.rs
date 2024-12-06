@@ -648,6 +648,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         let mut offset = new_size;
         while offset < old_size {
             match self.discard_to_backing(offset, old_size - offset).await {
+                Ok((_, 0)) => break, // cannot discard tail
                 Ok((dofs, dlen)) => offset = dofs + dlen,
                 // Basically ignore errors, but stop trying to discard
                 Err(_) => break,
