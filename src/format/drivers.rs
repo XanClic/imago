@@ -252,7 +252,32 @@ pub enum Mapping<'a, S: Storage> {
 
     /// Range is to be read as zeroes.
     #[non_exhaustive]
-    Zero {},
+    Zero {
+        /// Whether these zeroes are explicit on this layer.
+        ///
+        /// Differential image formats (like qcow2) track information about the status for all
+        /// blocks in the image (called clusters in case of qcow2).  Perhaps most importantly, they
+        /// track whether a block is allocated or not:
+        /// - Allocated blocks have their data in the image.
+        /// - Unallocated blocks do not have their data in this image, but have to be read from a
+        ///   backing image (which results in [`Mapping::Indirect`] mappings).
+        ///
+        /// Thus, such images represent the difference from their backing image (hence
+        /// “differential”).
+        ///
+        /// Without a backing image, this feature can be used for sparse allocation: Unallocated
+        /// blocks are simply interpreted to be zero.  These ranges will be noted as
+        /// [`Mapping::Zero`] with `explicit` set to false.
+        ///
+        /// Formats like qcow2 can track more information beyond just the allocation status,
+        /// though, for example, whether a block should read as zero. Such blocks similarly do not
+        /// need to have their data stored in the image file, but are still not treated as
+        /// unallocated, so will never be read from a backing image, regardless of whether one
+        /// exists or not.
+        ///
+        /// These ranges are noted as [`Mapping::Zero`] with `explicit` set to true.
+        explicit: bool,
+    },
 
     /// End of file reached.
     #[non_exhaustive]

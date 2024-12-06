@@ -54,7 +54,32 @@ pub enum Mapping<'a, S: Storage> {
 
     /// Range is to be read as zeroes.
     #[non_exhaustive]
-    Zero {},
+    Zero {
+        /// Whether these zeroes are explicit on this image (the top layer).
+        ///
+        /// Differential image formats (like qcow2) track information about the status for all
+        /// blocks in the image (called clusters in case of qcow2).  Perhaps most importantly, they
+        /// track whether a block is allocated or not:
+        /// - Allocated blocks have their data in the image.
+        /// - Unallocated blocks do not have their data in this image, but have to be read from a
+        ///   backing image (which results in [`drivers::Mapping::Indirect`] mappings).
+        ///
+        /// Thus, such images represent the difference from their backing image (hence
+        /// “differential”).
+        ///
+        /// Without a backing image, this feature can be used for sparse allocation: Unallocated
+        /// blocks are simply interpreted to be zero.  These ranges will be noted as
+        /// [`Mapping::Zero`] with `explicit` set to false.
+        ///
+        /// Formats like qcow2 can track more information beyond just the allocation status,
+        /// though, for example, whether a block should read as zero. Such blocks similarly do not
+        /// need to have their data stored in the image file, but are still not treated as
+        /// unallocated, so will never be read from a backing image, regardless of whether one
+        /// exists or not.
+        ///
+        /// These ranges are noted as [`Mapping::Zero`] with `explicit` set to true.
+        explicit: bool,
+    },
 
     /// End of file reached.
     ///
@@ -166,7 +191,7 @@ impl<S: Storage> FormatAccess<S> {
                 writable: _,
             } => storage.readv(bufv, offset).await,
 
-            Mapping::Zero {} | Mapping::Eof {} => {
+            Mapping::Zero { explicit: _ } | Mapping::Eof {} => {
                 bufv.fill(0);
                 Ok(())
             }
@@ -225,14 +250,21 @@ impl<S: Storage> FormatAccess<S> {
                     max_length = length;
                 }
 
-                drivers::Mapping::Zero {} => return Ok((Mapping::Zero {}, length)),
+                drivers::Mapping::Zero { explicit } => {
+                    // If this is not the top layer, always clear `explicit`
+                    return if explicit && ptr::eq(format_layer, self) {
+                        Ok((Mapping::Zero { explicit: true }, length))
+                    } else {
+                        Ok((Mapping::Zero { explicit: false }, length))
+                    };
+                }
 
                 drivers::Mapping::Eof {} => {
                     // Return EOF only on top layer, zero otherwise
                     return if ptr::eq(format_layer, self) {
                         Ok((Mapping::Eof {}, 0))
                     } else {
-                        Ok((Mapping::Zero {}, max_length))
+                        Ok((Mapping::Zero { explicit: false }, max_length))
                     };
                 }
 
@@ -402,7 +434,7 @@ impl<S: Storage> FormatAccess<S> {
                     offset: _,
                     writable: _,
                 } => None,
-                drivers::Mapping::Zero {} => {
+                drivers::Mapping::Zero { explicit: _ } => {
                     if allocate {
                         None
                     } else {
@@ -672,7 +704,10 @@ impl<S: Storage> Display for Mapping<'_, S> {
                 write!(f, "{}:0x{:x}/{}", storage, offset, writable)
             }
 
-            Mapping::Zero {} => write!(f, "<zero>"),
+            Mapping::Zero { explicit } => {
+                let explicit = if *explicit { "explicit" } else { "unallocated" };
+                write!(f, "<zero:{explicit}>")
+            }
 
             Mapping::Eof {} => write!(f, "<eof>"),
 

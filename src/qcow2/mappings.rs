@@ -22,7 +22,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                     writable: false,
                 }
             } else {
-                Mapping::Zero {}
+                Mapping::Zero { explicit: false }
             };
             return Ok((mapping, len));
         };
@@ -61,14 +61,14 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                         writable: false,
                     }
                 } else {
-                    Mapping::Zero {}
+                    Mapping::Zero { explicit: false }
                 }
             }
 
             L2Mapping::Zero {
                 host_cluster: _,
                 copied: _,
-            } => Mapping::Zero {},
+            } => Mapping::Zero { explicit: true },
 
             L2Mapping::Compressed {
                 host_offset: _,
