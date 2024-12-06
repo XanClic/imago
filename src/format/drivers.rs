@@ -89,12 +89,12 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// `max_length` is a hint how long of a range is required at all, but the returned length may
     /// exceed that value if that simplifies the implementation.
     ///
-    /// The returned length must only be 0 if `Mapping::Eof` is returned.
+    /// The returned length must only be 0 if `ShallowMapping::Eof` is returned.
     async fn get_mapping<'a>(
         &'a self,
         offset: u64,
         max_length: u64,
-    ) -> io::Result<(Mapping<'a, Self::Storage>, u64)>;
+    ) -> io::Result<(ShallowMapping<'a, Self::Storage>, u64)>;
 
     /// Ensure that `offset` is directly mapped to some storage object, up to a length of `length`.
     ///
@@ -170,7 +170,7 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    /// Read data from a `Mapping::Special` area.
+    /// Read data from a `ShallowMapping::Special` area.
     async fn readv_special(&self, _bufv: IoVectorMut<'_>, _offset: u64) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
@@ -218,11 +218,11 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
 
 /// Non-recursive mapping information.
 ///
-/// Mapping information as returned by `FormatDriverInstance::get_mapping()`, only looking at that
-/// format layer’s information.
+/// Mapping information as returned by [`FormatDriverInstance::get_mapping()`], only looking at
+/// that format layer’s information.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Mapping<'a, S: Storage + 'static> {
+pub enum ShallowMapping<'a, S: Storage + 'static> {
     /// Raw data.
     #[non_exhaustive]
     Raw {
@@ -271,14 +271,14 @@ pub enum Mapping<'a, S: Storage + 'static> {
         /// track whether a block is allocated or not:
         /// - Allocated blocks have their data in the image.
         /// - Unallocated blocks do not have their data in this image, but have to be read from a
-        ///   backing image (which results in [`Mapping::Indirect`] mappings).
+        ///   backing image (which results in [`ShallowMapping::Indirect`] mappings).
         ///
         /// Thus, such images represent the difference from their backing image (hence
         /// “differential”).
         ///
         /// Without a backing image, this feature can be used for sparse allocation: Unallocated
         /// blocks are simply interpreted to be zero.  These ranges will be noted as
-        /// [`Mapping::Zero`] with `explicit` set to false.
+        /// [`ShallowMapping::Zero`] with `explicit` set to false.
         ///
         /// Formats like qcow2 can track more information beyond just the allocation status,
         /// though, for example, whether a block should read as zero. Such blocks similarly do not
@@ -286,7 +286,7 @@ pub enum Mapping<'a, S: Storage + 'static> {
         /// unallocated, so will never be read from a backing image, regardless of whether one
         /// exists or not.
         ///
-        /// These ranges are noted as [`Mapping::Zero`] with `explicit` set to true.
+        /// These ranges are noted as [`ShallowMapping::Zero`] with `explicit` set to true.
         explicit: bool,
     },
 

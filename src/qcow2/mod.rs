@@ -15,14 +15,14 @@ mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
 use crate::format::builder::FormatDriverBuilder;
-use crate::format::drivers::{FormatDriverInstance, Mapping};
+use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
 use crate::format::{Format, PreallocateMode};
 use crate::io_buffers::IoVectorMut;
 use crate::misc_helpers::ResultErrorContext;
 use crate::raw::Raw;
-use crate::{storage, FormatAccess, Storage, StorageExt, StorageOpenOptions};
+use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
 pub use builder::Qcow2OpenBuilder;
@@ -457,9 +457,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         &'a self,
         offset: u64,
         max_length: u64,
-    ) -> io::Result<(Mapping<'a, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'a, S>, u64)> {
         let length_until_eof = match self.header.size().checked_sub(offset) {
-            None | Some(0) => return Ok((Mapping::Eof {}, 0)),
+            None | Some(0) => return Ok((ShallowMapping::Eof {}, 0)),
             Some(length) => length,
         };
 

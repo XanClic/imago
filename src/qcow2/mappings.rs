@@ -11,18 +11,18 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         &self,
         offset: GuestOffset,
         max_length: u64,
-    ) -> io::Result<(Mapping<'_, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'_, S>, u64)> {
         let Some(l2_table) = self.get_l2(offset, false).await? else {
             let cb = self.header.cluster_bits();
             let len = cmp::min(offset.remaining_in_l2_table(cb), max_length);
             let mapping = if let Some(backing) = self.backing.as_ref() {
-                Mapping::Indirect {
+                ShallowMapping::Indirect {
                     layer: backing.inner(),
                     offset: offset.0,
                     writable: false,
                 }
             } else {
-                Mapping::Zero { explicit: false }
+                ShallowMapping::Zero { explicit: false }
             };
             return Ok((mapping, len));
         };
@@ -37,7 +37,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         offset: GuestOffset,
         max_length: u64,
         l2_table: &L2Table,
-    ) -> io::Result<(Mapping<'_, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'_, S>, u64)> {
         let cb = self.header.cluster_bits();
 
         // Get mapping at `offset`
@@ -47,7 +47,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             L2Mapping::DataFile {
                 host_cluster,
                 copied,
-            } => Mapping::Raw {
+            } => ShallowMapping::Raw {
                 storage: self.storage(),
                 offset: host_cluster.relative_offset(offset, cb).0,
                 writable: copied,
@@ -55,25 +55,25 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
             L2Mapping::Backing { backing_offset } => {
                 if let Some(backing) = self.backing.as_ref() {
-                    Mapping::Indirect {
+                    ShallowMapping::Indirect {
                         layer: backing.inner(),
                         offset: backing_offset + offset.in_cluster_offset(cb) as u64,
                         writable: false,
                     }
                 } else {
-                    Mapping::Zero { explicit: false }
+                    ShallowMapping::Zero { explicit: false }
                 }
             }
 
             L2Mapping::Zero {
                 host_cluster: _,
                 copied: _,
-            } => Mapping::Zero { explicit: true },
+            } => ShallowMapping::Zero { explicit: true },
 
             L2Mapping::Compressed {
                 host_offset: _,
                 length: _,
-            } => Mapping::Special { offset: offset.0 },
+            } => ShallowMapping::Special { offset: offset.0 },
         };
 
         // Find out how long this consecutive mapping is, but only within the current L2 table
@@ -118,7 +118,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let existing = self
             .do_get_mapping_with_l2(offset, length, &l2_table)
             .await?;
-        if let Mapping::Raw {
+        if let ShallowMapping::Raw {
             storage,
             offset,
             writable: true,

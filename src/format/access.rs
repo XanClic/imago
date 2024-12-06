@@ -2,7 +2,7 @@
 //!
 //! Provides access to different image formats via `FormatAccess` objects.
 
-use super::drivers::{self, FormatDriverInstance};
+use super::drivers::{FormatDriverInstance, ShallowMapping};
 use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::ext::write_full_zeroes;
@@ -62,7 +62,7 @@ pub enum Mapping<'a, S: Storage + 'static> {
         /// track whether a block is allocated or not:
         /// - Allocated blocks have their data in the image.
         /// - Unallocated blocks do not have their data in this image, but have to be read from a
-        ///   backing image (which results in [`drivers::Mapping::Indirect`] mappings).
+        ///   backing image (which results in [`ShallowMapping::Indirect`] mappings).
         ///
         /// Thus, such images represent the difference from their backing image (hence
         /// “differential”).
@@ -212,10 +212,32 @@ impl<S: Storage + 'static> FormatAccess<S> {
         }
     }
 
-    /// Return the mapping at `offset`.
+    /// Return the shallow mapping at `offset`.
+    ///
+    /// Find what `offset` is mapped to, which may be another format layer, return that
+    /// information, and the length of the continuous mapping (from `offset`).
+    ///
+    /// Use [`FormatAccess::get_mapping()`] to recursively fully resolve references to other format
+    /// layers.
+    pub async fn get_shallow_mapping(
+        &self,
+        offset: u64,
+        max_length: u64,
+    ) -> io::Result<(ShallowMapping<'_, S>, u64)> {
+        self.inner
+            .get_mapping(offset, max_length)
+            .await
+            .map(|(m, l)| (m, cmp::min(l, max_length)))
+    }
+
+    /// Return the recursively resolved mapping at `offset`.
     ///
     /// Find what `offset` is mapped to, return that mapping information, and the length of that
     /// continuous mapping (from `offset`).
+    ///
+    /// All data references to other format layers are automatically resolved (recursively), so
+    /// that the result are more “trivial” mappings (unless prevented by special mappings like
+    /// compressed clusters).
     pub async fn get_mapping(
         &self,
         mut offset: u64,
@@ -225,11 +247,10 @@ impl<S: Storage + 'static> FormatAccess<S> {
         let mut writable_gate = true;
 
         loop {
-            let (mapping, length) = format_layer.inner.get_mapping(offset, max_length).await?;
-            let length = std::cmp::min(length, max_length);
+            let (mapping, length) = format_layer.get_shallow_mapping(offset, max_length).await?;
 
             match mapping {
-                drivers::Mapping::Raw {
+                ShallowMapping::Raw {
                     storage,
                     offset,
                     writable,
@@ -244,7 +265,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                     ))
                 }
 
-                drivers::Mapping::Indirect {
+                ShallowMapping::Indirect {
                     layer: recurse_layer,
                     offset: recurse_offset,
                     writable: recurse_writable,
@@ -255,7 +276,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                     max_length = length;
                 }
 
-                drivers::Mapping::Zero { explicit } => {
+                ShallowMapping::Zero { explicit } => {
                     // If this is not the top layer, always clear `explicit`
                     return if explicit && ptr::eq(format_layer, self) {
                         Ok((Mapping::Zero { explicit: true }, length))
@@ -264,7 +285,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                     };
                 }
 
-                drivers::Mapping::Eof {} => {
+                ShallowMapping::Eof {} => {
                     // Return EOF only on top layer, zero otherwise
                     return if ptr::eq(format_layer, self) {
                         Ok((Mapping::Eof {}, 0))
@@ -273,7 +294,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                     };
                 }
 
-                drivers::Mapping::Special { offset } => {
+                ShallowMapping::Special { offset } => {
                     return Ok((
                         Mapping::Special {
                             layer: format_layer,
@@ -517,29 +538,29 @@ impl<S: Storage + 'static> FormatAccess<S> {
             let mlen = cmp::min(mlen, length);
 
             let mapping = match mapping {
-                drivers::Mapping::Raw {
+                ShallowMapping::Raw {
                     storage,
                     offset,
                     writable,
                 } => writable.then_some((storage, offset)),
                 // For already zero clusters, we don’t need to do anything
-                drivers::Mapping::Zero { explicit: true } => {
+                ShallowMapping::Zero { explicit: true } => {
                     // Nothing to be done
                     offset += mlen;
                     length -= mlen;
                     continue;
                 }
                 // For unallocated clusters, we should establish zero data
-                drivers::Mapping::Zero { explicit: false }
-                | drivers::Mapping::Indirect {
+                ShallowMapping::Zero { explicit: false }
+                | ShallowMapping::Indirect {
                     layer: _,
                     offset: _,
                     writable: _,
                 } => None,
-                drivers::Mapping::Eof {} => {
+                ShallowMapping::Eof {} => {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
-                drivers::Mapping::Special { offset: _ } => None,
+                ShallowMapping::Special { offset: _ } => None,
             };
 
             let (file, mofs, mlen) = if let Some((file, mofs)) = mapping {

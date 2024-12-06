@@ -3,10 +3,10 @@
 //! Allows accessing generic storage objects (`Storage`) as images (i.e. `FormatAccess`).
 
 use crate::format::builder::{FormatDriverBuilder, FormatDriverBuilderBase};
-use crate::format::drivers::{FormatDriverInstance, Mapping};
+use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::ImplicitOpenGate;
 use crate::format::{Format, PreallocateMode};
-use crate::{storage, Storage, StorageExt, StorageOpenOptions};
+use crate::{storage, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -109,14 +109,14 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
         &'a self,
         offset: u64,
         max_length: u64,
-    ) -> io::Result<(Mapping<'a, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'a, S>, u64)> {
         let remaining = match self.size().checked_sub(offset) {
-            None | Some(0) => return Ok((Mapping::Eof {}, 0)),
+            None | Some(0) => return Ok((ShallowMapping::Eof {}, 0)),
             Some(remaining) => remaining,
         };
 
         Ok((
-            Mapping::Raw {
+            ShallowMapping::Raw {
                 storage: &self.inner,
                 offset,
                 writable: true,
