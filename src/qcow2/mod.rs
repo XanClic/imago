@@ -393,16 +393,13 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.need_writable()?;
         self.check_disk_bounds(offset, length, "write")?;
 
-        let (first_cluster, count) = self
-            .ensure_fixed_mapping(
-                GuestOffset(offset),
-                length,
-                FixedMapping::ZeroRetainAllocation,
-            )
-            .await?;
-
-        let cb = self.header.cluster_bits();
-        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+        self.ensure_fixed_mapping(
+            GuestOffset(offset),
+            length,
+            FixedMapping::ZeroRetainAllocation,
+        )
+        .await
+        .map(|(ofs, len)| (ofs.0, len))
     }
 
     async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -412,12 +409,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         // Safe to discard: We have a mutable `self` reference
         // Note this will return an `Unsupported` error for v2 images.  That’s OK, safely
         // discarding on them is a hairy affair, and they are really outdated by now.
-        let (first_cluster, count) = self
-            .ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
-            .await?;
-
-        let cb = self.header.cluster_bits();
-        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
+            .await
+            .map(|(ofs, len)| (ofs.0, len))
     }
 
     async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -429,12 +423,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.check_disk_bounds(offset, length, "discard")?;
 
         // Safe to discard: We have a mutable `self` reference
-        let (first_cluster, count) = self
-            .ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::FullDiscard)
-            .await?;
-
-        let cb = self.header.cluster_bits();
-        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::FullDiscard)
+            .await
+            .map(|(ofs, len)| (ofs.0, len))
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
