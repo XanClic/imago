@@ -9,7 +9,7 @@ use std::io;
 /// Synchronous wrapper around [`FormatAccess`].
 ///
 /// Creates and keeps a tokio runtime in which to run I/O.
-pub struct SyncFormatAccess<S: Storage> {
+pub struct SyncFormatAccess<S: Storage + 'static> {
     /// Wrapped asynchronous [`FormatAccess`].
     inner: FormatAccess<S>,
 
@@ -17,7 +17,7 @@ pub struct SyncFormatAccess<S: Storage> {
     runtime: tokio::runtime::Runtime,
 }
 
-impl<S: Storage> SyncFormatAccess<S> {
+impl<S: Storage + 'static> SyncFormatAccess<S> {
     /// Like [`FormatAccess::new()`], but create a synchronous wrapper.
     pub fn new<D: FormatDriverInstance<Storage = S> + 'static>(inner: D) -> io::Result<Self> {
         FormatAccess::new(inner).try_into()

@@ -8,6 +8,7 @@ pub mod ext;
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use drivers::CommonStorageHelper;
+use std::any::Any;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::io;
@@ -220,7 +221,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
 ///
 /// Async functions in `DynStorage` return boxed futures (`Pin<Box<dyn Future>>`), which makes them
 /// slighly less efficient than async functions in `Storage`, hence the distinction.
-pub trait DynStorage: Debug + Display + Send + Sync {
+pub trait DynStorage: Any + Debug + Display + Send + Sync {
     /// Wrapper around [`Storage::mem_align()`].
     fn mem_align(&self) -> usize;
 
@@ -400,7 +401,7 @@ impl<S: Storage> Storage for &S {
     }
 }
 
-impl<S: Storage> DynStorage for S {
+impl<S: Storage + 'static> DynStorage for S {
     fn mem_align(&self) -> usize {
         S::mem_align(self)
     }

@@ -15,14 +15,14 @@ mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
 use crate::format::builder::FormatDriverBuilder;
-use crate::format::drivers::{FormatDriverInstance, Mapping};
+use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
 use crate::format::{Format, PreallocateMode};
 use crate::io_buffers::IoVectorMut;
 use crate::misc_helpers::ResultErrorContext;
 use crate::raw::Raw;
-use crate::{storage, FormatAccess, Storage, StorageExt, StorageOpenOptions};
+use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
 pub use builder::Qcow2OpenBuilder;
@@ -429,6 +429,11 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.header.size()
     }
 
+    fn zero_granularity(&self) -> Option<u64> {
+        self.header.require_version(3).ok()?;
+        Some(self.header.cluster_size() as u64)
+    }
+
     fn collect_storage_dependencies(&self) -> Vec<&S> {
         let mut v = self
             .backing
@@ -452,9 +457,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         &'a self,
         offset: u64,
         max_length: u64,
-    ) -> io::Result<(Mapping<'a, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'a, S>, u64)> {
         let length_until_eof = match self.header.size().checked_sub(offset) {
-            None | Some(0) => return Ok((Mapping::Eof, 0)),
+            None | Some(0) => return Ok((ShallowMapping::Eof {}, 0)),
             Some(length) => length,
         };
 
@@ -484,16 +489,13 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.need_writable()?;
         self.check_disk_bounds(offset, length, "write")?;
 
-        let (first_cluster, count) = self
-            .ensure_fixed_mapping(
-                GuestOffset(offset),
-                length,
-                FixedMapping::ZeroRetainAllocation,
-            )
-            .await?;
-
-        let cb = self.header.cluster_bits();
-        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+        self.ensure_fixed_mapping(
+            GuestOffset(offset),
+            length,
+            FixedMapping::ZeroRetainAllocation,
+        )
+        .await
+        .map(|(ofs, len)| (ofs.0, len))
     }
 
     async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -503,12 +505,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         // Safe to discard: We have a mutable `self` reference
         // Note this will return an `Unsupported` error for v2 images.  That’s OK, safely
         // discarding on them is a hairy affair, and they are really outdated by now.
-        let (first_cluster, count) = self
-            .ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
-            .await?;
-
-        let cb = self.header.cluster_bits();
-        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
+            .await
+            .map(|(ofs, len)| (ofs.0, len))
     }
 
     async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -520,12 +519,9 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.check_disk_bounds(offset, length, "discard")?;
 
         // Safe to discard: We have a mutable `self` reference
-        let (first_cluster, count) = self
-            .ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::FullDiscard)
-            .await?;
-
-        let cb = self.header.cluster_bits();
-        Ok((first_cluster.offset(cb).0, count.byte_size(cb)))
+        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::FullDiscard)
+            .await
+            .map(|(ofs, len)| (ofs.0, len))
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
@@ -657,6 +653,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         let mut offset = new_size;
         while offset < old_size {
             match self.discard_to_backing(offset, old_size - offset).await {
+                Ok((_, 0)) => break, // cannot discard tail
                 Ok((dofs, dlen)) => offset = dofs + dlen,
                 // Basically ignore errors, but stop trying to discard
                 Err(_) => break,

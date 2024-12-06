@@ -3,10 +3,10 @@
 //! Allows accessing generic storage objects (`Storage`) as images (i.e. `FormatAccess`).
 
 use crate::format::builder::{FormatDriverBuilder, FormatDriverBuilderBase};
-use crate::format::drivers::{FormatDriverInstance, Mapping};
+use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::ImplicitOpenGate;
 use crate::format::{Format, PreallocateMode};
-use crate::{storage, Storage, StorageExt, StorageOpenOptions};
+use crate::{storage, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Wraps a storage object without any translation.
 #[derive(Debug)]
-pub struct Raw<S: Storage> {
+pub struct Raw<S: Storage + 'static> {
     /// Wrapped storage object.
     inner: S,
 
@@ -26,7 +26,7 @@ pub struct Raw<S: Storage> {
     size: AtomicU64,
 }
 
-impl<S: Storage> Raw<S> {
+impl<S: Storage + 'static> Raw<S> {
     /// Create a new [`FormatDriverBuilder`] instance for the given image.
     pub fn builder(image: S) -> RawOpenBuilder<S> {
         RawOpenBuilder::new(image)
@@ -75,7 +75,7 @@ impl<S: Storage> Raw<S> {
 }
 
 #[async_trait(?Send)]
-impl<S: Storage> FormatDriverInstance for Raw<S> {
+impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
     type Storage = S;
 
     fn format(&self) -> Format {
@@ -93,6 +93,10 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         self.size.load(Ordering::Relaxed)
     }
 
+    fn zero_granularity(&self) -> Option<u64> {
+        None
+    }
+
     fn collect_storage_dependencies(&self) -> Vec<&S> {
         vec![&self.inner]
     }
@@ -105,14 +109,14 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
         &'a self,
         offset: u64,
         max_length: u64,
-    ) -> io::Result<(Mapping<'a, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'a, S>, u64)> {
         let remaining = match self.size().checked_sub(offset) {
-            None | Some(0) => return Ok((Mapping::Eof, 0)),
+            None | Some(0) => return Ok((ShallowMapping::Eof {}, 0)),
             Some(remaining) => remaining,
         };
 
         Ok((
-            Mapping::Raw {
+            ShallowMapping::Raw {
                 storage: &self.inner,
                 offset,
                 writable: true,
@@ -240,16 +244,16 @@ impl<S: Storage> FormatDriverInstance for Raw<S> {
     }
 }
 
-impl<S: Storage> Display for Raw<S> {
+impl<S: Storage + 'static> Display for Raw<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "raw[{}]", self.inner)
     }
 }
 
 /// Options builder for opening a raw image.
-pub struct RawOpenBuilder<S: Storage>(FormatDriverBuilderBase<S>);
+pub struct RawOpenBuilder<S: Storage + 'static>(FormatDriverBuilderBase<S>);
 
-impl<S: Storage> FormatDriverBuilder<S> for RawOpenBuilder<S> {
+impl<S: Storage + 'static> FormatDriverBuilder<S> for RawOpenBuilder<S> {
     type Format = Raw<S>;
     const FORMAT: Format = Format::Raw;
 

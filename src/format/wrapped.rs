@@ -8,6 +8,8 @@
 use crate::{FormatAccess, Storage};
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
+use std::sync::Arc;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 /// Represents [`FormatAccess`] wrapped in e.g. `Arc`, `Box`, or nothing at all.
 ///
@@ -22,7 +24,7 @@ pub trait WrappedFormat<S: Storage>: Debug + Display + Send + Sync {
 }
 
 impl<
-        S: Storage,
+        S: Storage + 'static,
         D: Deref<Target = FormatAccess<S>> + Debug + Display + From<FormatAccess<S>> + Send + Sync,
     > WrappedFormat<S> for D
 {
@@ -42,5 +44,16 @@ impl<S: Storage> WrappedFormat<S> for FormatAccess<S> {
 
     fn inner(&self) -> &FormatAccess<S> {
         self
+    }
+}
+
+impl<S: Storage> WrappedFormat<S> for OwnedRwLockReadGuard<FormatAccess<S>> {
+    fn wrap(inner: FormatAccess<S>) -> Self {
+        // Ugly, but works.
+        Arc::new(RwLock::new(inner)).try_read_owned().unwrap()
+    }
+
+    fn inner(&self) -> &FormatAccess<S> {
+        self.deref()
     }
 }

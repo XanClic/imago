@@ -2,18 +2,18 @@
 //!
 //! Provides access to different image formats via `FormatAccess` objects.
 
-use super::drivers::{self, FormatDriverInstance};
+use super::drivers::{FormatDriverInstance, ShallowMapping};
 use super::PreallocateMode;
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::ext::write_full_zeroes;
 use crate::vector_select::FutureVector;
 use crate::{Storage, StorageExt};
 use std::fmt::{self, Display, Formatter};
-use std::{cmp, io};
+use std::{cmp, io, ptr};
 
 /// Provides access to a disk image.
 #[derive(Debug)]
-pub struct FormatAccess<S: Storage> {
+pub struct FormatAccess<S: Storage + 'static> {
     /// Image format driver.
     inner: Box<dyn FormatDriverInstance<Storage = S>>,
 
@@ -31,8 +31,10 @@ pub struct FormatAccess<S: Storage> {
 ///
 /// Mapping information that resolves down to the storage object layer (except for special data).
 #[derive(Debug)]
-pub enum Mapping<'a, S: Storage> {
+#[non_exhaustive]
+pub enum Mapping<'a, S: Storage + 'static> {
     /// Raw data.
+    #[non_exhaustive]
     Raw {
         /// Storage object where this data is stored.
         storage: &'a S,
@@ -51,16 +53,44 @@ pub enum Mapping<'a, S: Storage> {
     },
 
     /// Range is to be read as zeroes.
-    Zero,
+    #[non_exhaustive]
+    Zero {
+        /// Whether these zeroes are explicit on this image (the top layer).
+        ///
+        /// Differential image formats (like qcow2) track information about the status for all
+        /// blocks in the image (called clusters in case of qcow2).  Perhaps most importantly, they
+        /// track whether a block is allocated or not:
+        /// - Allocated blocks have their data in the image.
+        /// - Unallocated blocks do not have their data in this image, but have to be read from a
+        ///   backing image (which results in [`ShallowMapping::Indirect`] mappings).
+        ///
+        /// Thus, such images represent the difference from their backing image (hence
+        /// “differential”).
+        ///
+        /// Without a backing image, this feature can be used for sparse allocation: Unallocated
+        /// blocks are simply interpreted to be zero.  These ranges will be noted as
+        /// [`Mapping::Zero`] with `explicit` set to false.
+        ///
+        /// Formats like qcow2 can track more information beyond just the allocation status,
+        /// though, for example, whether a block should read as zero. Such blocks similarly do not
+        /// need to have their data stored in the image file, but are still not treated as
+        /// unallocated, so will never be read from a backing image, regardless of whether one
+        /// exists or not.
+        ///
+        /// These ranges are noted as [`Mapping::Zero`] with `explicit` set to true.
+        explicit: bool,
+    },
 
     /// End of file reached.
     ///
     /// The accompanying length is always 0.
-    Eof,
+    #[non_exhaustive]
+    Eof {},
 
     /// Data is encoded in some manner, e.g. compressed or encrypted.
     ///
     /// Such data cannot be accessed directly, but must be interpreted by the image format driver.
+    #[non_exhaustive]
     Special {
         /// Format layer where this special data was encountered.
         layer: &'a FormatAccess<S>,
@@ -71,7 +101,7 @@ pub enum Mapping<'a, S: Storage> {
 }
 
 // When adding new public methods, don’t forget to add them to sync_wrappers, too.
-impl<S: Storage> FormatAccess<S> {
+impl<S: Storage + 'static> FormatAccess<S> {
     /// Wrap a format driver instance in `FormatAccess`.
     ///
     /// `FormatAccess` provides I/O access to disk images, based on the functionality offered by
@@ -89,6 +119,11 @@ impl<S: Storage> FormatAccess<S> {
     /// Return the contained format driver instance.
     pub fn inner(&self) -> &dyn FormatDriverInstance<Storage = S> {
         self.inner.as_ref()
+    }
+
+    /// Return the contained format driver instance.
+    pub fn inner_mut(&mut self) -> &mut dyn FormatDriverInstance<Storage = S> {
+        self.inner.as_mut()
     }
 
     /// Return the disk size in bytes.
@@ -161,7 +196,7 @@ impl<S: Storage> FormatAccess<S> {
                 writable: _,
             } => storage.readv(bufv, offset).await,
 
-            Mapping::Zero | Mapping::Eof => {
+            Mapping::Zero { explicit: _ } | Mapping::Eof {} => {
                 bufv.fill(0);
                 Ok(())
             }
@@ -177,10 +212,32 @@ impl<S: Storage> FormatAccess<S> {
         }
     }
 
-    /// Return the mapping at `offset`.
+    /// Return the shallow mapping at `offset`.
+    ///
+    /// Find what `offset` is mapped to, which may be another format layer, return that
+    /// information, and the length of the continuous mapping (from `offset`).
+    ///
+    /// Use [`FormatAccess::get_mapping()`] to recursively fully resolve references to other format
+    /// layers.
+    pub async fn get_shallow_mapping(
+        &self,
+        offset: u64,
+        max_length: u64,
+    ) -> io::Result<(ShallowMapping<'_, S>, u64)> {
+        self.inner
+            .get_mapping(offset, max_length)
+            .await
+            .map(|(m, l)| (m, cmp::min(l, max_length)))
+    }
+
+    /// Return the recursively resolved mapping at `offset`.
     ///
     /// Find what `offset` is mapped to, return that mapping information, and the length of that
     /// continuous mapping (from `offset`).
+    ///
+    /// All data references to other format layers are automatically resolved (recursively), so
+    /// that the result are more “trivial” mappings (unless prevented by special mappings like
+    /// compressed clusters).
     pub async fn get_mapping(
         &self,
         mut offset: u64,
@@ -190,11 +247,10 @@ impl<S: Storage> FormatAccess<S> {
         let mut writable_gate = true;
 
         loop {
-            let (mapping, length) = format_layer.inner.get_mapping(offset, max_length).await?;
-            let length = std::cmp::min(length, max_length);
+            let (mapping, length) = format_layer.get_shallow_mapping(offset, max_length).await?;
 
             match mapping {
-                drivers::Mapping::Raw {
+                ShallowMapping::Raw {
                     storage,
                     offset,
                     writable,
@@ -209,7 +265,7 @@ impl<S: Storage> FormatAccess<S> {
                     ))
                 }
 
-                drivers::Mapping::Indirect {
+                ShallowMapping::Indirect {
                     layer: recurse_layer,
                     offset: recurse_offset,
                     writable: recurse_writable,
@@ -220,11 +276,25 @@ impl<S: Storage> FormatAccess<S> {
                     max_length = length;
                 }
 
-                drivers::Mapping::Zero => return Ok((Mapping::Zero, length)),
+                ShallowMapping::Zero { explicit } => {
+                    // If this is not the top layer, always clear `explicit`
+                    return if explicit && ptr::eq(format_layer, self) {
+                        Ok((Mapping::Zero { explicit: true }, length))
+                    } else {
+                        Ok((Mapping::Zero { explicit: false }, length))
+                    };
+                }
 
-                drivers::Mapping::Eof => return Ok((Mapping::Eof, 0)),
+                ShallowMapping::Eof {} => {
+                    // Return EOF only on top layer, zero otherwise
+                    return if ptr::eq(format_layer, self) {
+                        Ok((Mapping::Eof {}, 0))
+                    } else {
+                        Ok((Mapping::Zero { explicit: false }, max_length))
+                    };
+                }
 
-                drivers::Mapping::Special { offset } => {
+                ShallowMapping::Special { offset } => {
                     return Ok((
                         Mapping::Special {
                             layer: format_layer,
@@ -363,52 +433,140 @@ impl<S: Storage> FormatAccess<S> {
         self.writev(buf.into(), offset).await
     }
 
+    /// Check whether the given range is zero.
+    ///
+    /// Checks for zero mappings, not zero data (although this might be changed in the future).
+    ///
+    /// Errors are treated as non-zero areas.
+    async fn is_range_zero(&self, mut offset: u64, mut length: u64) -> bool {
+        while length > 0 {
+            match self.get_mapping(offset, length).await {
+                Ok((Mapping::Zero { explicit: _ }, mlen)) => {
+                    offset += mlen;
+                    length -= mlen;
+                }
+                _ => return false,
+            };
+        }
+
+        true
+    }
+
     /// Ensure the given range reads as zeroes, without write-zeroes support.
     ///
     /// Does not require support for efficient zeroing, instead writing zeroes when the range is
     /// not zero yet.  If `allocate` is true, areas that are not currently allocated will be
     /// allocated to write zeroes there; if it is false, unallocated areas that currently read as
     /// zero are left alone.
-    async fn soft_ensure_zero(
-        &self,
-        mut offset: u64,
-        mut length: u64,
-        allocate: bool,
-    ) -> io::Result<()> {
+    ///
+    /// However, can still use efficient zero support if present.
+    ///
+    /// The main use case is to handle unaligned zero requests.  Quite inefficient for large areas.
+    async fn soft_ensure_zero(&self, mut offset: u64, mut length: u64) -> io::Result<()> {
+        // “Fast” path: Try to efficiently zero as much as possible
+        if let Some(gran) = self.inner.zero_granularity() {
+            let end = offset.checked_add(length).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Write-zero wrap-around: {offset} + {length}"),
+                )
+            })?;
+            let mut aligned_start = offset - offset % gran;
+            // Could be handled, but don’t bother
+            let mut aligned_end = end.checked_next_multiple_of(gran).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Write-zero wrap-around at cluster granularity",
+                )
+            })?;
+
+            aligned_end = cmp::min(aligned_end, self.size());
+
+            // Whether the whole area could be efficiently zeroed
+            let mut fully_zeroed = true;
+
+            if offset > aligned_start
+                && !self
+                    .is_range_zero(aligned_start, offset - aligned_start)
+                    .await
+            {
+                // Non-zero head, we cannot zero that cluster.  Still try to zero as much as
+                // possible.
+                fully_zeroed = false;
+                aligned_start += gran;
+            }
+            if end < aligned_end && !self.is_range_zero(end, aligned_end - end).await {
+                // Non-zero tail, we cannot zero that cluster.  Still try to zero as much as
+                // possible.
+                fully_zeroed = false;
+                aligned_end -= gran;
+            }
+
+            while aligned_start < aligned_end {
+                let res = self
+                    .inner
+                    .ensure_zero_mapping(aligned_start, aligned_end - aligned_start)
+                    .await;
+                if let Ok((zofs, zlen)) = res {
+                    if zofs != aligned_start || zlen == 0 {
+                        // Produced a gap, so will need to fall back, but still try to zero as
+                        // much as possible
+                        fully_zeroed = false;
+                        if zlen == 0 {
+                            // Cannot go on
+                            break;
+                        }
+                    }
+                    aligned_start = zofs + zlen;
+                } else {
+                    // Ignore errors, just fall back
+                    fully_zeroed = false;
+                    break;
+                }
+            }
+
+            if fully_zeroed {
+                // Everything zeroed, no need to check
+                return Ok(());
+            }
+        }
+
+        // Slow path: Everything that is not zero in this layer is allocated as data and zeroes are
+        // written.  The more we zeroed in the fast path, the quicker this will be.
         while length > 0 {
             let (mapping, mlen) = self.inner.get_mapping(offset, length).await?;
             let mlen = cmp::min(mlen, length);
 
             let mapping = match mapping {
-                drivers::Mapping::Raw {
+                ShallowMapping::Raw {
                     storage,
                     offset,
                     writable,
                 } => writable.then_some((storage, offset)),
-                drivers::Mapping::Indirect {
+                // For already zero clusters, we don’t need to do anything
+                ShallowMapping::Zero { explicit: true } => {
+                    // Nothing to be done
+                    offset += mlen;
+                    length -= mlen;
+                    continue;
+                }
+                // For unallocated clusters, we should establish zero data
+                ShallowMapping::Zero { explicit: false }
+                | ShallowMapping::Indirect {
                     layer: _,
                     offset: _,
                     writable: _,
                 } => None,
-                drivers::Mapping::Zero => {
-                    if allocate {
-                        None
-                    } else {
-                        offset += mlen;
-                        length -= mlen;
-                        continue;
-                    }
-                }
-                drivers::Mapping::Eof => {
+                ShallowMapping::Eof {} => {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
-                drivers::Mapping::Special { offset: _ } => None,
+                ShallowMapping::Special { offset: _ } => None,
             };
 
             let (file, mofs, mlen) = if let Some((file, mofs)) = mapping {
                 (file, mofs, mlen)
             } else {
-                self.ensure_data_mapping(offset, length, true).await?
+                self.ensure_data_mapping(offset, mlen, true).await?
             };
 
             write_full_zeroes(file, mofs, mlen).await?;
@@ -444,13 +602,12 @@ impl<S: Storage> FormatAccess<S> {
                 break;
             }
             // Fill up head, i.e. the range [offset, zofs)
-            self.soft_ensure_zero(offset, zofs - offset, true).await?;
+            self.soft_ensure_zero(offset, zofs - offset).await?;
             offset = zofs + zlen;
         }
 
         // Fill up tail, i.e. the remaining range [offset, max_offset)
-        self.soft_ensure_zero(offset, max_offset - offset, true)
-            .await?;
+        self.soft_ensure_zero(offset, max_offset - offset).await?;
         Ok(())
     }
 
@@ -480,13 +637,12 @@ impl<S: Storage> FormatAccess<S> {
                 break;
             }
             // Fill up head, i.e. the range [offset, zofs)
-            self.soft_ensure_zero(offset, zofs - offset, false).await?;
+            self.soft_ensure_zero(offset, zofs - offset).await?;
             offset = zofs + zlen;
         }
 
         // Fill up tail, i.e. the remaining range [offset, max_offset)
-        self.soft_ensure_zero(offset, max_offset - offset, false)
-            .await?;
+        self.soft_ensure_zero(offset, max_offset - offset).await?;
         Ok(())
     }
 
@@ -638,7 +794,7 @@ impl<S: Storage> FormatAccess<S> {
 impl<S: Storage> Mapping<'_, S> {
     /// Return `true` if and only if this mapping signifies the end of file.
     pub fn is_eof(&self) -> bool {
-        matches!(self, Mapping::Eof)
+        matches!(self, Mapping::Eof {})
     }
 }
 
@@ -657,15 +813,18 @@ impl<S: Storage> Display for Mapping<'_, S> {
                 writable,
             } => {
                 let writable = if *writable { "rw" } else { "ro" };
-                write!(f, "{}:0x{:x}/{}", storage, offset, writable)
+                write!(f, "{storage}:0x{offset:x}/{writable}")
             }
 
-            Mapping::Zero => write!(f, "<zero>"),
+            Mapping::Zero { explicit } => {
+                let explicit = if *explicit { "explicit" } else { "unallocated" };
+                write!(f, "<zero:{explicit}>")
+            }
 
-            Mapping::Eof => write!(f, "<eof>"),
+            Mapping::Eof {} => write!(f, "<eof>"),
 
             Mapping::Special { layer, offset } => {
-                write!(f, "<special:{}:0x{:x}>", layer, offset)
+                write!(f, "<special:{layer}:0x{offset:x}>")
             }
         }
     }

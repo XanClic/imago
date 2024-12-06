@@ -11,18 +11,18 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         &self,
         offset: GuestOffset,
         max_length: u64,
-    ) -> io::Result<(Mapping<'_, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'_, S>, u64)> {
         let Some(l2_table) = self.get_l2(offset, false).await? else {
             let cb = self.header.cluster_bits();
             let len = cmp::min(offset.remaining_in_l2_table(cb), max_length);
             let mapping = if let Some(backing) = self.backing.as_ref() {
-                Mapping::Indirect {
+                ShallowMapping::Indirect {
                     layer: backing.inner(),
                     offset: offset.0,
                     writable: false,
                 }
             } else {
-                Mapping::Zero
+                ShallowMapping::Zero { explicit: false }
             };
             return Ok((mapping, len));
         };
@@ -37,7 +37,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         offset: GuestOffset,
         max_length: u64,
         l2_table: &L2Table,
-    ) -> io::Result<(Mapping<'_, S>, u64)> {
+    ) -> io::Result<(ShallowMapping<'_, S>, u64)> {
         let cb = self.header.cluster_bits();
 
         // Get mapping at `offset`
@@ -47,7 +47,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             L2Mapping::DataFile {
                 host_cluster,
                 copied,
-            } => Mapping::Raw {
+            } => ShallowMapping::Raw {
                 storage: self.storage(),
                 offset: host_cluster.relative_offset(offset, cb).0,
                 writable: copied,
@@ -55,25 +55,25 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
             L2Mapping::Backing { backing_offset } => {
                 if let Some(backing) = self.backing.as_ref() {
-                    Mapping::Indirect {
+                    ShallowMapping::Indirect {
                         layer: backing.inner(),
                         offset: backing_offset + offset.in_cluster_offset(cb) as u64,
                         writable: false,
                     }
                 } else {
-                    Mapping::Zero
+                    ShallowMapping::Zero { explicit: false }
                 }
             }
 
             L2Mapping::Zero {
                 host_cluster: _,
                 copied: _,
-            } => Mapping::Zero,
+            } => ShallowMapping::Zero { explicit: true },
 
             L2Mapping::Compressed {
                 host_offset: _,
                 length: _,
-            } => Mapping::Special { offset: offset.0 },
+            } => ShallowMapping::Special { offset: offset.0 },
         };
 
         // Find out how long this consecutive mapping is, but only within the current L2 table
@@ -118,7 +118,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let existing = self
             .do_get_mapping_with_l2(offset, length, &l2_table)
             .await?;
-        if let Mapping::Raw {
+        if let ShallowMapping::Raw {
             storage,
             offset,
             writable: true,
@@ -154,13 +154,13 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     ///
     /// Allows zeroing or discarding clusters.  `mapping` says which kind of mapping to create.
     ///
-    /// Return the first cluster affected, and the number of clusters affected (may be 0).
+    /// Return the offset of the first affected cluster, and the byte length affected (may be 0).
     pub(super) async fn ensure_fixed_mapping(
         &self,
         offset: GuestOffset,
         length: u64,
         mapping: FixedMapping,
-    ) -> io::Result<(GuestCluster, ClusterCount)> {
+    ) -> io::Result<(GuestOffset, u64)> {
         match mapping {
             FixedMapping::ZeroDiscard | FixedMapping::ZeroRetainAllocation => {
                 self.header.require_version(3)?;
@@ -172,7 +172,15 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         // We can only touch full clusters
         let cluster_align_mask = self.header.cluster_size() as u64 - 1;
-        let aligned_end = (offset + length).0 & !cluster_align_mask;
+        let end = (offset + length).0;
+        let aligned_end = if end == self.header.size() {
+            // Up-align operations until the image end to a full cluster (the remainder of this
+            // cluster is not used for anything)
+            (end + cluster_align_mask) & !cluster_align_mask
+        } else {
+            // Otherwise, align down (only full clusters)
+            end & !cluster_align_mask
+        };
         let aligned_offset = (offset + cluster_align_mask).0 & !cluster_align_mask;
         let aligned_length = aligned_end.saturating_sub(aligned_offset);
 
@@ -181,7 +189,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let cluster_count = ClusterCount::checked_from_byte_size(aligned_length, cb).unwrap();
 
         if cluster_count.0 == 0 {
-            return Ok((first_cluster, cluster_count));
+            return Ok((GuestOffset(aligned_offset), 0));
         }
 
         let l2_table = self.ensure_l2(first_cluster.offset(cb)).await?;
@@ -202,7 +210,17 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             self.free_data_clusters(alloc.0, alloc.1).await;
         }
 
-        Ok((first_cluster, res?))
+        let count = res?;
+
+        let affected_offset = first_cluster.offset(cb);
+        let affected_length = count.byte_size(cb);
+
+        let head = affected_offset - offset;
+        // We may overshoot for the last cluster in the image, limit the returned value to the
+        // range given by the caller
+        let affected_length = cmp::min(affected_length, length.saturating_sub(head));
+
+        Ok((affected_offset, affected_length))
     }
 
     /// Get the L2 table referenced by the given L1 table index, if any.
@@ -427,6 +445,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let cb = self.header.cluster_bits();
         let mut cluster = first_cluster;
         let end_cluster = first_cluster + count;
+        let mut done = ClusterCount(0);
 
         while cluster < end_cluster {
             let l2i = cluster.l2_index(cb);
@@ -439,13 +458,14 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 leaked_allocations.push(leaked);
             }
 
+            done += ClusterCount(1);
             let Some(next) = cluster.next_in_l2(cb) else {
                 break;
             };
             cluster = next;
         }
 
-        Ok(cluster - first_cluster)
+        Ok(done)
     }
 }
 
