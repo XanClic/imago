@@ -44,7 +44,8 @@
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
-use crate::{PreallocateMode, Storage, StorageOpenOptions};
+use crate::storage::PreallocateMode;
+use crate::{Storage, StorageOpenOptions};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
 use std::ops::{Deref, DerefMut};

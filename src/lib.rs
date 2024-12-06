@@ -103,10 +103,10 @@ pub mod raw;
 pub mod storage;
 mod vector_select;
 
-pub use format::access::*;
+pub use format::access::{FormatAccess, Mapping};
 pub use format::builder::FormatDriverBuilder;
 pub use format::gate::{DenyImplicitOpenGate, PermissiveImplicitOpenGate};
 #[cfg(feature = "sync-wrappers")]
-pub use format::sync_wrappers::*;
+pub use format::sync_wrappers::SyncFormatAccess;
 pub use storage::ext::StorageExt;
-pub use storage::*;
+pub use storage::{DynStorage, Storage, StorageOpenOptions};

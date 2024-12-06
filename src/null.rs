@@ -4,7 +4,8 @@
 
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
-use crate::{PreallocateMode, Storage};
+use crate::storage::PreallocateMode;
+use crate::Storage;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
