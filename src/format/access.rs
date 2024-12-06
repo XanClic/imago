@@ -412,18 +412,106 @@ impl<S: Storage + 'static> FormatAccess<S> {
         self.writev(buf.into(), offset).await
     }
 
+    /// Check whether the given range is zero.
+    ///
+    /// Checks for zero mappings, not zero data (although this might be changed in the future).
+    ///
+    /// Errors are treated as non-zero areas.
+    async fn is_range_zero(&self, mut offset: u64, mut length: u64) -> bool {
+        while length > 0 {
+            match self.get_mapping(offset, length).await {
+                Ok((Mapping::Zero { explicit: _ }, mlen)) => {
+                    offset += mlen;
+                    length -= mlen;
+                }
+                _ => return false,
+            };
+        }
+
+        true
+    }
+
     /// Ensure the given range reads as zeroes, without write-zeroes support.
     ///
     /// Does not require support for efficient zeroing, instead writing zeroes when the range is
     /// not zero yet.  If `allocate` is true, areas that are not currently allocated will be
     /// allocated to write zeroes there; if it is false, unallocated areas that currently read as
     /// zero are left alone.
-    async fn soft_ensure_zero(
-        &self,
-        mut offset: u64,
-        mut length: u64,
-        allocate: bool,
-    ) -> io::Result<()> {
+    ///
+    /// However, can still use efficient zero support if present.
+    ///
+    /// The main use case is to handle unaligned zero requests.  Quite inefficient for large areas.
+    async fn soft_ensure_zero(&self, mut offset: u64, mut length: u64) -> io::Result<()> {
+        // “Fast” path: Try to efficiently zero as much as possible
+        if let Some(gran) = self.inner.zero_granularity() {
+            let end = offset.checked_add(length).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Write-zero wrap-around: {offset} + {length}"),
+                )
+            })?;
+            let mut aligned_start = offset - offset % gran;
+            // Could be handled, but don’t bother
+            let mut aligned_end = end.checked_next_multiple_of(gran).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Write-zero wrap-around at cluster granularity",
+                )
+            })?;
+
+            aligned_end = cmp::min(aligned_end, self.size());
+
+            // Whether the whole area could be efficiently zeroed
+            let mut fully_zeroed = true;
+
+            if offset > aligned_start
+                && !self
+                    .is_range_zero(aligned_start, offset - aligned_start)
+                    .await
+            {
+                // Non-zero head, we cannot zero that cluster.  Still try to zero as much as
+                // possible.
+                fully_zeroed = false;
+                aligned_start += gran;
+            }
+            if end < aligned_end && !self.is_range_zero(end, aligned_end - end).await {
+                // Non-zero tail, we cannot zero that cluster.  Still try to zero as much as
+                // possible.
+                fully_zeroed = false;
+                aligned_end -= gran;
+            }
+
+            while aligned_start < aligned_end {
+                let res = self
+                    .inner
+                    .ensure_zero_mapping(aligned_start, aligned_end - aligned_start)
+                    .await;
+                if let Ok((zofs, zlen)) = res {
+                    if zofs != aligned_start || zlen == 0 {
+                        // Produced a gap, so will need to fall back, but still try to zero as
+                        // much as possible
+                        fully_zeroed = false;
+                        if zlen == 0 {
+                            // Cannot go on
+                            break;
+                        }
+                    }
+                    aligned_start = zofs + zlen;
+                } else {
+                    // Ignore errors, just fall back
+                    fully_zeroed = false;
+                    break;
+                }
+            }
+
+            if fully_zeroed {
+                // Everything zeroed, no need to check
+                return Ok(());
+            }
+        }
+
+        // Slow path: Everything that is not zero in this layer is allocated as data and zeroes are
+        // written.  The more we zeroed in the fast path, the quicker this will be.
         while length > 0 {
             let (mapping, mlen) = self.inner.get_mapping(offset, length).await?;
             let mlen = cmp::min(mlen, length);
@@ -434,20 +522,20 @@ impl<S: Storage + 'static> FormatAccess<S> {
                     offset,
                     writable,
                 } => writable.then_some((storage, offset)),
-                drivers::Mapping::Indirect {
+                // For already zero clusters, we don’t need to do anything
+                drivers::Mapping::Zero { explicit: true } => {
+                    // Nothing to be done
+                    offset += mlen;
+                    length -= mlen;
+                    continue;
+                }
+                // For unallocated clusters, we should establish zero data
+                drivers::Mapping::Zero { explicit: false }
+                | drivers::Mapping::Indirect {
                     layer: _,
                     offset: _,
                     writable: _,
                 } => None,
-                drivers::Mapping::Zero { explicit: _ } => {
-                    if allocate {
-                        None
-                    } else {
-                        offset += mlen;
-                        length -= mlen;
-                        continue;
-                    }
-                }
                 drivers::Mapping::Eof {} => {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
@@ -457,7 +545,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
             let (file, mofs, mlen) = if let Some((file, mofs)) = mapping {
                 (file, mofs, mlen)
             } else {
-                self.ensure_data_mapping(offset, length, true).await?
+                self.ensure_data_mapping(offset, mlen, true).await?
             };
 
             write_full_zeroes(file, mofs, mlen).await?;
@@ -493,13 +581,12 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 break;
             }
             // Fill up head, i.e. the range [offset, zofs)
-            self.soft_ensure_zero(offset, zofs - offset, true).await?;
+            self.soft_ensure_zero(offset, zofs - offset).await?;
             offset = zofs + zlen;
         }
 
         // Fill up tail, i.e. the remaining range [offset, max_offset)
-        self.soft_ensure_zero(offset, max_offset - offset, true)
-            .await?;
+        self.soft_ensure_zero(offset, max_offset - offset).await?;
         Ok(())
     }
 
@@ -529,13 +616,12 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 break;
             }
             // Fill up head, i.e. the range [offset, zofs)
-            self.soft_ensure_zero(offset, zofs - offset, false).await?;
+            self.soft_ensure_zero(offset, zofs - offset).await?;
             offset = zofs + zlen;
         }
 
         // Fill up tail, i.e. the remaining range [offset, max_offset)
-        self.soft_ensure_zero(offset, max_offset - offset, false)
-            .await?;
+        self.soft_ensure_zero(offset, max_offset - offset).await?;
         Ok(())
     }
 

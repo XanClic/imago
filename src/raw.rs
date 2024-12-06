@@ -93,6 +93,10 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
         self.size.load(Ordering::Relaxed)
     }
 
+    fn zero_granularity(&self) -> Option<u64> {
+        None
+    }
+
     fn collect_storage_dependencies(&self) -> Vec<&S> {
         vec![&self.inner]
     }

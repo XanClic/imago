@@ -429,6 +429,11 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.header.size()
     }
 
+    fn zero_granularity(&self) -> Option<u64> {
+        self.header.require_version(3).ok()?;
+        Some(self.header.cluster_size() as u64)
+    }
+
     fn collect_storage_dependencies(&self) -> Vec<&S> {
         let mut v = self
             .backing

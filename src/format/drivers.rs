@@ -58,6 +58,15 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// Size of the disk represented by this image.
     fn size(&self) -> u64;
 
+    /// Granularity on which blocks can be marked as zero.
+    ///
+    /// This is the granularity for [`FormatDriverInstance::ensure_zero_mapping()`].
+    ///
+    /// Return `None` if zero blocks are not supported.
+    fn zero_granularity(&self) -> Option<u64> {
+        None
+    }
+
     /// Recursively collect all storage objects associated with this image.
     ///
     /// “Recursive” means to recurse to other images like e.g. a backing file.
