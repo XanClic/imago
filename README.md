@@ -28,17 +28,13 @@ use imago::null::Null;
 use imago::qcow2::Qcow2;
 use imago::raw::Raw;
 use imago::{
-    DenyImplicitOpenGate, DynStorage, FormatAccess, FormatDriverBuilder, Storage,
-    StorageOpenOptions,
+    DenyImplicitOpenGate, DynStorage, FormatAccess, FormatDriverBuilder,
+    PermissiveImplicitOpenGate, Storage, StorageOpenOptions,
 };
 use std::sync::Arc;
 
-let qcow2_file_opts = StorageOpenOptions::new()
-    .write(true)
-    .filename(String::from("image.qcow2"));
-let qcow2_file = File::open(qcow2_file_opts).await?;
-
 // Produce qcow2 instance with arbitrary (and potentially mixed) storage instances
+// (By using `Box<dyn DynStorage>` as the `Storage` type.)
 
 let backing_storage: Box<dyn DynStorage> = Box::new(Null::new(0));
 let backing = Raw::builder(backing_storage)
@@ -46,10 +42,17 @@ let backing = Raw::builder(backing_storage)
     .await?;
 let backing = Arc::new(FormatAccess::new(backing));
 
+// `Box<dyn DynStorage>::open()` defaults to using the `imago::file::File` driver, so we can
+// use paths with `Box<dyn DynStorage>`, too.
+// Despite explicitly setting a backing image, we still need `PermissiveImplicitOpenGate`
+// instead of `DenyImplicitOpenGate`, because `builder_path()` will need to implicitly open
+// that storage object.  Passing an explicitly opened storage object via `builder()` would
+// remedy that.
 let qcow2 = Qcow2::builder_path("image.qcow2")
     .storage_open_options(StorageOpenOptions::new().direct(true))
+    .write(true)
     .backing(Some(Arc::clone(&backing)))
-    .open(DenyImplicitOpenGate::default())
+    .open(PermissiveImplicitOpenGate::default())
     .await?;
 
 let qcow2 = FormatAccess::new(qcow2);
