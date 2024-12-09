@@ -3,7 +3,7 @@
 use super::drivers::FormatDriverInstance;
 use super::gate::ImplicitOpenGate;
 use super::wrapped::WrappedFormat;
-use super::Format;
+use super::{Format, PreallocateMode};
 use crate::misc_helpers::ResultErrorContext;
 use crate::qcow2::Qcow2OpenBuilder;
 use crate::raw::RawOpenBuilder;
@@ -99,6 +99,58 @@ pub trait FormatDriverBuilder<S: Storage>: Sized {
     fn get_storage_open_options(&self) -> Option<&StorageOpenOptions>;
 }
 
+/// Prepares creating (formatting) an image.
+///
+/// There are common options for all kinds of formats, which are accessible through this trait’s
+/// methods, but there are also specialized options that depend on the format itself.  Each
+/// implementation will provide such specialized methods.
+///
+/// See [`Qcow2CreateBuilder`](crate::qcow2::Qcow2CreateBuilder) for an example implementation.
+pub trait FormatCreateBuilder<S: Storage>: Sized {
+    /// Which format this is.
+    const FORMAT: Format;
+
+    /// Open builder type for this format.
+    type DriverBuilder: FormatDriverBuilder<S>;
+
+    /// Prepare formatting the given image file.
+    fn new(image: S) -> Self;
+
+    /// Set the virtual disk size.
+    fn size(self, size: u64) -> Self;
+
+    /// Set the desired preallocation mode.
+    fn preallocate(self, prealloc_mode: PreallocateMode) -> Self;
+
+    /// Format the image file.
+    ///
+    /// Formats the underlying image file according to the options specified in `self`.
+    ///
+    /// This will delete any currently present data in the image!
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn create(self) -> io::Result<()>;
+
+    /// Format the image file and open it.
+    ///
+    /// Same as [`FormatCreateBuilder::create()`], but also opens the image file.
+    ///
+    /// Note that the image file will always be opened as writable, regardless of whether this was
+    /// set in `open_builder` or not.  This is because formatting requires the image to be
+    /// writable.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn create_open<G: ImplicitOpenGate<S>, F: FnOnce(S) -> io::Result<Self::DriverBuilder>>(
+        self,
+        open_gate: G,
+        open_builder_fn: F,
+    ) -> io::Result<<Self::DriverBuilder as FormatDriverBuilder<S>>::Format>;
+
+    /// Get the set virtual disk size.
+    fn get_size(&self) -> u64;
+
+    /// Get the preallocation mode.
+    fn get_preallocate(&self) -> PreallocateMode;
+}
+
 /// Image open builder with the most basic options.
 pub struct FormatDriverBuilderBase<S: Storage> {
     /// Metadata (image) file
@@ -109,6 +161,18 @@ pub struct FormatDriverBuilderBase<S: Storage> {
 
     /// Options to be used for implicitly opened storage
     storage_opts: Option<StorageOpenOptions>,
+}
+
+/// Image creation builder with the most basic options.
+pub struct FormatCreateBuilderBase<S: Storage> {
+    /// Metadata (image) file
+    image: S,
+
+    /// Virtual disk size
+    size: u64,
+
+    /// Preallocation mode
+    prealloc_mode: PreallocateMode,
 }
 
 impl<S: Storage> FormatDriverBuilderBase<S> {
@@ -176,6 +240,47 @@ impl<S: Storage> FormatDriverBuilderBase<S> {
     pub async fn open_image<G: ImplicitOpenGate<S>>(self, gate: &mut G) -> io::Result<S> {
         let opts = self.make_storage_opts();
         self.image.open_storage(opts, gate).await
+    }
+}
+
+impl<S: Storage> FormatCreateBuilderBase<S> {
+    /// Helper for [`FormatCreateBuilder::new()`].
+    pub fn new(image: S) -> Self {
+        FormatCreateBuilderBase {
+            image,
+            size: 0,
+            prealloc_mode: PreallocateMode::None,
+        }
+    }
+
+    /// Helper for [`FormatCreateBuilder::size()`].
+    pub fn set_size(&mut self, size: u64) {
+        self.size = size;
+    }
+
+    /// Helper for [`FormatCreateBuilder::preallocate()`].
+    pub fn set_preallocate(&mut self, prealloc_mode: PreallocateMode) {
+        self.prealloc_mode = prealloc_mode;
+    }
+
+    /// Get the set virtual disk size.
+    pub fn get_size(&self) -> u64 {
+        self.size
+    }
+
+    /// Get the preallocation mode.
+    pub fn get_preallocate(&self) -> PreallocateMode {
+        self.prealloc_mode
+    }
+
+    /// Get the image file to be formatted.
+    pub fn get_image(self) -> S {
+        self.image
+    }
+
+    /// Get the image file to be formatted, by reference.
+    pub fn get_image_ref(&self) -> &S {
+        &self.image
     }
 }
 
