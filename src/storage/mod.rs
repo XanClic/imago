@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 /// Parameters from which a storage object can be constructed.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct StorageOpenOptions {
     /// Filename to open.
     pub(crate) filename: Option<PathBuf>,
@@ -27,6 +27,24 @@ pub struct StorageOpenOptions {
 
     /// Whether to bypass the host page cache (if applicable).
     pub(crate) direct: bool,
+}
+
+/// Parameters from which a new storage object can be created.
+#[derive(Clone, Debug)]
+pub struct StorageCreateOptions {
+    /// Options to open the image, includes the filename.
+    ///
+    /// `writable` should be ignored, created files should always be opened as writable.
+    pub(crate) open_opts: StorageOpenOptions,
+
+    /// Initial size.
+    pub(crate) size: u64,
+
+    /// Preallocation mode.
+    pub(crate) prealloc_mode: PreallocateMode,
+
+    /// Whether to overwrite an existing file.
+    pub(crate) overwrite: bool,
 }
 
 /// Implementation for storage objects.
@@ -51,6 +69,31 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(Self::open(opts))
+    }
+
+    /// Create a storage object and open it.
+    ///
+    /// Different storage implementations may require different options.
+    ///
+    /// Note that newly created storage objects are always opened as writable.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn create_open(_opts: StorageCreateOptions) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Cannot create storage objects of type {}",
+                std::any::type_name::<Self>()
+            ),
+        ))
+    }
+
+    /// Create a storage object.
+    ///
+    /// Different storage implementations may require different options.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn create(opts: StorageCreateOptions) -> io::Result<()> {
+        Self::create_open(opts).await?;
+        Ok(())
     }
 
     /// Minimum required alignment for memory buffers.
@@ -495,6 +538,11 @@ impl Storage for Box<dyn DynStorage> {
         Ok(Box::new(crate::file::File::open(opts).await?))
     }
 
+    async fn create_open(opts: StorageCreateOptions) -> io::Result<Self> {
+        // Same as `Self::open()`.
+        Ok(Box::new(crate::file::File::create_open(opts).await?))
+    }
+
     fn mem_align(&self) -> usize {
         self.as_ref().dyn_mem_align()
     }
@@ -563,6 +611,12 @@ impl Storage for Box<dyn DynStorage> {
 impl Storage for Arc<dyn DynStorage> {
     async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
         Box::<dyn DynStorage>::open(opts).await.map(Into::into)
+    }
+
+    async fn create_open(opts: StorageCreateOptions) -> io::Result<Self> {
+        Box::<dyn DynStorage>::create_open(opts)
+            .await
+            .map(Into::into)
     }
 
     fn mem_align(&self) -> usize {
@@ -667,5 +721,80 @@ impl StorageOpenOptions {
     /// Return the set direct state.
     pub fn get_direct(&self) -> bool {
         self.direct
+    }
+}
+
+impl StorageCreateOptions {
+    /// Create default options.
+    pub fn new() -> Self {
+        StorageCreateOptions::default()
+    }
+
+    /// Set the filename of the file to create.
+    pub fn filename<P: AsRef<Path>>(self, filename: P) -> Self {
+        self.modify_open_opts(|o| o.filename(filename))
+    }
+
+    /// Set the initial size.
+    pub fn size(mut self, size: u64) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Set the desired preallocation mode.
+    pub fn preallocate(mut self, prealloc_mode: PreallocateMode) -> Self {
+        self.prealloc_mode = prealloc_mode;
+        self
+    }
+
+    /// Whether to overwrite an existing file.
+    pub fn overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
+        self
+    }
+
+    /// Modify the options used for opening the file.
+    pub fn modify_open_opts<F: FnOnce(StorageOpenOptions) -> StorageOpenOptions>(
+        mut self,
+        f: F,
+    ) -> Self {
+        self.open_opts = f(self.open_opts);
+        self
+    }
+
+    /// Get the set filename (if any).
+    pub fn get_filename(&self) -> Option<&Path> {
+        self.open_opts.filename.as_deref()
+    }
+
+    /// Get the set size.
+    pub fn get_size(&self) -> u64 {
+        self.size
+    }
+
+    /// Get the preallocation mode.
+    pub fn get_preallocate(&self) -> PreallocateMode {
+        self.prealloc_mode
+    }
+
+    /// Check whether to overwrite an existing file.
+    pub fn get_overwrite(&self) -> bool {
+        self.overwrite
+    }
+
+    /// Get the options for opening the created file.
+    pub fn get_open_options(self) -> StorageOpenOptions {
+        self.open_opts
+    }
+}
+
+impl Default for StorageCreateOptions {
+    fn default() -> Self {
+        StorageCreateOptions {
+            open_opts: Default::default(),
+            size: 0,
+            prealloc_mode: PreallocateMode::None,
+            overwrite: false,
+        }
     }
 }
