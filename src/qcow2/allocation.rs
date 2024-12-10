@@ -54,7 +54,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         &self,
         count: ClusterCount,
     ) -> io::Result<HostCluster> {
-        self.allocator().await?.allocate_clusters(count).await
+        self.allocator().await?.allocate_clusters(count, None).await
     }
 
     /// Allocate one data clusters for the given guest cluster.
@@ -77,7 +77,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             // Allocate clusters before setting up L2 entries
             self.l2_cache.depend_on(&allocator.rb_cache).await?;
 
-            allocator.allocate_clusters(ClusterCount(1)).await
+            allocator.allocate_clusters(ClusterCount(1), None).await
         }
     }
 
@@ -181,14 +181,23 @@ impl<S: Storage> Allocator<S> {
     }
 
     /// Allocate clusters in the image file.
-    async fn allocate_clusters(&mut self, count: ClusterCount) -> io::Result<HostCluster> {
+    ///
+    /// `end_cluster` should only be used when allocating refblocks.  When reaching this cluster
+    /// index, abort trying to allocate.  (This is used for allocating refblocks, to prevent
+    /// infinite recursion and speed things up.)
+    async fn allocate_clusters(
+        &mut self,
+        count: ClusterCount,
+        end_cluster: Option<HostCluster>,
+    ) -> io::Result<HostCluster> {
         let mut index = self.first_free_cluster;
         loop {
+            if end_cluster == Some(index) {
+                return Err(io::Error::other("Maximum cluster index reached"));
+            }
+
             let alloc_count = self.allocate_clusters_at(index, count).await?;
             if alloc_count == count {
-                if count == ClusterCount(1) || index == self.first_free_cluster {
-                    self.first_free_cluster = index + count;
-                }
                 return Ok(index);
             }
 
@@ -217,16 +226,39 @@ impl<S: Storage> Allocator<S> {
         let start_index = index;
 
         while count > ClusterCount(0) {
-            match self.allocate_cluster_at(index).await {
-                // Successful allocation
-                Ok(true) => (),
+            // Note that `ensure_rb()` in `allocate_cluster_at()` may allocate clusters (new
+            // refblocks), and also a new refcount table.  This can interfere with us allocating a
+            // large continuous region like so (A is our allocation, R is a refblock, imagine a
+            // refblock covers four clusters):
+            //
+            // |AAAA| -- allocated four clusters need new refblock
+            // |AAAA|R   | -- made refblock self-describing, but now allocation cannot go on
+            //
+            // This gets resolved by us retrying, and future refblocks using the region that has
+            // now become free but already has refblocks to cover it:
+            //
+            // |    |RAAA| -- retry after refblock; need a new refblock again
+            // |R   |RAAA|AAAA| -- the new refblock allocates itself in the region we abandoned
+            //
+            // However, eventually, the new refblocks will run into the new start of our allocation
+            // again:
+            //
+            // |RRRR|RAAA|AAAA|AAAA|AAAA|AAAA| -- need new refblock
+            // |RRRR|RAAA|AAAA|AAAA|AAAA|AAAA|R   | -- allocation cannot go on, again
+            // |RRRR|R   |    |    |    |    |RAAA| -- another attempt
+            // |RRRR|RRRR|R...|    |    |    |RAAA|AAAA|AAAA|AAAA|AAAA|...
+            //
+            // As you can see, the hole we leave behind gets larger each time.  So eventually, this
+            // must converge.
+            //
+            // The same applies to the refcount table being allocated instead of just refblocks.
 
-                // Already allocated, or some real error occurred
-                result => {
-                    self.free_clusters(start_index, index - start_index).await;
-                    return result.map(|_| index - start_index);
-                }
-            };
+            let result = self.allocate_cluster_at(index).await;
+            if !matches!(result, Ok(true)) {
+                // Already allocated, or some real error occurred; free everything allocated so far
+                self.free_clusters(start_index, index - start_index).await;
+                return result.map(|_| index - start_index);
+            }
 
             count -= ClusterCount(1);
             index += ClusterCount(1);
@@ -245,11 +277,17 @@ impl<S: Storage> Allocator<S> {
 
         let rb = self.ensure_rb(rt_index).await?;
         let mut rb = rb.lock_write().await;
-        if !rb.is_zero(rb_index) {
-            return Ok(false);
+        let can_allocate = rb.is_zero(rb_index);
+        if can_allocate {
+            rb.increment(rb_index)?;
         }
-        rb.increment(rb_index)?;
-        Ok(true)
+
+        // We now know this is allocated
+        if index == self.first_free_cluster {
+            self.first_free_cluster = index + ClusterCount(1);
+        }
+
+        Ok(can_allocate)
     }
 
     /// Get the refblock referenced by the given reftable index, if any.
@@ -289,23 +327,39 @@ impl<S: Storage> Allocator<S> {
             }
         }
 
-        let mut rb = RefBlock::new_cleared(self.file.as_ref(), &self.header)?;
+        let mut new_rb = RefBlock::new_cleared(self.file.as_ref(), &self.header)?;
 
-        // When allocating new refblocks, we always place them such that they describe themselves.
-        // TODO: There may be more efficient ways, this is just quite an easy one.
+        // This is the first cluster covered by the new refblock
         let rb_cluster = HostCluster::from_ref_indices(rt_index, 0, self.header.rb_bits());
-        rb.set_cluster(rb_cluster);
-        rb.lock_write().await.increment(0)?;
-        rb.write(self.file.as_ref()).await?;
 
-        self.reftable.enter_refblock(rt_index, &rb)?;
+        // Try to allocate a cluster in the already existing refcount structures.
+        // By stopping looking for clusters at `rb_cluster`, we ensure that we will not land here
+        // in this exact function again, trying to allocate the very same refblock (it is possible
+        // we allocate one before the current one, though), and so prevent any possible infinite
+        // recursion.
+        // Recursion is possible, though, so the future must be boxed.
+        // false`), so must be boxed.
+        if let Ok(new_rb_cluster) =
+            Box::pin(self.allocate_clusters(ClusterCount(1), Some(rb_cluster))).await
+        {
+            new_rb.set_cluster(new_rb_cluster);
+        } else {
+            // Place the refblock such that it covers itself
+            new_rb.set_cluster(rb_cluster);
+            new_rb.lock_write().await.increment(0)?;
+        }
+        new_rb.write(self.file.as_ref()).await?;
+
+        self.reftable.enter_refblock(rt_index, &new_rb)?;
         self.reftable
             .write_entry(self.file.as_ref(), rt_index)
             .await?;
 
-        let rb = Arc::new(rb);
-        self.rb_cache.insert(rb_cluster, Arc::clone(&rb)).await?;
-        Ok(rb)
+        let new_rb = Arc::new(new_rb);
+        self.rb_cache
+            .insert(new_rb.get_cluster().unwrap(), Arc::clone(&new_rb))
+            .await?;
+        Ok(new_rb)
     }
 
     /// Create a new refcount table covering at least `at_least_index`.
@@ -447,6 +501,10 @@ impl<S: Storage> Allocator<S> {
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
     async fn free_clusters(&mut self, start: HostCluster, mut count: ClusterCount) {
+        if count.0 == 0 {
+            return;
+        }
+
         if start < self.first_free_cluster {
             self.first_free_cluster = start;
         }
