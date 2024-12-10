@@ -195,9 +195,6 @@ impl<S: Storage> Allocator<S> {
         loop {
             let alloc_count = self.allocate_clusters_at(index, count).await?;
             if alloc_count == count {
-                if count == ClusterCount(1) || index == self.first_free_cluster {
-                    self.first_free_cluster = index + count;
-                }
                 return Ok(index);
             }
 
@@ -254,11 +251,17 @@ impl<S: Storage> Allocator<S> {
 
         let rb = self.ensure_rb(rt_index).await?;
         let mut rb = rb.lock_write().await;
-        if !rb.is_zero(rb_index) {
-            return Ok(false);
+        let can_allocate = rb.is_zero(rb_index);
+        if can_allocate {
+            rb.increment(rb_index)?;
         }
-        rb.increment(rb_index)?;
-        Ok(true)
+
+        // We now know this is allocated
+        if index == self.first_free_cluster {
+            self.first_free_cluster = index + ClusterCount(1);
+        }
+
+        Ok(can_allocate)
     }
 
     /// Get the refblock referenced by the given reftable index, if any.
@@ -456,6 +459,10 @@ impl<S: Storage> Allocator<S> {
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
     async fn free_clusters(&mut self, start: HostCluster, mut count: ClusterCount) {
+        if count.0 == 0 {
+            return;
+        }
+
         if start < self.first_free_cluster {
             self.first_free_cluster = start;
         }
