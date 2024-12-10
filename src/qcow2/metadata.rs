@@ -788,11 +788,12 @@ impl HeaderExtension {
                             Ok(ft) => ft,
                             Err(_) => continue, // skip unrecognized entries
                         };
-                        let feat_name = String::from(
-                            String::from_utf8_lossy(&feat[2..]).trim_end_matches('\0'),
-                        );
-
-                        feats.insert((feat_type, feat[1]), feat_name);
+                        // Cannot use CStr to parse this, as it may not be NUL-terminated.
+                        // Use this to remove everything from the first NUL byte.
+                        let feat_name_bytes = feat[2..].split(|c| *c == 0).next().unwrap();
+                        // Then just use it as a UTF-8 string.
+                        let feat_name = String::from_utf8_lossy(feat_name_bytes);
+                        feats.insert((feat_type, feat[1]), feat_name.to_string());
                     }
                     HeaderExtension::FeatureNameTable(feats)
                 }
