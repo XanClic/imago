@@ -113,8 +113,8 @@ impl Storage for File {
         Ok(dirname.join(relative))
     }
 
-    fn get_filename(&self) -> Option<&Path> {
-        self.filename.as_deref()
+    fn get_filename(&self) -> Option<PathBuf> {
+        self.filename.as_ref().cloned()
     }
 
     #[cfg(unix)]

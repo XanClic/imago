@@ -116,7 +116,7 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         self.inner.resolve_relative_path(relative)
     }
 
-    fn get_filename(&self) -> Option<&Path> {
+    fn get_filename(&self) -> Option<PathBuf> {
         self.inner.get_filename()
     }
 

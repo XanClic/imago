@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::format::builder::{FormatDriverBuilderBase, FormatOrBuilder, StorageOrPath};
+use std::path::PathBuf;
 
 /// Options builder for opening a qcow2 image.
 ///
@@ -141,7 +142,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverBuilder<S>
         Ok(qcow2)
     }
 
-    fn get_image_path(&self) -> Option<&Path> {
+    fn get_image_path(&self) -> Option<PathBuf> {
         self.base.get_image_path()
     }
 

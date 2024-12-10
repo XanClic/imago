@@ -10,7 +10,7 @@ use crate::{storage, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Wraps a storage object without any translation.
@@ -281,7 +281,7 @@ impl<S: Storage + 'static> FormatDriverBuilder<S> for RawOpenBuilder<S> {
         Raw::open_image(file, writable).await
     }
 
-    fn get_image_path(&self) -> Option<&Path> {
+    fn get_image_path(&self) -> Option<PathBuf> {
         self.0.get_image_path()
     }
 

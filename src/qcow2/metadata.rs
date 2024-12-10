@@ -270,8 +270,8 @@ pub(super) struct Header {
 impl Header {
     /// Load the qcow2 header from disk.
     ///
-    /// If `read_only` is true, do not perform any modifications (e.g. clearing auto-clear bits).
-    pub async fn load<S: Storage>(image: &S, read_only: bool) -> io::Result<Self> {
+    /// If `writable` is false, do not perform any modifications (e.g. clearing auto-clear bits).
+    pub async fn load<S: Storage>(image: &S, writable: bool) -> io::Result<Self> {
         // TODO: More sanity checks.
         let bincode = bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -469,7 +469,7 @@ impl Header {
         };
 
         // No need to clear autoclear features for read-only images
-        if autoclear_features != 0 && !read_only {
+        if autoclear_features != 0 && writable {
             header.v3.autoclear_features = 0;
             header.write(image).await?;
         }
@@ -914,11 +914,12 @@ impl HeaderExtension {
                             Ok(ft) => ft,
                             Err(_) => continue, // skip unrecognized entries
                         };
-                        let feat_name = String::from(
-                            String::from_utf8_lossy(&feat[2..]).trim_end_matches('\0'),
-                        );
-
-                        feats.insert((feat_type, feat[1]), feat_name);
+                        // Cannot use CStr to parse this, as it may not be NUL-terminated.
+                        // Use this to remove everything from the first NUL byte.
+                        let feat_name_bytes = feat[2..].split(|c| *c == 0).next().unwrap();
+                        // Then just use it as a UTF-8 string.
+                        let feat_name = String::from_utf8_lossy(feat_name_bytes);
+                        feats.insert((feat_type, feat[1]), feat_name.to_string());
                     }
                     HeaderExtension::FeatureNameTable(feats)
                 }
@@ -1078,9 +1079,10 @@ pub(super) struct L1Table {
 impl L1Table {
     /// Create a clone that covers at least `at_least_index`.
     pub fn clone_and_grow(&self, at_least_index: usize, header: &Header) -> Self {
-        let new_size = cmp::max(at_least_index + 1, self.data.len());
-        let new_size = new_size.next_multiple_of(header.cluster_size());
-        let mut new_data = vec![L1Entry::default(); new_size];
+        let new_entry_count = cmp::max(at_least_index + 1, self.data.len());
+        let new_entry_count =
+            new_entry_count.next_multiple_of(header.cluster_size() / size_of::<L1Entry>());
+        let mut new_data = vec![L1Entry::default(); new_entry_count];
         new_data[..self.data.len()].copy_from_slice(&self.data);
 
         Self {
