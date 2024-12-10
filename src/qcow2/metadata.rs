@@ -270,8 +270,8 @@ pub(super) struct Header {
 impl Header {
     /// Load the qcow2 header from disk.
     ///
-    /// If `read_only` is true, do not perform any modifications (e.g. clearing auto-clear bits).
-    pub async fn load<S: Storage>(image: &S, read_only: bool) -> io::Result<Self> {
+    /// If `writable` is false, do not perform any modifications (e.g. clearing auto-clear bits).
+    pub async fn load<S: Storage>(image: &S, writable: bool) -> io::Result<Self> {
         let bincode = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_big_endian();
@@ -448,7 +448,7 @@ impl Header {
         };
 
         // No need to clear autoclear features for read-only images
-        if autoclear_features != 0 && !read_only {
+        if autoclear_features != 0 && writable {
             header.v3.autoclear_features = 0;
             header.write(image).await?;
         }
