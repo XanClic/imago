@@ -1078,9 +1078,10 @@ pub(super) struct L1Table {
 impl L1Table {
     /// Create a clone that covers at least `at_least_index`.
     pub fn clone_and_grow(&self, at_least_index: usize, header: &Header) -> Self {
-        let new_size = cmp::max(at_least_index + 1, self.data.len());
-        let new_size = new_size.next_multiple_of(header.cluster_size());
-        let mut new_data = vec![L1Entry::default(); new_size];
+        let new_entry_count = cmp::max(at_least_index + 1, self.data.len());
+        let new_entry_count =
+            new_entry_count.next_multiple_of(header.cluster_size() / size_of::<L1Entry>());
+        let mut new_data = vec![L1Entry::default(); new_entry_count];
         new_data[..self.data.len()].copy_from_slice(&self.data);
 
         Self {
