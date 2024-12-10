@@ -36,6 +36,7 @@ use types::*;
 /// - Metadata storage object: The image file itself
 /// - Data file (storage object): May be the image file itself, or an external data file
 /// - Backing image `WrappedFormat<S>`: A backing disk image in any format
+#[must_use = "qcow2 images must be flushed before closing"]
 pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAccess<S>> {
     /// Image file (which contains the qcow2 metadata).
     metadata: Arc<S>,
