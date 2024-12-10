@@ -90,7 +90,7 @@ pub trait FormatDriverBuilder<S: Storage>: Sized {
     }
 
     /// If possible, get the image’s path.
-    fn get_image_path(&self) -> Option<&Path>;
+    fn get_image_path(&self) -> Option<PathBuf>;
 
     /// Return the set writable state.
     fn get_writable(&self) -> bool;
@@ -142,10 +142,10 @@ impl<S: Storage> FormatDriverBuilderBase<S> {
     }
 
     /// If possible, get the image’s path.
-    pub fn get_image_path(&self) -> Option<&Path> {
+    pub fn get_image_path(&self) -> Option<PathBuf> {
         match &self.image {
             StorageOrPath::Storage(s) => s.get_filename(),
-            StorageOrPath::Path(p) => Some(p.as_ref()),
+            StorageOrPath::Path(p) => Some(p.clone()),
         }
     }
 

@@ -93,7 +93,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     ///
     /// Using the filename for [`StorageOpenOptions::filename()`] should open the same storage
     /// object.
-    fn get_filename(&self) -> Option<&Path> {
+    fn get_filename(&self) -> Option<PathBuf> {
         None
     }
 
@@ -241,7 +241,7 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
     fn dyn_resolve_relative_path(&self, relative: &Path) -> io::Result<PathBuf>;
 
     /// Wrapper around [`Storage::get_filename()`]
-    fn dyn_get_filename(&self) -> Option<&Path>;
+    fn dyn_get_filename(&self) -> Option<PathBuf>;
 
     /// Object-safe wrapper around [`Storage::pure_readv()`].
     ///
@@ -360,7 +360,7 @@ impl<S: Storage> Storage for &S {
         (*self).resolve_relative_path(relative)
     }
 
-    fn get_filename(&self) -> Option<&Path> {
+    fn get_filename(&self) -> Option<PathBuf> {
         (*self).get_filename()
     }
 
@@ -426,7 +426,7 @@ impl<S: Storage + 'static> DynStorage for S {
         <S as Storage>::resolve_relative_path(self, relative)
     }
 
-    fn dyn_get_filename(&self) -> Option<&Path> {
+    fn dyn_get_filename(&self) -> Option<PathBuf> {
         <S as Storage>::get_filename(self)
     }
 
@@ -519,7 +519,7 @@ impl Storage for Box<dyn DynStorage> {
         self.as_ref().dyn_resolve_relative_path(relative.as_ref())
     }
 
-    fn get_filename(&self) -> Option<&Path> {
+    fn get_filename(&self) -> Option<PathBuf> {
         self.as_ref().dyn_get_filename()
     }
 
@@ -589,7 +589,7 @@ impl Storage for Arc<dyn DynStorage> {
         self.as_ref().dyn_resolve_relative_path(relative.as_ref())
     }
 
-    fn get_filename(&self) -> Option<&Path> {
+    fn get_filename(&self) -> Option<PathBuf> {
         self.as_ref().dyn_get_filename()
     }
 
