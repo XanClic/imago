@@ -253,16 +253,12 @@ impl<S: Storage> Allocator<S> {
             //
             // The same applies to the refcount table being allocated instead of just refblocks.
 
-            match self.allocate_cluster_at(index).await {
-                // Successful allocation
-                Ok(true) => (),
-
-                // Already allocated, or some real error occurred
-                result => {
-                    self.free_clusters(start_index, index - start_index).await;
-                    return result.map(|_| index - start_index);
-                }
-            };
+            let result = self.allocate_cluster_at(index).await;
+            if !matches!(result, Ok(true)) {
+                // Already allocated, or some real error occurred; free everything allocated so far
+                self.free_clusters(start_index, index - start_index).await;
+                return result.map(|_| index - start_index);
+            }
 
             count -= ClusterCount(1);
             index += ClusterCount(1);
