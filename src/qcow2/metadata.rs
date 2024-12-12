@@ -3,11 +3,11 @@
 use super::types::*;
 use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
+use crate::misc_helpers::invalid_data;
 use crate::{Storage, StorageExt};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::ErrorKind::InvalidData;
 use std::mem::size_of;
 use std::num::TryFromIntError;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -280,11 +280,9 @@ impl Header {
         let mut header_buf = vec![0u8; V2Header::RAW_SIZE];
         image.read(header_buf.as_mut_slice(), 0).await?;
 
-        let header: V2Header = bincode
-            .deserialize(&header_buf)
-            .map_err(|err| io::Error::new(InvalidData, err))?;
+        let header: V2Header = bincode.deserialize(&header_buf).map_err(invalid_data)?;
         if header.magic != MAGIC {
-            return Err(io::Error::new(InvalidData, "Not a qcow2 file"));
+            return Err(invalid_data("Not a qcow2 file"));
         }
 
         let v3header_base = if header.version == 2 {
@@ -294,25 +292,20 @@ impl Header {
             image
                 .read(header_buf.as_mut_slice(), V2Header::RAW_SIZE as u64)
                 .await?;
-            bincode
-                .deserialize(&header_buf)
-                .map_err(|err| io::Error::new(InvalidData, err))?
+            bincode.deserialize(&header_buf).map_err(invalid_data)?
         } else {
-            return Err(io::Error::new(
-                InvalidData,
-                format!("qcow2 v{} is not supported", header.version),
-            ));
+            return Err(invalid_data(format!(
+                "qcow2 v{} is not supported",
+                header.version
+            )));
         };
 
         let min_header_size = V2Header::RAW_SIZE + V3HeaderBase::RAW_SIZE;
         if (v3header_base.header_length as usize) < min_header_size {
-            return Err(io::Error::new(
-                InvalidData,
-                format!(
-                    "qcow2 header too short: {} < {}",
-                    v3header_base.header_length, min_header_size,
-                ),
-            ));
+            return Err(invalid_data(format!(
+                "qcow2 header too short: {} < {}",
+                v3header_base.header_length, min_header_size,
+            )));
         }
 
         let unknown_header_fields = if header.version == 2 {
@@ -331,39 +324,26 @@ impl Header {
         let l1_offset = HostOffset(header.l1_table_offset.load(Ordering::Relaxed));
         l1_offset
             .checked_cluster(header.cluster_bits)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned L1 table: {l1_offset}"),
-                )
-            })?;
+            .ok_or_else(|| invalid_data(format!("Unaligned L1 table: {l1_offset}")))?;
 
         let rt_offset = HostOffset(header.refcount_table_offset.load(Ordering::Relaxed));
         rt_offset
             .checked_cluster(header.cluster_bits)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned refcount table: {rt_offset}"),
-                )
-            })?;
+            .ok_or_else(|| invalid_data(format!("Unaligned refcount table: {rt_offset}")))?;
 
         let backing_filename = if header.backing_file_offset != 0 {
             let (offset, length) = (header.backing_file_offset, header.backing_file_size);
             if length > 1023 {
-                return Err(io::Error::new(
-                    InvalidData,
-                    format!("Backing file name is too long ({length}, must not exceed 1023)"),
-                ));
+                return Err(invalid_data(format!(
+                    "Backing file name is too long ({length}, must not exceed 1023)"
+                )));
             }
 
-            let end = offset.checked_add(length as u64).ok_or(io::Error::new(
-                InvalidData,
+            let end = offset.checked_add(length as u64).ok_or(invalid_data(
                 "Backing file name offset is invalid (too high)",
             ))?;
             if end >= cluster_size {
-                return Err(io::Error::new(
-                    InvalidData,
+                return Err(invalid_data(
                     "Backing file name offset is invalid (beyond first cluster)",
                 ));
             }
@@ -371,9 +351,10 @@ impl Header {
             let mut backing_buf = vec![0; length as usize];
             image.read(&mut backing_buf, offset).await?;
 
-            Some(String::from_utf8(backing_buf).map_err(|err| {
-                io::Error::new(InvalidData, format!("Backing file name is invalid: {err}"))
-            })?)
+            Some(
+                String::from_utf8(backing_buf)
+                    .map_err(|err| invalid_data(format!("Backing file name is invalid: {err}")))?,
+            )
         } else {
             None
         };
@@ -385,10 +366,7 @@ impl Header {
             let mut extensions = Vec::<HeaderExtension>::new();
             loop {
                 if ext_offset + HeaderExtensionHeader::RAW_SIZE as u64 > cluster_size {
-                    return Err(io::Error::new(
-                        InvalidData,
-                        "Header extensions exceed the first cluster",
-                    ));
+                    return Err(invalid_data("Header extensions exceed the first cluster"));
                 }
 
                 let mut ext_hdr_buf = vec![0; HeaderExtensionHeader::RAW_SIZE];
@@ -396,14 +374,10 @@ impl Header {
 
                 ext_offset += HeaderExtensionHeader::RAW_SIZE as u64;
 
-                let ext_hdr: HeaderExtensionHeader = bincode
-                    .deserialize(&ext_hdr_buf)
-                    .map_err(|err| io::Error::new(InvalidData, err))?;
+                let ext_hdr: HeaderExtensionHeader =
+                    bincode.deserialize(&ext_hdr_buf).map_err(invalid_data)?;
                 if ext_offset + ext_hdr.length as u64 > cluster_size {
-                    return Err(io::Error::new(
-                        InvalidData,
-                        "Header extensions exceed the first cluster",
-                    ));
+                    return Err(invalid_data("Header extensions exceed the first cluster"));
                 }
 
                 let mut ext_data = vec![0; ext_hdr.length as usize];
@@ -486,10 +460,10 @@ impl Header {
                 })
                 .collect::<Vec<String>>();
 
-            return Err(io::Error::new(
-                InvalidData,
-                format!("Unrecognized incompatible feature(s) {}", feats.join(", ")),
-            ));
+            return Err(invalid_data(format!(
+                "Unrecognized incompatible feature(s) {}",
+                feats.join(", ")
+            )));
         }
 
         Ok(header)
@@ -532,17 +506,9 @@ impl Header {
             self.v2.backing_file_size = 0;
         }
 
-        let mut full_buf = bincode
-            .serialize(&self.v2)
-            .map_err(|err| io::Error::new(InvalidData, err))?;
-
+        let mut full_buf = bincode.serialize(&self.v2).map_err(invalid_data)?;
         if self.v2.version > 2 {
-            full_buf.append(
-                &mut bincode
-                    .serialize(&self.v3)
-                    .map_err(|err| io::Error::new(InvalidData, err))?,
-            );
-
+            full_buf.append(&mut bincode.serialize(&self.v3).map_err(invalid_data)?);
             full_buf.extend_from_slice(&self.unknown_header_fields);
             full_buf.resize(full_buf.len().next_multiple_of(8), 0);
         }
@@ -720,12 +686,9 @@ impl Header {
         })?;
 
         let entries = l1_table.entries();
-        let entries = entries.try_into().map_err(|err| {
-            io::Error::new(
-                InvalidData,
-                format!("Too many L1 entries ({entries}): {err}"),
-            )
-        })?;
+        let entries = entries
+            .try_into()
+            .map_err(|err| invalid_data(format!("Too many L1 entries ({entries}): {err}")))?;
 
         self.v2.l1_table_offset.store(offset.0, Ordering::Relaxed);
 
@@ -763,10 +726,7 @@ impl Header {
 
         let clusters = reftable.cluster_count(cb);
         let clusters = clusters.0.try_into().map_err(|err| {
-            io::Error::new(
-                InvalidData,
-                format!("Too many reftable clusters ({clusters}): {err}"),
-            )
+            invalid_data(format!("Too many reftable clusters ({clusters}): {err}"))
         })?;
 
         self.v2
@@ -833,17 +793,14 @@ impl Header {
             let ext_hdr = HeaderExtensionHeader {
                 extension_type: e.extension_type(),
                 length: data.len().try_into().map_err(|err| {
-                    io::Error::new(
-                        InvalidData,
-                        format!("Header extension too long ({}): {}", data.len(), err),
-                    )
+                    invalid_data(format!(
+                        "Header extension too long ({}): {}",
+                        data.len(),
+                        err
+                    ))
                 })?,
             };
-            result.append(
-                &mut bincode
-                    .serialize(&ext_hdr)
-                    .map_err(|err| io::Error::new(InvalidData, err))?,
-            );
+            result.append(&mut bincode.serialize(&ext_hdr).map_err(invalid_data)?);
             result.append(&mut data);
             result.resize(result.len().next_multiple_of(8), 0);
         }
@@ -852,11 +809,7 @@ impl Header {
             extension_type: HeaderExtensionType::End as u32,
             length: 0,
         };
-        result.append(
-            &mut bincode
-                .serialize(&end_ext)
-                .map_err(|err| io::Error::new(InvalidData, err))?,
-        );
+        result.append(&mut bincode.serialize(&end_ext).map_err(invalid_data)?);
         result.resize(result.len().next_multiple_of(8), 0);
 
         Ok(result)
@@ -868,10 +821,7 @@ impl Header {
             .with_fixint_encoding()
             .with_big_endian();
 
-        let v2_header = bincode
-            .serialize(&self.v2)
-            .map_err(|err| io::Error::new(InvalidData, err))?;
-
+        let v2_header = bincode.serialize(&self.v2).map_err(invalid_data)?;
         image.write(&v2_header, 0).await
     }
 
@@ -903,7 +853,7 @@ impl HeaderExtension {
                 HeaderExtensionType::End => return Ok(None),
                 HeaderExtensionType::BackingFileFormat => {
                     let fmt = String::from_utf8(data).map_err(|err| {
-                        io::Error::new(InvalidData, format!("Invalid backing file format: {err}"))
+                        invalid_data(format!("Invalid backing file format: {err}"))
                     })?;
                     HeaderExtension::BackingFileFormat(fmt)
                 }
@@ -925,10 +875,7 @@ impl HeaderExtension {
                 }
                 HeaderExtensionType::ExternalDataFileName => {
                     let filename = String::from_utf8(data).map_err(|err| {
-                        io::Error::new(
-                            InvalidData,
-                            format!("Invalid external data file name: {err}"),
-                        )
+                        invalid_data(format!("Invalid external data file name: {err}"))
                     })?;
                     HeaderExtension::ExternalDataFileName(filename)
                 }
@@ -1028,27 +975,21 @@ impl TableEntry for L1Entry {
         let entry = L1Entry(value);
 
         if entry.reserved_bits() != 0 {
-            return Err(io::Error::new(
-                InvalidData,
-                format!(
-                    "Invalid L1 entry 0x{:x}, reserved bits set (0x{:x})",
-                    value,
-                    entry.reserved_bits(),
-                ),
-            ));
+            return Err(invalid_data(format!(
+                "Invalid L1 entry 0x{:x}, reserved bits set (0x{:x})",
+                value,
+                entry.reserved_bits(),
+            )));
         }
 
         if let Some(l2_ofs) = entry.l2_offset() {
             if l2_ofs.in_cluster_offset(header.cluster_bits()) != 0 {
-                return Err(io::Error::new(
-                    InvalidData,
-                    format!(
-                        "Invalid L1 entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
-                        value,
-                        l2_ofs,
-                        header.cluster_size(),
-                    ),
-                ));
+                return Err(invalid_data(format!(
+                    "Invalid L1 entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
+                    value,
+                    l2_ofs,
+                    header.cluster_size(),
+                )));
             }
         }
 
@@ -1475,27 +1416,21 @@ impl TableEntry for AtomicL2Entry {
         let entry = L2Entry(value);
 
         if entry.reserved_bits() != 0 {
-            return Err(io::Error::new(
-                InvalidData,
-                format!(
-                    "Invalid L2 entry 0x{:x}, reserved bits set (0x{:x})",
-                    value,
-                    entry.reserved_bits(),
-                ),
-            ));
+            return Err(invalid_data(format!(
+                "Invalid L2 entry 0x{:x}, reserved bits set (0x{:x})",
+                value,
+                entry.reserved_bits(),
+            )));
         }
 
         if let Some(offset) = entry.cluster_offset(header.external_data_file()) {
             if !entry.is_compressed() && offset.in_cluster_offset(header.cluster_bits()) != 0 {
-                return Err(io::Error::new(
-                    InvalidData,
-                    format!(
-                        "Invalid L2 entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
-                        value,
-                        offset,
-                        header.cluster_size(),
-                    ),
-                ));
+                return Err(invalid_data(format!(
+                    "Invalid L2 entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
+                    value,
+                    offset,
+                    header.cluster_size(),
+                )));
             }
         }
 
@@ -1895,20 +1830,16 @@ impl TableEntry for RefTableEntry {
         let entry = RefTableEntry(value);
 
         if entry.reserved_bits() != 0 {
-            return Err(io::Error::new(
-                InvalidData,
-                format!(
-                    "Invalid reftable entry 0x{:x}, reserved bits set (0x{:x})",
-                    value,
-                    entry.reserved_bits(),
-                ),
-            ));
+            return Err(invalid_data(format!(
+                "Invalid reftable entry 0x{:x}, reserved bits set (0x{:x})",
+                value,
+                entry.reserved_bits(),
+            )));
         }
 
         if let Some(rb_ofs) = entry.refblock_offset() {
             if rb_ofs.in_cluster_offset(header.cluster_bits()) != 0 {
-                return Err(io::Error::new(
-                    InvalidData,
+                return Err(invalid_data(
                     format!(
                         "Invalid reftable entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
                         value,
@@ -2296,16 +2227,14 @@ impl RefBlockWriteGuard<'_> {
             old.checked_sub(change)
         };
         let new = new.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Changing refcount from {old} by {change} would overflow"),
-            )
+            invalid_data(format!(
+                "Changing refcount from {old} by {change} would overflow"
+            ))
         })?;
         if new > base_mask {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Changing refcount from {old} to {new} (by {change}) would overflow"),
-            ));
+            return Err(invalid_data(format!(
+                "Changing refcount from {old} to {new} (by {change}) would overflow"
+            )));
         }
 
         let full = (full & !mask) | (new << shift);
@@ -2334,17 +2263,15 @@ impl RefBlockWriteGuard<'_> {
             old.checked_sub(-change as u64)
         };
         let new = new.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Changing refcount from {old} by {change} would overflow"),
-            )
+            invalid_data(format!(
+                "Changing refcount from {old} by {change} would overflow"
+            ))
         })?;
 
         store(atomic, new).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Changing refcount from {old} to {new} (by {change}) would overflow"),
-            )
+            invalid_data(format!(
+                "Changing refcount from {old} to {new} (by {change}) would overflow"
+            ))
         })?;
 
         Ok(old)

@@ -242,10 +242,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 return Ok(None);
             }
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"),
-                )
+                invalid_data(format!(
+                    "Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"
+                ))
             })?;
 
             self.l2_cache.get_or_insert(l2_cluster).await.map(Some)
@@ -276,10 +275,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let l1_entry = l1_locked.get(l1_index);
         let mut l2_table = if let Some(l2_offset) = l1_entry.l2_offset() {
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"),
-                )
+                invalid_data(format!(
+                    "Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"
+                ))
             })?;
 
             let l2 = self.l2_cache.get_or_insert(l2_cluster).await?;
