@@ -25,7 +25,7 @@ pub(super) struct HostCluster(pub u64);
 
 /// Cluster count.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct ClusterCount(pub usize);
+pub(super) struct ClusterCount(pub u64);
 
 impl GuestOffset {
     /// Return the offset from the start of the containing guest clusters.
@@ -169,7 +169,7 @@ impl HostCluster {
     ///
     /// Same as `self.offset(cb) + guest_offset.in_cluster_offset`.
     pub fn relative_offset(self, guest_offset: GuestOffset, cluster_bits: u32) -> HostOffset {
-        self.offset(cluster_bits) + guest_offset.in_cluster_offset(cluster_bits)
+        self.offset(cluster_bits) + guest_offset.in_cluster_offset(cluster_bits) as u64
     }
 }
 
@@ -177,12 +177,12 @@ impl ClusterCount {
     /// Get how many clusters are required to cover `byte_size`.
     ///
     /// This rounds up.
-    pub fn from_byte_size(byte_size: usize, cluster_bits: u32) -> Self {
+    pub fn from_byte_size(byte_size: u64, cluster_bits: u32) -> Self {
         ClusterCount(byte_size.div_ceil(1 << cluster_bits))
     }
 
     /// Return the full byte size of this many clusters.
-    pub fn byte_size(self, cluster_bits: u32) -> usize {
+    pub fn byte_size(self, cluster_bits: u32) -> u64 {
         self.0 << cluster_bits
     }
 }
@@ -191,13 +191,13 @@ impl Add<ClusterCount> for HostCluster {
     type Output = Self;
 
     fn add(self, rhs: ClusterCount) -> Self {
-        HostCluster(self.0 + rhs.0 as u64)
+        HostCluster(self.0 + rhs.0)
     }
 }
 
 impl AddAssign<ClusterCount> for HostCluster {
     fn add_assign(&mut self, rhs: ClusterCount) {
-        self.0 += rhs.0 as u64;
+        self.0 += rhs.0;
     }
 }
 
@@ -205,13 +205,13 @@ impl Sub<ClusterCount> for HostCluster {
     type Output = Self;
 
     fn sub(self, rhs: ClusterCount) -> Self {
-        HostCluster(self.0 - rhs.0 as u64)
+        HostCluster(self.0 - rhs.0)
     }
 }
 
 impl SubAssign<ClusterCount> for HostCluster {
     fn sub_assign(&mut self, rhs: ClusterCount) {
-        self.0 -= rhs.0 as u64;
+        self.0 -= rhs.0;
     }
 }
 
@@ -219,7 +219,7 @@ impl Sub<HostCluster> for HostCluster {
     type Output = ClusterCount;
 
     fn sub(self, rhs: Self) -> ClusterCount {
-        ClusterCount((self.0 - rhs.0) as usize)
+        ClusterCount(self.0 - rhs.0)
     }
 }
 
@@ -251,27 +251,27 @@ impl SubAssign<ClusterCount> for ClusterCount {
     }
 }
 
-impl Add<usize> for HostOffset {
+impl Add<u64> for HostOffset {
     type Output = Self;
 
-    fn add(self, rhs: usize) -> Self {
-        HostOffset(self.0 + rhs as u64)
+    fn add(self, rhs: u64) -> Self {
+        HostOffset(self.0 + rhs)
     }
 }
 
-impl Sub<usize> for HostOffset {
+impl Sub<u64> for HostOffset {
     type Output = Self;
 
-    fn sub(self, rhs: usize) -> Self {
-        HostOffset(self.0 - rhs as u64)
+    fn sub(self, rhs: u64) -> Self {
+        HostOffset(self.0 - rhs)
     }
 }
 
 impl Sub<HostOffset> for HostOffset {
-    type Output = usize;
+    type Output = u64;
 
-    fn sub(self, rhs: Self) -> usize {
-        (self.0 - rhs.0).try_into().unwrap()
+    fn sub(self, rhs: Self) -> u64 {
+        self.0 - rhs.0
     }
 }
 

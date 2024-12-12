@@ -148,12 +148,9 @@ impl<S: Storage> Allocator<S> {
     pub async fn new(image: Arc<S>, header: Arc<Header>) -> io::Result<Self> {
         let cb = header.cluster_bits();
         let rt_offset = header.reftable_offset();
-        let rt_cluster = rt_offset.checked_cluster(cb).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unaligned refcount table: {rt_offset}"),
-            )
-        })?;
+        let rt_cluster = rt_offset
+            .checked_cluster(cb)
+            .ok_or_else(|| invalid_data(format!("Unaligned refcount table: {rt_offset}")))?;
 
         let reftable = RefTable::load(
             image.as_ref(),
@@ -298,10 +295,7 @@ impl<S: Storage> Allocator<S> {
         if let Some(rb_offset) = rt_entry.refblock_offset() {
             let cb = self.header.cluster_bits();
             let rb_cluster = rb_offset.checked_cluster(cb).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"),
-                )
+                invalid_data(format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"))
             })?;
 
             self.rb_cache.get_or_insert(rb_cluster).await.map(Some)
@@ -372,8 +366,8 @@ impl<S: Storage> Allocator<S> {
         let rb_bits = self.header.rb_bits();
         let rb_entries = 1 << rb_bits;
 
-        let mut new_rt = self.reftable.clone_and_grow(&self.header, at_least_index);
-        let rt_clusters = ClusterCount::from_byte_size(new_rt.byte_size(), cb);
+        let mut new_rt = self.reftable.clone_and_grow(&self.header, at_least_index)?;
+        let rt_clusters = ClusterCount::from_byte_size(new_rt.byte_size() as u64, cb);
 
         // Find free range
         let (mut rt_index, mut rb_index) = self.first_free_cluster.rt_rb_indices(rb_bits);
@@ -392,17 +386,14 @@ impl<S: Storage> Allocator<S> {
             let Some(rb_offset) = rt_entry.refblock_offset() else {
                 let start_index = HostCluster::from_ref_indices(rt_index, 0, rb_bits);
                 free_cluster_index.get_or_insert(start_index);
-                free_cluster_count += ClusterCount(rb_entries);
+                free_cluster_count += ClusterCount(rb_entries as u64);
                 // Need to allocate this RB
                 required_clusters += ClusterCount(1);
                 continue;
             };
 
             let rb_cluster = rb_offset.checked_cluster(cb).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"),
-                )
+                invalid_data(format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"))
             })?;
 
             let rb = self.rb_cache.get_or_insert(rb_cluster).await?;
@@ -488,7 +479,7 @@ impl<S: Storage> Allocator<S> {
         // Must set new reftable before calling `free_clusters()`
         let mut old_reftable = mem::replace(&mut self.reftable, new_rt);
         if let Some(old_rt_cluster) = old_reftable.get_cluster() {
-            let old_rt_size = old_reftable.cluster_count(cb);
+            let old_rt_size = old_reftable.cluster_count();
             old_reftable.unset_cluster();
             self.free_clusters(old_rt_cluster, old_rt_size).await;
         }
@@ -514,7 +505,7 @@ impl<S: Storage> Allocator<S> {
         let (mut rt_index, mut rb_index) = start.rt_rb_indices(rb_bits);
 
         while count > ClusterCount(0) {
-            let in_rb_count = cmp::min(rb_entries - rb_index, count.0);
+            let in_rb_count = cmp::min((rb_entries - rb_index) as u64, count.0) as usize;
 
             match self.get_rb(rt_index).await {
                 Ok(Some(rb)) => {
@@ -535,7 +526,7 @@ impl<S: Storage> Allocator<S> {
                 Err(err) => event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}"),
             }
 
-            count -= ClusterCount(in_rb_count);
+            count -= ClusterCount(in_rb_count as u64);
             rb_index = 0;
             rt_index += 1;
         }

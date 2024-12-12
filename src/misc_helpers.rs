@@ -72,3 +72,10 @@ impl<'a, B: vm_memory::bitmap::BitmapSlice> ImagoAsRef<'a, vm_memory::VolatileSl
         self
     }
 }
+
+/// Generate an `io::Error` of kind `InvalidData`.
+pub(crate) fn invalid_data<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
+    error: E,
+) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}

@@ -11,14 +11,13 @@ use crate::macros::passthrough_trait_fn;
 use crate::misc_helpers::ImagoAsRef;
 use std::alloc::{self, GlobalAlloc};
 use std::fmt::{self, Debug, Formatter};
-use std::io;
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 #[cfg(unix)]
 use std::mem;
 use std::mem::{size_of, size_of_val};
 use std::ops::Range;
-use std::{cmp, ptr, slice};
+use std::{cmp, io, ptr, slice};
 
 /// Owned memory buffer.
 pub struct IoBuffer {

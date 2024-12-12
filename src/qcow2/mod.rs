@@ -15,7 +15,7 @@ use crate::async_lru_cache::AsyncLruCache;
 use crate::format::drivers::{FormatDriverInstance, Mapping};
 use crate::format::wrapped::WrappedFormat;
 use crate::io_buffers::IoVectorMut;
-use crate::misc_helpers::ResultErrorContext;
+use crate::misc_helpers::{invalid_data, ResultErrorContext};
 use crate::raw::Raw;
 use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
@@ -85,12 +85,9 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
         let cb = header.cluster_bits();
         let l1_offset = header.l1_table_offset();
-        let l1_cluster = l1_offset.checked_cluster(cb).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unaligned L1 table: {l1_offset}"),
-            )
-        })?;
+        let l1_cluster = l1_offset
+            .checked_cluster(cb)
+            .ok_or_else(|| invalid_data("Unaligned L1 table: {l1_offset}"))?;
 
         let l1_table =
             L1Table::load(&metadata, &header, l1_cluster, header.l1_table_entries()).await?;

@@ -169,10 +169,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 return Ok(None);
             }
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"),
-                )
+                invalid_data(format!(
+                    "Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"
+                ))
             })?;
 
             self.l2_cache.get_or_insert(l2_cluster).await.map(Some)
@@ -203,10 +202,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let l1_entry = l1_locked.get(l1_index);
         let mut l2_table = if let Some(l2_offset) = l1_entry.l2_offset() {
             let l2_cluster = l2_offset.checked_cluster(cb).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"),
-                )
+                invalid_data(format!(
+                    "Unaligned L2 table for {offset:?}; L1 entry: {l1_entry:?}"
+                ))
             })?;
 
             let l2 = self.l2_cache.get_or_insert(l2_cluster).await?;
@@ -249,13 +247,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         mut l1_locked: RwLockWriteGuard<'a, L1Table>,
         at_least_index: usize,
     ) -> io::Result<RwLockWriteGuard<'a, L1Table>> {
-        let cb = self.header.cluster_bits();
+        let mut new_l1 = l1_locked.clone_and_grow(at_least_index, &self.header)?;
 
-        let mut new_l1 = l1_locked.clone_and_grow(at_least_index, &self.header);
-
-        let l1_start = self
-            .allocate_meta_clusters(new_l1.cluster_count(cb))
-            .await?;
+        let l1_start = self.allocate_meta_clusters(new_l1.cluster_count()).await?;
 
         new_l1.set_cluster(l1_start);
         new_l1.write(self.metadata.as_ref()).await?;
@@ -266,7 +260,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .await?;
 
         if let Some(old_l1_cluster) = l1_locked.get_cluster() {
-            let old_l1_size = l1_locked.cluster_count(cb);
+            let old_l1_size = l1_locked.cluster_count();
             l1_locked.unset_cluster();
             self.free_meta_clusters(old_l1_cluster, old_l1_size).await;
         }
