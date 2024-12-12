@@ -366,7 +366,7 @@ impl<S: Storage> Allocator<S> {
         let rb_bits = self.header.rb_bits();
         let rb_entries = 1 << rb_bits;
 
-        let mut new_rt = self.reftable.clone_and_grow(&self.header, at_least_index);
+        let mut new_rt = self.reftable.clone_and_grow(&self.header, at_least_index)?;
         let rt_clusters = ClusterCount::from_byte_size(new_rt.byte_size() as u64, cb);
 
         // Find free range
@@ -479,7 +479,7 @@ impl<S: Storage> Allocator<S> {
         // Must set new reftable before calling `free_clusters()`
         let mut old_reftable = mem::replace(&mut self.reftable, new_rt);
         if let Some(old_rt_cluster) = old_reftable.get_cluster() {
-            let old_rt_size = old_reftable.cluster_count(cb);
+            let old_rt_size = old_reftable.cluster_count();
             old_reftable.unset_cluster();
             self.free_clusters(old_rt_cluster, old_rt_size).await;
         }

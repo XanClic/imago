@@ -247,13 +247,9 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         mut l1_locked: RwLockWriteGuard<'a, L1Table>,
         at_least_index: usize,
     ) -> io::Result<RwLockWriteGuard<'a, L1Table>> {
-        let cb = self.header.cluster_bits();
+        let mut new_l1 = l1_locked.clone_and_grow(at_least_index, &self.header)?;
 
-        let mut new_l1 = l1_locked.clone_and_grow(at_least_index, &self.header);
-
-        let l1_start = self
-            .allocate_meta_clusters(new_l1.cluster_count(cb))
-            .await?;
+        let l1_start = self.allocate_meta_clusters(new_l1.cluster_count()).await?;
 
         new_l1.set_cluster(l1_start);
         new_l1.write(self.metadata.as_ref()).await?;
@@ -264,7 +260,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .await?;
 
         if let Some(old_l1_cluster) = l1_locked.get_cluster() {
-            let old_l1_size = l1_locked.cluster_count(cb);
+            let old_l1_size = l1_locked.cluster_count();
             l1_locked.unset_cluster();
             self.free_meta_clusters(old_l1_cluster, old_l1_size).await;
         }
