@@ -148,12 +148,9 @@ impl<S: Storage> Allocator<S> {
     pub async fn new(image: Arc<S>, header: Arc<Header>) -> io::Result<Self> {
         let cb = header.cluster_bits();
         let rt_offset = header.reftable_offset();
-        let rt_cluster = rt_offset.checked_cluster(cb).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unaligned refcount table: {rt_offset}"),
-            )
-        })?;
+        let rt_cluster = rt_offset
+            .checked_cluster(cb)
+            .ok_or_else(|| invalid_data(format!("Unaligned refcount table: {rt_offset}")))?;
 
         let reftable = RefTable::load(
             image.as_ref(),
@@ -298,10 +295,7 @@ impl<S: Storage> Allocator<S> {
         if let Some(rb_offset) = rt_entry.refblock_offset() {
             let cb = self.header.cluster_bits();
             let rb_cluster = rb_offset.checked_cluster(cb).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"),
-                )
+                invalid_data(format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"))
             })?;
 
             self.rb_cache.get_or_insert(rb_cluster).await.map(Some)
@@ -399,10 +393,7 @@ impl<S: Storage> Allocator<S> {
             };
 
             let rb_cluster = rb_offset.checked_cluster(cb).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"),
-                )
+                invalid_data(format!("Unaligned refcount block with index {rt_index}; refcount table entry: {rt_entry:?}"))
             })?;
 
             let rb = self.rb_cache.get_or_insert(rb_cluster).await?;
