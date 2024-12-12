@@ -96,3 +96,10 @@ pub(crate) fn while_eintr<R: From<i8> + PartialEq, F: FnMut() -> R>(
         }
     }
 }
+
+/// Generate an `io::Error` of kind `InvalidData`.
+pub(crate) fn invalid_data<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
+    error: E,
+) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
