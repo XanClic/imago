@@ -43,7 +43,7 @@
 use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::storage::drivers::CommonStorageHelper;
 use crate::storage::PreallocateMode;
-use crate::{Storage, StorageOpenOptions};
+use crate::{Storage, StorageCreateOptions, StorageOpenOptions};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
 use std::ops::{Deref, DerefMut};
@@ -98,6 +98,10 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
     #[cfg(feature = "sync-wrappers")]
     fn open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
         Ok(S::open_sync(opts)?.into())
+    }
+
+    async fn create_open(opts: StorageCreateOptions) -> io::Result<Self> {
+        Ok(S::create_open(opts).await?.into())
     }
 
     fn mem_align(&self) -> usize {
