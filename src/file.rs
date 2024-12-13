@@ -9,7 +9,7 @@ use crate::misc_helpers::ResultErrorContext;
 use crate::storage::drivers::CommonStorageHelper;
 use crate::storage::ext::write_full_zeroes;
 use crate::storage::PreallocateMode;
-use crate::{Storage, StorageOpenOptions};
+use crate::{Storage, StorageCreateOptions, StorageOpenOptions};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Seek, SeekFrom, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -73,12 +73,35 @@ impl TryFrom<fs::File> for File {
 
 impl Storage for File {
     async fn open(opts: StorageOpenOptions) -> io::Result<Self> {
-        Self::do_open_sync(opts)
+        Self::do_open_sync(opts, fs::OpenOptions::new())
     }
 
     #[cfg(feature = "sync-wrappers")]
     fn open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
-        Self::do_open_sync(opts)
+        Self::do_open_sync(opts, fs::OpenOptions::new())
+    }
+
+    async fn create_open(opts: StorageCreateOptions) -> io::Result<Self> {
+        // Always allow writing for new files
+        let opts = opts.modify_open_opts(|o| o.write(true));
+        let size = opts.size;
+        let prealloc_mode = opts.prealloc_mode;
+
+        let mut file_opts = fs::OpenOptions::new();
+        if opts.overwrite {
+            file_opts.create(true).truncate(true);
+        } else {
+            file_opts.create_new(true);
+        };
+
+        let file = Self::do_open_sync(opts.get_open_options(), file_opts)?;
+        if size > 0 {
+            file.resize(size, prealloc_mode)
+                .await
+                .err_context(|| "Resizing file")?;
+        }
+
+        Ok(file)
     }
 
     fn mem_align(&self) -> usize {
@@ -739,13 +762,16 @@ impl File {
         (cmp::max(min_req_align, 4096), cmp::max(min_mem_align, 4096))
     }
 
-    /// Implementation for [`File::open()`] and [`File::open_sync()`].
-    fn do_open_sync(opts: StorageOpenOptions) -> io::Result<Self> {
+    /// Implementation for anything that opens a file.
+    fn do_open_sync(opts: StorageOpenOptions, base_fs_opts: fs::OpenOptions) -> io::Result<Self> {
         let Some(filename) = opts.filename else {
-            return Err(io::Error::other("Filename required"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Filename required",
+            ));
         };
 
-        let mut file_opts = fs::OpenOptions::new();
+        let mut file_opts = base_fs_opts;
         file_opts.read(true).write(opts.writable);
         #[cfg(not(target_os = "macos"))]
         if opts.direct {

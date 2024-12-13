@@ -14,7 +14,7 @@ mod sync_wrappers;
 mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
-use crate::format::builder::FormatDriverBuilder;
+use crate::format::builder::{FormatCreateBuilder, FormatDriverBuilder};
 use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
@@ -25,7 +25,7 @@ use crate::raw::Raw;
 use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
-pub use builder::Qcow2OpenBuilder;
+pub use builder::{Qcow2CreateBuilder, Qcow2OpenBuilder};
 use cache::L2CacheBackend;
 use mappings::FixedMapping;
 use metadata::*;
@@ -85,6 +85,11 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// Create a new [`FormatDriverBuilder`] instance for an image under the given path.
     pub fn builder_path<P: AsRef<Path>>(image_path: P) -> Qcow2OpenBuilder<S, F> {
         Qcow2OpenBuilder::new_path(image_path)
+    }
+
+    /// Create a new [`FormatCreateBuilder`] instance to format the given file.
+    pub fn create_builder(image: S) -> Qcow2CreateBuilder<S, F> {
+        Qcow2CreateBuilder::<S, F>::new(image)
     }
 
     /// Internal implementation for opening a qcow2 image.
@@ -609,6 +614,39 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             return Ok(()); // only grow, else do nothing
         }
 
+        if let Some(data_file) = self.storage.as_ref() {
+            // Options that allocate data mappings in qcow2 will resize the data file via
+            // `preallocate()` or `preallocate_write_data()`.  Those that don’t won’t, so they need
+            // to be handled here.
+            match prealloc_mode {
+                PreallocateMode::None => {
+                    data_file
+                        .resize(new_size, storage::PreallocateMode::None)
+                        .await?;
+                }
+                PreallocateMode::Zero => {
+                    data_file
+                        .resize(new_size, storage::PreallocateMode::Zero)
+                        .await?;
+                }
+                PreallocateMode::FormatAllocate
+                | PreallocateMode::FullAllocate
+                | PreallocateMode::WriteData => (),
+            }
+        }
+
+        // QEMU requires the L1 table to at least match the image’s size.
+        // On that note, note that this would make an L1 state’s data visible to the guest (and
+        // also effectively invalidate it, because it is no longer L1 state, but just data), but
+        // QEMU does not care either.  (We could see whether there are allocated clusters after the
+        // image end to find out.)
+        {
+            let l1_locked = self.l1_table.write().await;
+            let l1_index =
+                GuestOffset(new_size.saturating_sub(1)).l1_index(self.header.cluster_bits());
+            let _l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
+        }
+
         // Grow before preallocating (so we can preallocate)
         self.header.set_size(new_size);
 
@@ -646,6 +684,12 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         let old_size = self.size();
         if new_size >= old_size {
             return Ok(()); // only shrink, else do nothing
+        }
+
+        if let Some(data_file) = self.storage.as_ref() {
+            data_file
+                .resize(new_size, storage::PreallocateMode::None)
+                .await?;
         }
 
         let mut offset = new_size;

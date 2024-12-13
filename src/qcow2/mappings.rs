@@ -315,7 +315,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Create a new L1 table covering at least `at_least_index`.
     ///
     /// Create a new L1 table of the required size with all the entries of the previous L1 table.
-    async fn grow_l1_table<'a>(
+    pub(super) async fn grow_l1_table<'a>(
         &self,
         mut l1_locked: RwLockWriteGuard<'a, L1Table>,
         at_least_index: usize,
