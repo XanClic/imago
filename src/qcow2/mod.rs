@@ -609,6 +609,27 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             return Ok(()); // only grow, else do nothing
         }
 
+        if let Some(data_file) = self.storage.as_ref() {
+            // Options that allocate data mappings in qcow2 will resize the data file via
+            // `preallocate()` or `preallocate_write_data()`.  Those that don’t won’t, so they need
+            // to be handled here.
+            match prealloc_mode {
+                PreallocateMode::None => {
+                    data_file
+                        .resize(new_size, storage::PreallocateMode::None)
+                        .await?;
+                }
+                PreallocateMode::Zero => {
+                    data_file
+                        .resize(new_size, storage::PreallocateMode::Zero)
+                        .await?;
+                }
+                PreallocateMode::FormatAllocate
+                | PreallocateMode::FullAllocate
+                | PreallocateMode::WriteData => (),
+            }
+        }
+
         // QEMU requires the L1 table to at least match the image’s size.
         // On that note, note that this would make an L1 state’s data visible to the guest (and
         // also effectively invalidate it, because it is no longer L1 state, but just data), but
@@ -658,6 +679,12 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         let old_size = self.size();
         if new_size >= old_size {
             return Ok(()); // only shrink, else do nothing
+        }
+
+        if let Some(data_file) = self.storage.as_ref() {
+            data_file
+                .resize(new_size, storage::PreallocateMode::None)
+                .await?;
         }
 
         let mut offset = new_size;
