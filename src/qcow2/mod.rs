@@ -609,6 +609,18 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             return Ok(()); // only grow, else do nothing
         }
 
+        // QEMU requires the L1 table to at least match the image’s size.
+        // On that note, note that this would make an L1 state’s data visible to the guest (and
+        // also effectively invalidate it, because it is no longer L1 state, but just data), but
+        // QEMU does not care either.  (We could see whether there are allocated clusters after the
+        // image end to find out.)
+        {
+            let l1_locked = self.l1_table.write().await;
+            let l1_index =
+                GuestOffset(new_size.saturating_sub(1)).l1_index(self.header.cluster_bits());
+            let _l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
+        }
+
         // Grow before preallocating (so we can preallocate)
         self.header.set_size(new_size);
 
