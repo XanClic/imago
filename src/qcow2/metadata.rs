@@ -536,25 +536,51 @@ impl Header {
             V2Header::RAW_SIZE
         };
 
-        let mut header_exts = self.serialize_extensions()?;
+        // If the header gets too long, try to remove the feature name table to make it small
+        // enough
+        let mut header_exts;
+        let mut backing_file_ofs;
+        loop {
+            header_exts = self.serialize_extensions()?;
+
+            backing_file_ofs = header_len
+                .checked_add(header_exts.len())
+                .ok_or_else(|| invalid_data("Header size overflow"))?;
+            let backing_file_len = self
+                .backing_filename
+                .as_ref()
+                .map(|n| n.as_bytes().len())
+                .unwrap_or(0);
+            let header_end = backing_file_ofs
+                .checked_add(backing_file_len)
+                .ok_or_else(|| invalid_data("Header size overflow"))?;
+
+            if header_end <= self.cluster_size() {
+                break;
+            }
+
+            if !self
+                .extensions
+                .iter()
+                .any(|e| e.extension_type() == HeaderExtensionType::FeatureNameTable as u32)
+            {
+                return Err(io::Error::other(format!(
+                    "Header would be too long ({} > {})",
+                    header_end,
+                    self.cluster_size()
+                )));
+            }
+            self.extensions
+                .retain(|e| e.extension_type() != HeaderExtensionType::FeatureNameTable as u32);
+        }
 
         if let Some(backing) = self.backing_filename.as_ref() {
-            let offset = header_len + header_exts.len();
-            let size = backing.as_bytes().len();
-            let end = offset.checked_add(size).ok_or_else(|| {
-                io::Error::other("Header plus header extensions plus backing filename is too long")
-            })?;
-            if end > self.cluster_size() {
-                return Err(io::Error::other(
-                    "Header plus header extensions plus backing filename is too long",
-                ))?;
-            }
-            self.v2.backing_file_offset = offset as u64;
-            self.v2.backing_file_size = size as u32;
+            self.v2.backing_file_offset = backing_file_ofs as u64;
+            self.v2.backing_file_size = backing.as_bytes().len() as u32;
         } else {
             self.v2.backing_file_offset = 0;
             self.v2.backing_file_size = 0;
-        }
+        };
 
         let mut full_buf = bincode.serialize(&self.v2).map_err(invalid_data)?;
         if self.v2.version > 2 {
