@@ -14,7 +14,7 @@ mod sync_wrappers;
 mod types;
 
 use crate::async_lru_cache::AsyncLruCache;
-use crate::format::builder::FormatDriverBuilder;
+use crate::format::builder::{FormatCreateBuilder, FormatDriverBuilder};
 use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
 use crate::format::wrapped::WrappedFormat;
@@ -25,7 +25,7 @@ use crate::raw::Raw;
 use crate::{storage, FormatAccess, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
-pub use builder::Qcow2OpenBuilder;
+pub use builder::{Qcow2CreateBuilder, Qcow2OpenBuilder};
 use cache::L2CacheBackend;
 use mappings::FixedMapping;
 use metadata::*;
@@ -85,6 +85,11 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// Create a new [`FormatDriverBuilder`] instance for an image under the given path.
     pub fn builder_path<P: AsRef<Path>>(image_path: P) -> Qcow2OpenBuilder<S, F> {
         Qcow2OpenBuilder::new_path(image_path)
+    }
+
+    /// Create a new [`FormatCreateBuilder`] instance to format the given file.
+    pub fn create_builder(image: S) -> Qcow2CreateBuilder<S, F> {
+        Qcow2CreateBuilder::<S, F>::new(image)
     }
 
     /// Internal implementation for opening a qcow2 image.

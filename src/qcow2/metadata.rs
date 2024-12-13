@@ -202,6 +202,51 @@ numerical_enum! {
     }
 }
 
+impl From<IncompatibleFeatures> for (FeatureType, u8) {
+    /// Get this feature’s feature name table key.
+    fn from(feat: IncompatibleFeatures) -> (FeatureType, u8) {
+        assert!((feat as u64).is_power_of_two());
+        (
+            FeatureType::Incompatible,
+            (feat as u64).trailing_zeros() as u8,
+        )
+    }
+}
+
+numerical_enum! {
+    /// Compatible feature bits.
+    pub(super) enum CompatibleFeatures as u64 {
+        LazyRefcounts = 1 << 0,
+    }
+}
+
+impl From<CompatibleFeatures> for (FeatureType, u8) {
+    /// Get this feature’s feature name table key.
+    fn from(feat: CompatibleFeatures) -> (FeatureType, u8) {
+        assert!((feat as u64).is_power_of_two());
+        (
+            FeatureType::Compatible,
+            (feat as u64).trailing_zeros() as u8,
+        )
+    }
+}
+
+numerical_enum! {
+    /// Autoclear feature bits.
+    pub(super) enum AutoclearFeatures as u64 {
+        Bitmaps = 1 << 0,
+        RawExternalData = 1 << 1,
+    }
+}
+
+impl From<AutoclearFeatures> for (FeatureType, u8) {
+    /// Get this feature’s feature name table key.
+    fn from(feat: AutoclearFeatures) -> (FeatureType, u8) {
+        assert!((feat as u64).is_power_of_two());
+        (FeatureType::Autoclear, (feat as u64).trailing_zeros() as u8)
+    }
+}
+
 numerical_enum! {
     /// Extension type IDs.
     pub(super) enum HeaderExtensionType as u32 {
@@ -606,6 +651,64 @@ impl Header {
         image.write(&full_buf, 0).await
     }
 
+    /// Create a header for a new image.
+    pub fn new(
+        cluster_bits: u32,
+        refcount_order: u32,
+        backing_filename: Option<String>,
+        backing_format: Option<String>,
+        external_data_file: Option<String>,
+    ) -> Self {
+        assert!((MIN_CLUSTER_SIZE..=MAX_CLUSTER_SIZE)
+            .contains(&1usize.checked_shl(cluster_bits).unwrap()));
+        assert!((MIN_REFCOUNT_WIDTH..=MAX_REFCOUNT_WIDTH)
+            .contains(&1usize.checked_shl(refcount_order).unwrap()));
+
+        let has_external_data_file = external_data_file.is_some();
+        let incompatible_features = if has_external_data_file {
+            IncompatibleFeatures::ExternalDataFile as u64
+        } else {
+            0
+        };
+
+        let mut extensions = vec![HeaderExtension::feature_name_table()];
+        if let Some(backing_format) = backing_format {
+            extensions.push(HeaderExtension::BackingFileFormat(backing_format));
+        }
+        if let Some(external_data_file) = external_data_file {
+            extensions.push(HeaderExtension::ExternalDataFileName(external_data_file));
+        }
+
+        Header {
+            v2: V2Header {
+                magic: MAGIC,
+                version: 3,
+                backing_file_offset: 0, // will be set by `Self::write()`
+                backing_file_size: 0,   // will be set by `Self::write()`
+                cluster_bits,
+                size: 0.into(),
+                crypt_method: 0,
+                l1_size: 0.into(),
+                l1_table_offset: 0.into(),
+                refcount_table_offset: 0.into(),
+                refcount_table_clusters: 0.into(),
+                nb_snapshots: 0,
+                snapshots_offset: 0,
+            },
+            v3: V3HeaderBase {
+                incompatible_features,
+                compatible_features: 0,
+                autoclear_features: 0,
+                refcount_order,
+                header_length: 0, // will be set by `Self::write()`
+            },
+            unknown_header_fields: Vec::new(),
+            backing_filename,
+            extensions,
+            external_data_file: has_external_data_file,
+        }
+    }
+
     /// Update from a newly loaded header.
     ///
     /// Checks whether fields we consider immutable have remained the same, and updates mutable
@@ -1005,6 +1108,29 @@ impl HeaderExtension {
                 data,
             } => Ok(data.clone()),
         }
+    }
+
+    /// Creates a [`Self::FeatureNameTable`].
+    fn feature_name_table() -> Self {
+        use {AutoclearFeatures as A, CompatibleFeatures as C, IncompatibleFeatures as I};
+
+        let mut map = HashMap::new();
+
+        map.insert(I::Dirty.into(), "dirty".into());
+        map.insert(I::Corrupt.into(), "corrupt".into());
+        map.insert(I::ExternalDataFile.into(), "external data file".into());
+        map.insert(
+            I::CompressionType.into(),
+            "extended compression type".into(),
+        );
+        map.insert(I::ExtendedL2Entries.into(), "extended L2 entries".into());
+
+        map.insert(C::LazyRefcounts.into(), "lazy refcounts".into());
+
+        map.insert(A::Bitmaps.into(), "persistent dirty bitmaps".into());
+        map.insert(A::RawExternalData.into(), "raw external data file".into());
+
+        HeaderExtension::FeatureNameTable(map)
     }
 }
 
