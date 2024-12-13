@@ -2,11 +2,15 @@
 //!
 //! Allows accessing generic storage objects (`Storage`) as images (i.e. `FormatAccess`).
 
-use crate::format::builder::{FormatDriverBuilder, FormatDriverBuilderBase};
+use crate::format::builder::{
+    FormatCreateBuilder, FormatCreateBuilderBase, FormatDriverBuilder, FormatDriverBuilderBase,
+};
 use crate::format::drivers::FormatDriverInstance;
 use crate::format::gate::ImplicitOpenGate;
 use crate::format::{Format, PreallocateMode};
-use crate::{storage, ShallowMapping, Storage, StorageExt, StorageOpenOptions};
+use crate::{
+    storage, DenyImplicitOpenGate, ShallowMapping, Storage, StorageExt, StorageOpenOptions,
+};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -35,6 +39,11 @@ impl<S: Storage + 'static> Raw<S> {
     /// Create a new [`FormatDriverBuilder`] instance for an image under the given path.
     pub fn builder_path<P: AsRef<Path>>(image_path: P) -> RawOpenBuilder<S> {
         RawOpenBuilder::new_path(image_path)
+    }
+
+    /// Create a new [`FormatCreateBuilder`] instance for the given file.
+    pub fn create_builder(image: S) -> RawCreateBuilder<S> {
+        RawCreateBuilder::new(image)
     }
 
     /// Wrap `inner`, allowing it to be used as a disk image in raw format.
@@ -291,5 +300,68 @@ impl<S: Storage + 'static> FormatDriverBuilder<S> for RawOpenBuilder<S> {
 
     fn get_storage_open_options(&self) -> Option<&StorageOpenOptions> {
         self.0.get_storage_opts()
+    }
+}
+
+/// Creation builder for a new raw image.
+pub struct RawCreateBuilder<S: Storage + 'static>(FormatCreateBuilderBase<S>);
+
+impl<S: Storage + 'static> FormatCreateBuilder<S> for RawCreateBuilder<S> {
+    const FORMAT: Format = Format::Raw;
+    type DriverBuilder = RawOpenBuilder<S>;
+
+    fn new(image: S) -> Self {
+        RawCreateBuilder(FormatCreateBuilderBase::new(image))
+    }
+
+    fn size(mut self, size: u64) -> Self {
+        self.0.set_size(size);
+        self
+    }
+
+    fn preallocate(mut self, prealloc_mode: PreallocateMode) -> Self {
+        self.0.set_preallocate(prealloc_mode);
+        self
+    }
+
+    fn get_size(&self) -> u64 {
+        self.0.get_size()
+    }
+
+    fn get_preallocate(&self) -> PreallocateMode {
+        self.0.get_preallocate()
+    }
+
+    async fn create(self) -> io::Result<()> {
+        self.create_open(DenyImplicitOpenGate::default(), |image| {
+            Ok(Raw::builder(image))
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn create_open<
+        G: ImplicitOpenGate<S>,
+        F: FnOnce(S) -> io::Result<Self::DriverBuilder>,
+    >(
+        self,
+        open_gate: G,
+        open_builder_fn: F,
+    ) -> io::Result<Raw<S>> {
+        let size = self.0.get_size();
+        let prealloc = self.0.get_preallocate();
+        let image = self.0.get_image();
+
+        // Clear of data (and allow for full preallocation, if requested)
+        if image.size()? > 0 {
+            image.resize(size, storage::PreallocateMode::None).await?;
+        }
+
+        let img = open_builder_fn(image)?.write(true).open(open_gate).await?;
+        if size > 0 {
+            img.resize_grow(size, prealloc).await?;
+        }
+
+        Ok(img)
     }
 }
