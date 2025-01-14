@@ -539,7 +539,7 @@ impl Header {
 
         if let Some(backing) = self.backing_filename.as_ref() {
             let offset = header_len + header_exts.len();
-            let size = backing.as_bytes().len();
+            let size = backing.len(); // length in bytes
             let end = offset.checked_add(size).ok_or_else(|| {
                 io::Error::other("Header plus header extensions plus backing filename is too long")
             })?;
