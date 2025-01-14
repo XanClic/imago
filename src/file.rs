@@ -539,9 +539,9 @@ impl File {
                 Ok(true) => break Ok(req_align),
                 Ok(false) => {
                     if req_align >= max_req_align {
-                        break Err(io::Error::other(
-                            "Maximum I/O alignment ({max_req_align}) exceeded",
-                        ));
+                        break Err(io::Error::other(format!(
+                            "Maximum I/O alignment ({max_req_align}) exceeded"
+                        )));
                     }
                     // No reason to probe anything between 1 and 512
                     if req_align == min_req_align {
@@ -586,9 +586,9 @@ impl File {
                 Ok(false) => {
                     // Not aligned
                     if mem_align >= max_mem_align {
-                        break Err(io::Error::other(
-                            "Maximum memory alignment ({max_mem_align}) exceeded",
-                        ));
+                        break Err(io::Error::other(format!(
+                            "Maximum memory alignment ({max_mem_align}) exceeded"
+                        )));
                     }
                     // No reason to probe anything between 1 and the page size (or 4096 at least)
                     if mem_align == min_mem_align {
