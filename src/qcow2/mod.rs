@@ -182,7 +182,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// `None` means using the same data storage for both metadata and data, which should be used
     /// if [`Qcow2::requires_external_data_file()`] is `false`.
     pub fn set_data_file(&mut self, file: Option<S>) {
-        self.storage = file.map(Into::into);
+        self.storage = file;
         self.storage_set = true;
     }
 
@@ -295,7 +295,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// [`Qcow2::set_data_file()`] or [`Qcow2::set_backing()`], respectively.
     pub async fn open_implicit_dependencies(&mut self) -> io::Result<()> {
         if !self.storage_set {
-            self.storage = self.open_implicit_data_file().await?.map(Into::into);
+            self.storage = self.open_implicit_data_file().await?;
             self.storage_set = true;
         }
 
