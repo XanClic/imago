@@ -212,7 +212,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// `None` means using the same data storage for both metadata and data, which should be used
     /// if [`Qcow2::requires_external_data_file()`] is `false`.
     pub fn set_data_file(&mut self, file: Option<S>) {
-        self.storage = file.map(Into::into);
+        self.storage = file;
         self.storage_set = true;
     }
 
@@ -359,10 +359,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         mut gate: G,
     ) -> io::Result<()> {
         if !self.storage_set {
-            self.storage = self
-                .open_implicit_data_file(&mut gate)
-                .await?
-                .map(Into::into);
+            self.storage = self.open_implicit_data_file(&mut gate).await?;
             self.storage_set = true;
         }
 
