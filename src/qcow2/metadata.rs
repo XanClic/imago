@@ -594,7 +594,7 @@ impl Header {
             let backing_file_len = self
                 .backing_filename
                 .as_ref()
-                .map(|n| n.as_bytes().len())
+                .map(|n| n.len()) // length in bytes
                 .unwrap_or(0);
             let header_end = backing_file_ofs
                 .checked_add(backing_file_len)
@@ -621,7 +621,7 @@ impl Header {
 
         if let Some(backing) = self.backing_filename.as_ref() {
             self.v2.backing_file_offset = backing_file_ofs as u64;
-            self.v2.backing_file_size = backing.as_bytes().len() as u32;
+            self.v2.backing_file_size = backing.len() as u32; // length in bytes
         } else {
             self.v2.backing_file_offset = 0;
             self.v2.backing_file_size = 0;
