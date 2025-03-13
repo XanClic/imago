@@ -2804,11 +2804,7 @@ pub trait Table: Sized {
         // the storage’s request/memory alignment, but that is often fair.  If that is not the
         // case, there is not much we can do anyway.
         let byte_size = self.byte_size();
-        let power_of_two_up_to_byte_size = if byte_size.is_power_of_two() {
-            byte_size
-        } else {
-            ((byte_size + 1) / 2).next_power_of_two()
-        };
+        let power_of_two_up_to_byte_size = ((byte_size / 2) + 1).next_power_of_two();
         let alignment = cmp::min(
             power_of_two_up_to_byte_size,
             cmp::max(
