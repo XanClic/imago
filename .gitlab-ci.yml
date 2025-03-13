@@ -89,7 +89,7 @@ check:clippy-nightly:
       else
         CARGO_OPTS=--all-features;
       fi'
-    - 'cargo +nightly clippy
+    - 'RUSTFLAGS=-Dunknown_lints cargo +nightly clippy
       --target $TARGET
       --color always
       --verbose

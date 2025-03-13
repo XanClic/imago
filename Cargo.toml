@@ -46,6 +46,12 @@ sync-wrappers = ["tokio/rt"]
 vm-memory = ["dep:vm-memory"]
 
 [lints.rust]
+# Occasionally, we may need to silence warnings and clippy lints that
+# were only introduced in newer Rust compiler versions.  Do not croak
+# in that case; the nightly clippy job disables this and ensures
+# that there are no misspelled allow() attributes.
+unknown_lints = "allow"
+
 # Prohibit code that is forbidden in Rust 2024
 unsafe_op_in_unsafe_fn = "deny"
 
