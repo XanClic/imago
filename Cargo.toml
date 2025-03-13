@@ -46,6 +46,9 @@ sync-wrappers = ["tokio/rt"]
 vm-memory = ["dep:vm-memory"]
 
 [lints.rust]
+# Prohibit code that is forbidden in Rust 2024
+unsafe_op_in_unsafe_fn = "deny"
+
 warnings = "deny"
 
 [lints.rustdoc]
