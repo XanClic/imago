@@ -417,7 +417,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         Ok((host_offset_start.0, allocated_length))
     }
 
-    /// Inner implementation for [`Qcow2::do_ensure_fixed_mapping()`].
+    /// Inner implementation for [`Qcow2::ensure_fixed_mapping()`].
     ///
     /// Does not do any clean-up: The L2 table will probably be modified, but not written to disk.
     /// Any existing allocations that have been removed from it (and are thus leaked) are entered
