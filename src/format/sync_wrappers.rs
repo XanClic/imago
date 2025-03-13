@@ -222,7 +222,9 @@ impl<S: Storage + 'static> SyncFormatAccess<S> {
     /// Not flushing internal buffers may cause image corruption.  You must ensure the on-disk
     /// state is consistent.
     pub unsafe fn invalidate_cache(&self) -> io::Result<()> {
-        self.runtime.block_on(self.inner.invalidate_cache())
+        // Safety ensured by caller
+        self.runtime
+            .block_on(unsafe { self.inner.invalidate_cache() })
     }
 
     /// Resize to the given size.
