@@ -10,10 +10,13 @@ use crate::storage::drivers::CommonStorageHelper;
 use crate::storage::ext::write_full_zeroes;
 use crate::storage::PreallocateMode;
 use crate::{Storage, StorageCreateOptions, StorageOpenOptions};
+use cfg_if::cfg_if;
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
@@ -21,8 +24,6 @@ use std::os::windows::fs::{FileExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::{cmp, fs};
@@ -447,9 +448,7 @@ impl File {
     /// `direct_io` should be `true` if direct I/O was requested, and can be `false` if that status
     /// is unknown.
     fn new(mut file: fs::File, filename: Option<PathBuf>, direct_io: bool) -> io::Result<Self> {
-        let size = file
-            .seek(SeekFrom::End(0))
-            .err_context(|| "Failed to determine file size")?;
+        let size = get_file_size(&file).err_context(|| "Failed to determine file size")?;
 
         #[cfg(all(unix, not(target_os = "macos")))]
         let direct_io = direct_io || {
@@ -689,16 +688,9 @@ impl File {
     fn get_min_dio_req_align(file: &fs::File) -> usize {
         #[cfg(target_os = "linux")]
         {
-            let mut alignment: libc::c_int = 0;
-            // Safe: BLKSSZGET wants an int.
-            let res = unsafe {
-                libc::ioctl(
-                    file.as_raw_fd(),
-                    libc::BLKSSZGET,
-                    ptr::addr_of_mut!(alignment),
-                )
-            };
-            if res >= 0 && alignment > 0 {
+            let mut alignment = 0;
+            let res = unsafe { ioctl::blksszget(file.as_raw_fd(), &mut alignment) };
+            if res.is_ok() && alignment > 0 {
                 let alignment = alignment as usize;
                 if alignment.is_power_of_two() {
                     return alignment;
@@ -708,32 +700,18 @@ impl File {
 
         #[cfg(target_os = "macos")]
         {
-            let mut alignment: u32 = 0;
-            // Safe: DKIOCGETBLOCKSIZE wants a uint32_t.
-            let res = unsafe {
-                libc::ioctl(
-                    file.as_raw_fd(),
-                    0x40046418, // libc::DKIOCGETBLOCKSIZE
-                    ptr::addr_of_mut!(alignment),
-                )
-            };
-            if res >= 0 && alignment.is_power_of_two() {
+            let mut alignment = 0;
+            let res = unsafe { ioctl::dkiocgetblocksize(file.as_raw_fd(), &mut alignment) };
+            if res.is_ok() && alignment.is_power_of_two() {
                 return alignment as usize;
             }
         }
 
         #[cfg(target_os = "freebsd")]
         {
-            let mut alignment: libc::c_uint = 0;
-            // Safe: DIOCGSECTORSIZE wants an unsigned int.
-            let res = unsafe {
-                libc::ioctl(
-                    file.as_raw_fd(),
-                    libc::DIOCGSECTORSIZE,
-                    ptr::addr_of_mut!(alignment),
-                )
-            };
-            if res >= 0 && alignment.is_power_of_two() {
+            let mut alignment = 0;
+            let res = unsafe { ioctl::diocgsectorsize(file.as_raw_fd(), &mut alignment) };
+            if res.is_ok() && alignment.is_power_of_two() {
                 return alignment as usize;
             }
         }
@@ -834,4 +812,83 @@ impl Display for File {
             write!(f, "file:<unknown path>")
         }
     }
+}
+
+/// Get total size in bytes of the given file.
+///
+/// If the file is a block or character device, use get_device_size() instead of
+/// reading len from metadata which doesn't work on some platforms like macOS.
+fn get_file_size(file: &fs::File) -> io::Result<u64> {
+    #[allow(clippy::bind_instead_of_map)]
+    file.metadata().and_then(|m| {
+        #[cfg(unix)]
+        if m.file_type().is_block_device() || m.file_type().is_char_device() {
+            return get_device_size(file);
+        }
+        Ok(m.len())
+    })
+}
+
+cfg_if! {
+    if #[cfg(target_os = "linux")] {
+        /// Get total size in bytes of the given block or character device.
+        fn get_device_size(file: &fs::File) -> io::Result<u64> {
+            let mut size = 0;
+            unsafe { ioctl::blkgetsize64(file.as_raw_fd(), &mut size) }?;
+            Ok(size)
+        }
+    } else if #[cfg(target_os = "macos")] {
+        /// Get total size in bytes of the given block or character device.
+        fn get_device_size(file: &fs::File) -> io::Result<u64> {
+            let mut block_size = 0;
+            unsafe { ioctl::dkiocgetblocksize(file.as_raw_fd(), &mut block_size) }?;
+            let mut block_count = 0;
+            unsafe { ioctl::dkiocgetblockcount(file.as_raw_fd(), &mut block_count) }?;
+            Ok(u64::from(block_size) * block_count)
+        }
+    } else if #[cfg(target_os = "freebsd")] {
+        /// Get total size in bytes of the given block or character device.
+        fn get_device_size(file: &fs::File) -> io::Result<u64> {
+            let mut size = 0;
+            unsafe { ioctl::diocgmediasize(file.as_raw_fd(), &mut size) }?;
+            Ok(size as u64)
+        }
+    } else if #[cfg(unix)] {
+        /// Get total size in bytes of the given block or character device - unsupported platform.
+        fn get_device_size(_file: &fs::File) -> io::Result<u64> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+}
+
+/// This module generates type-safe wrappers for chosen ioctls
+mod ioctl {
+    #[cfg(unix)]
+    use nix::ioctl_read;
+    #[cfg(target_os = "linux")]
+    use nix::ioctl_read_bad;
+
+    // https://github.com/torvalds/linux/blob/master/include/uapi/linux/fs.h#L200
+
+    #[cfg(target_os = "linux")]
+    ioctl_read!(blkgetsize64, 0x12, 114, u64);
+
+    #[cfg(target_os = "linux")]
+    ioctl_read_bad!(blksszget, libc::BLKSSZGET, libc::c_int);
+
+    // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/disk.h#L198-L199
+
+    #[cfg(target_os = "macos")]
+    ioctl_read!(dkiocgetblocksize, 'd', 24, u32);
+
+    #[cfg(target_os = "macos")]
+    ioctl_read!(dkiocgetblockcount, 'd', 25, u64);
+
+    // https://web.mit.edu/freebsd/head/sys/sys/disk.h
+
+    #[cfg(target_os = "freebsd")]
+    ioctl_read!(diocgsectorsize, 'd', 128, libc::c_uint);
+
+    #[cfg(target_os = "freebsd")]
+    ioctl_read!(diocgmediasize, 'd', 129, libc::off_t);
 }
