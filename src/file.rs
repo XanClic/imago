@@ -6,10 +6,13 @@ use crate::io_buffers::{IoVector, IoVectorMut};
 use crate::misc_helpers::ResultErrorContext;
 use crate::storage::drivers::CommonStorageHelper;
 use crate::{Storage, StorageOpenOptions};
+use cfg_if::cfg_if;
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
@@ -364,9 +367,7 @@ impl File {
     /// `direct_io` should be `true` if direct I/O was requested, and can be `false` if that status
     /// is unknown.
     fn new(mut file: fs::File, filename: Option<PathBuf>, direct_io: bool) -> io::Result<Self> {
-        let size = file
-            .seek(SeekFrom::End(0))
-            .err_context(|| "Failed to determine file size")?;
+        let size = get_file_size(&file).err_context(|| "Failed to determine file size")?;
 
         #[cfg(all(unix, not(target_os = "macos")))]
         let direct_io = direct_io || {
@@ -733,6 +734,53 @@ impl Display for File {
             write!(f, "file:{filename:?}")
         } else {
             write!(f, "file:<unknown path>")
+        }
+    }
+}
+
+/// Get total size in bytes of the given file.
+///
+/// If the file is a block or character device, use get_device_size() instead of
+/// reading len from metadata which doesn't work on some platforms like macOS.
+fn get_file_size(file: &fs::File) -> io::Result<u64> {
+    #[allow(clippy::bind_instead_of_map)]
+    file.metadata().and_then(|m| {
+        #[cfg(unix)]
+        if m.file_type().is_block_device() || m.file_type().is_char_device() {
+            return get_device_size(file);
+        }
+        Ok(m.len())
+    })
+}
+
+cfg_if! {
+    if #[cfg(target_os = "linux")] {
+        /// Get total size in bytes of the given block or character device.
+        fn get_device_size(file: &fs::File) -> io::Result<u64> {
+            let mut size = 0;
+            unsafe { ioctl::blkgetsize64(file.as_raw_fd(), &mut size) }?;
+            Ok(size)
+        }
+    } else if #[cfg(target_os = "macos")] {
+        /// Get total size in bytes of the given block or character device.
+        fn get_device_size(file: &fs::File) -> io::Result<u64> {
+            let mut block_size = 0;
+            unsafe { ioctl::dkiocgetblocksize(file.as_raw_fd(), &mut block_size) }?;
+            let mut block_count = 0;
+            unsafe { ioctl::dkiocgetblockcount(file.as_raw_fd(), &mut block_count) }?;
+            Ok(u64::from(block_size) * block_count)
+        }
+    } else if #[cfg(target_os = "freebsd")] {
+        /// Get total size in bytes of the given block or character device.
+        fn get_device_size(file: &fs::File) -> io::Result<u64> {
+            let mut size = 0;
+            unsafe { ioctl::diocgmediasize(file.as_raw_fd(), &mut size) }?;
+            Ok(size as u64)
+        }
+    } else if #[cfg(unix)] {
+        /// Get total size in bytes of the given block or character device - unsupported platform.
+        fn get_device_size(_file: &fs::File) -> io::Result<u64> {
+            Err(io::ErrorKind::Unsupported.into())
         }
     }
 }
