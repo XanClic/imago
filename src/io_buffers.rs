@@ -307,7 +307,8 @@ impl<'a> IoBufferRefTrait<'a> for IoBufferRef<'a> {
     passthrough_trait_fn! { fn into_ref(self) -> IoBufferRef<'a>; }
 
     unsafe fn into_typed_slice<T: Copy + Sized>(self) -> Self::SliceType<T> {
-        Self::into_typed_slice(self)
+        // Safety ensured by caller
+        unsafe { Self::into_typed_slice(self) }
     }
 }
 
@@ -428,7 +429,8 @@ impl<'a> IoBufferRefTrait<'a> for IoBufferMut<'a> {
     passthrough_trait_fn! { fn into_ref(self) -> IoBufferRef<'a>; }
 
     unsafe fn into_typed_slice<T: Copy + Sized>(self) -> Self::SliceType<T> {
-        Self::into_typed_slice(self)
+        // Safety ensured by caller
+        unsafe { Self::into_typed_slice(self) }
     }
 }
 
@@ -827,7 +829,8 @@ macro_rules! impl_io_vector {
             where
                 Self: 'b
             {
-                Self::as_iovec(self)
+                // Safety ensured by caller
+                unsafe { Self::as_iovec(self) }
             }
         }
 

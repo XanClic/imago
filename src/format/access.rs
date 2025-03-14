@@ -732,7 +732,8 @@ impl<S: Storage + 'static> FormatAccess<S> {
     /// Not flushing internal buffers may cause image corruption.  You must ensure the on-disk
     /// state is consistent.
     pub async unsafe fn invalidate_cache(&self) -> io::Result<()> {
-        self.inner.invalidate_cache().await
+        // Safety ensured by caller
+        unsafe { self.inner.invalidate_cache() }.await
     }
 
     /// Resize to the given size.

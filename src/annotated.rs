@@ -153,7 +153,8 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
     }
 
     async unsafe fn invalidate_cache(&self) -> io::Result<()> {
-        self.inner.invalidate_cache().await
+        // Safety ensured by caller
+        unsafe { self.inner.invalidate_cache() }.await
     }
 
     fn get_storage_helper(&self) -> &CommonStorageHelper {
