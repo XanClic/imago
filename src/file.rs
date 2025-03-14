@@ -21,8 +21,6 @@ use std::os::windows::fs::{FileExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::{cmp, fs};
@@ -689,16 +687,9 @@ impl File {
     fn get_min_dio_req_align(file: &fs::File) -> usize {
         #[cfg(target_os = "linux")]
         {
-            let mut alignment: libc::c_int = 0;
-            // Safe: BLKSSZGET wants an int.
-            let res = unsafe {
-                libc::ioctl(
-                    file.as_raw_fd(),
-                    libc::BLKSSZGET,
-                    ptr::addr_of_mut!(alignment),
-                )
-            };
-            if res >= 0 && alignment > 0 {
+            let mut alignment = 0;
+            let res = unsafe { ioctl::blksszget(file.as_raw_fd(), &mut alignment) };
+            if res.is_ok() && alignment > 0 {
                 let alignment = alignment as usize;
                 if alignment.is_power_of_two() {
                     return alignment;
@@ -708,32 +699,18 @@ impl File {
 
         #[cfg(target_os = "macos")]
         {
-            let mut alignment: u32 = 0;
-            // Safe: DKIOCGETBLOCKSIZE wants a uint32_t.
-            let res = unsafe {
-                libc::ioctl(
-                    file.as_raw_fd(),
-                    0x40046418, // libc::DKIOCGETBLOCKSIZE
-                    ptr::addr_of_mut!(alignment),
-                )
-            };
-            if res >= 0 && alignment.is_power_of_two() {
+            let mut alignment = 0;
+            let res = unsafe { ioctl::dkiocgetblocksize(file.as_raw_fd(), &mut alignment) };
+            if res.is_ok() && alignment.is_power_of_two() {
                 return alignment as usize;
             }
         }
 
         #[cfg(target_os = "freebsd")]
         {
-            let mut alignment: libc::c_uint = 0;
-            // Safe: DIOCGSECTORSIZE wants an unsigned int.
-            let res = unsafe {
-                libc::ioctl(
-                    file.as_raw_fd(),
-                    libc::DIOCGSECTORSIZE,
-                    ptr::addr_of_mut!(alignment),
-                )
-            };
-            if res >= 0 && alignment.is_power_of_two() {
+            let mut alignment = 0;
+            let res = unsafe { ioctl::diocgsectorsize(file.as_raw_fd(), &mut alignment) };
+            if res.is_ok() && alignment.is_power_of_two() {
                 return alignment as usize;
             }
         }
@@ -834,4 +811,36 @@ impl Display for File {
             write!(f, "file:<unknown path>")
         }
     }
+}
+
+/// This module generates type-safe wrappers for chosen ioctls
+mod ioctl {
+    #[cfg(unix)]
+    use nix::ioctl_read;
+    #[cfg(target_os = "linux")]
+    use nix::ioctl_read_bad;
+
+    // https://github.com/torvalds/linux/blob/master/include/uapi/linux/fs.h#L200
+
+    #[cfg(target_os = "linux")]
+    ioctl_read!(blkgetsize64, 0x12, 114, u64);
+
+    #[cfg(target_os = "linux")]
+    ioctl_read_bad!(blksszget, libc::BLKSSZGET, libc::c_int);
+
+    // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/disk.h#L198-L199
+
+    #[cfg(target_os = "macos")]
+    ioctl_read!(dkiocgetblocksize, 'd', 24, u32);
+
+    #[cfg(target_os = "macos")]
+    ioctl_read!(dkiocgetblockcount, 'd', 25, u64);
+
+    // https://web.mit.edu/freebsd/head/sys/sys/disk.h
+
+    #[cfg(target_os = "freebsd")]
+    ioctl_read!(diocgsectorsize, 'd', 128, libc::c_uint);
+
+    #[cfg(target_os = "freebsd")]
+    ioctl_read!(diocgmediasize, 'd', 129, libc::off_t);
 }
