@@ -1,4 +1,4 @@
-//! Use a plain as storage.
+//! Use a plain file or host block device as storage.
 
 #[cfg(unix)]
 use crate::io_buffers::IoBuffer;
@@ -34,7 +34,7 @@ use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZE
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
-/// Use a plain file as storage objects.
+/// Use a plain file or host block device as a storage object.
 #[derive(Debug)]
 pub struct File {
     /// The file.
