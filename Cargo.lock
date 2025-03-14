@@ -82,6 +82,7 @@ version = "0.1.0-modified"
 dependencies = [
  "async-trait",
  "bincode",
+ "cfg-if",
  "libc",
  "miniz_oxide",
  "nix",
