@@ -36,16 +36,12 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         // expected and can be ignored
         if status != TINFLStatus::Done && status != TINFLStatus::HasMoreOutput {
             return Err(io::Error::other(format!(
-                "Failed to decompress cluster (host offset {}+{}): {:?}",
-                compressed_offset, compressed_length, status
+                "Failed to decompress cluster (host offset {compressed_offset}+{compressed_length}): {status:?}",
             )));
         }
         if written < buf.len() {
             return Err(io::Error::other(format!(
-                "Failed to decompress cluster (host offset {}+{}): Decompressed {} bytes, expected {}",
-                compressed_offset,
-                compressed_length,
-                written,
+                "Failed to decompress cluster (host offset {compressed_offset}+{compressed_length}): Decompressed {written} bytes, expected {}",
                 buf.len(),
             )));
         }

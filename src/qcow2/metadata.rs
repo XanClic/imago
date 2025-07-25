@@ -323,21 +323,20 @@ impl Header {
         })?;
         if !(MIN_CLUSTER_SIZE..=MAX_CLUSTER_SIZE).contains(&cluster_size) {
             return Err(invalid_data(format!(
-                "Invalid cluster size: {}; must be between {} and {}",
-                cluster_size, MIN_CLUSTER_SIZE, MAX_CLUSTER_SIZE,
+                "Invalid cluster size: {cluster_size}; must be between {MIN_CLUSTER_SIZE} and {MAX_CLUSTER_SIZE}",
             )));
         }
 
         let min_header_size = V2Header::RAW_SIZE + V3HeaderBase::RAW_SIZE;
         if (v3header_base.header_length as usize) < min_header_size {
             return Err(invalid_data(format!(
-                "qcow2 header too short: {} < {}",
-                v3header_base.header_length, min_header_size,
+                "qcow2 header too short: {} < {min_header_size}",
+                v3header_base.header_length,
             )));
         } else if (v3header_base.header_length as usize) > cluster_size {
             return Err(invalid_data(format!(
-                "qcow2 header too big: {} > {}",
-                v3header_base.header_length, cluster_size,
+                "qcow2 header too big: {} > {cluster_size}",
+                v3header_base.header_length,
             )));
         }
 
@@ -372,8 +371,7 @@ impl Header {
             })?;
         if !(MIN_REFCOUNT_WIDTH..=MAX_REFCOUNT_WIDTH).contains(&rc_width) {
             return Err(invalid_data(format!(
-                "Invalid refcount width: {}; must be between {} and {}",
-                rc_width, MIN_REFCOUNT_WIDTH, MAX_REFCOUNT_WIDTH,
+                "Invalid refcount width: {rc_width}; must be between {MIN_REFCOUNT_WIDTH} and {MAX_REFCOUNT_WIDTH}",
             )));
         }
 
@@ -455,8 +453,7 @@ impl Header {
             });
             if let Some(conflicting) = conflicting {
                 return Err(io::Error::other(format!(
-                    "Found conflicting backing file formats: {:?} != {:?}",
-                    backing_fmt, conflicting
+                    "Found conflicting backing file formats: {backing_fmt:?} != {conflicting:?}",
                 )));
             }
         }
@@ -469,8 +466,7 @@ impl Header {
             });
             if let Some(conflicting) = conflicting {
                 return Err(io::Error::other(format!(
-                    "Found conflicting external data file names: {:?} != {:?}",
-                    ext_data_file, conflicting
+                    "Found conflicting external data file names: {ext_data_file:?} != {conflicting:?}",
                 )));
             }
         }
@@ -741,11 +737,7 @@ impl Header {
             let ext_hdr = HeaderExtensionHeader {
                 extension_type: e.extension_type(),
                 length: data.len().try_into().map_err(|err| {
-                    invalid_data(format!(
-                        "Header extension too long ({}): {}",
-                        data.len(),
-                        err
-                    ))
+                    invalid_data(format!("Header extension too long ({}): {err}", data.len()))
                 })?,
             };
             result.append(&mut bincode.serialize(&ext_hdr).map_err(invalid_data)?);
@@ -918,8 +910,7 @@ impl TableEntry for L1Entry {
 
         if entry.reserved_bits() != 0 {
             return Err(invalid_data(format!(
-                "Invalid L1 entry 0x{:x}, reserved bits set (0x{:x})",
-                value,
+                "Invalid L1 entry 0x{value:x}, reserved bits set (0x{:x})",
                 entry.reserved_bits(),
             )));
         }
@@ -927,9 +918,7 @@ impl TableEntry for L1Entry {
         if let Some(l2_ofs) = entry.l2_offset() {
             if l2_ofs.in_cluster_offset(header.cluster_bits()) != 0 {
                 return Err(invalid_data(format!(
-                    "Invalid L1 entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
-                    value,
-                    l2_ofs,
+                    "Invalid L1 entry 0x{value:x}, offset ({l2_ofs}) is not aligned to cluster size (0x{:x})",
                     header.cluster_size(),
                 )));
             }
@@ -1376,8 +1365,7 @@ impl TableEntry for AtomicL2Entry {
 
         if entry.reserved_bits() != 0 {
             return Err(invalid_data(format!(
-                "Invalid L2 entry 0x{:x}, reserved bits set (0x{:x})",
-                value,
+                "Invalid L2 entry 0x{value:x}, reserved bits set (0x{:x})",
                 entry.reserved_bits(),
             )));
         }
@@ -1385,9 +1373,7 @@ impl TableEntry for AtomicL2Entry {
         if let Some(offset) = entry.cluster_offset(header.external_data_file()) {
             if !entry.is_compressed() && offset.in_cluster_offset(header.cluster_bits()) != 0 {
                 return Err(invalid_data(format!(
-                    "Invalid L2 entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
-                    value,
-                    offset,
+                    "Invalid L2 entry 0x{value:x}, offset ({offset}) is not aligned to cluster size (0x{:x})",
                     header.cluster_size(),
                 )));
             }
@@ -1709,8 +1695,7 @@ impl TableEntry for RefTableEntry {
 
         if entry.reserved_bits() != 0 {
             return Err(invalid_data(format!(
-                "Invalid reftable entry 0x{:x}, reserved bits set (0x{:x})",
-                value,
+                "Invalid reftable entry 0x{value:x}, reserved bits set (0x{:x})",
                 entry.reserved_bits(),
             )));
         }
@@ -1719,9 +1704,7 @@ impl TableEntry for RefTableEntry {
             if rb_ofs.in_cluster_offset(header.cluster_bits()) != 0 {
                 return Err(invalid_data(
                     format!(
-                        "Invalid reftable entry 0x{:x}, offset ({}) is not aligned to cluster size (0x{:x})",
-                        value,
-                        rb_ofs,
+                        "Invalid reftable entry 0x{value:x}, offset ({rb_ofs}) is not aligned to cluster size (0x{:x})",
                         header.cluster_size(),
                     ),
                 ));

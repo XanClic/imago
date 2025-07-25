@@ -103,8 +103,7 @@ impl<S: Storage> StorageExt for S {
         }
 
         trace!(
-            "Unaligned read: 0x{:x} + {} (size: {:#x})",
-            offset,
+            "Unaligned read: 0x{offset:x} + {} (size: {:#x})",
             bufv.len(),
             self.size().unwrap()
         );
@@ -159,8 +158,7 @@ impl<S: Storage> StorageExt for S {
         }
 
         trace!(
-            "Unaligned write: {:#x} + {} (size: {:#x})",
-            offset,
+            "Unaligned write: {offset:#x} + {} (size: {:#x})",
             bufv.len(),
             self.size().unwrap()
         );
