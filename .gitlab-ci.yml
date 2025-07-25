@@ -3,6 +3,7 @@ stages:
   - check
   - build
   - test
+  - publish
 
 workflow:
   rules:
@@ -152,3 +153,19 @@ test:test:
       --all-targets
       --all-features
       --no-fail-fast'
+
+publish:docs:
+  stage: publish
+  image: alpine
+  dependencies:
+    - build:docs
+  script:
+    - mkdir -p public
+    - mv target/doc public/doc
+    - echo '/imago /imago/doc/imago/index.html 302' > public/_redirects
+    - echo '/ /doc/imago/index.html 302' >> public/_redirects
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
