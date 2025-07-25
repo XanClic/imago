@@ -53,11 +53,13 @@ impl<V, E: ErrorContext> ResultErrorContext for Result<V, E> {
 /// bounds, we cannot implement this for `AsRef` (to have a common trait).
 ///
 /// Also includes a lifetime so that it is possible to borrow things for longer.
+#[cfg(feature = "vm-memory")]
 pub trait ImagoAsRef<'a, T: ?Sized> {
     /// Return a simple reference for `self`.
     fn as_ref(&self) -> &'a T;
 }
 
+#[cfg(feature = "vm-memory")]
 impl<'a, T: ?Sized, U: ImagoAsRef<'a, T>> ImagoAsRef<'a, T> for &'a U {
     fn as_ref(&self) -> &'a T {
         <U as ImagoAsRef<T>>::as_ref(self)
