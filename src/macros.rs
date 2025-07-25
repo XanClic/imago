@@ -30,9 +30,8 @@ macro_rules! numerical_enum {
                     _ => Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
-                                "Invalid value for {}: {:x}",
+                                "Invalid value for {}: {val:x}",
                                 stringify!($enum_name),
-                                val,
                             ),
                     )),
                 }

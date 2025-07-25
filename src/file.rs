@@ -562,10 +562,8 @@ impl File {
                 // Failed to determine request alignment, use a presumably safe value
                 let align = cmp::max(req_align, safe_req_align);
                 warn!(
-                    "Failed to probe request alignment ({}; {}), falling back to {} bytes",
-                    err,
+                    "Failed to probe request alignment ({err}; {}), falling back to {align} bytes",
                     err.kind(),
-                    align
                 );
                 align
             }
@@ -609,10 +607,8 @@ impl File {
                 // Failed to determine memory alignment, use a presumably safe value
                 let align = cmp::max(mem_align, safe_mem_align);
                 warn!(
-                    "Failed to probe memory alignment ({}; {}), falling back to {} bytes",
-                    err,
+                    "Failed to probe memory alignment ({err}; {}), falling back to {align} bytes",
                     err.kind(),
-                    align
                 );
                 align
             }

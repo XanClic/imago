@@ -282,11 +282,7 @@ impl<
                     ));
                 };
 
-                trace!(
-                    "Removing entry with key {:?}, aged {}",
-                    oldest_key,
-                    oldest.0
-                );
+                trace!("Removing entry with key {oldest_key:?}, aged {}", oldest.0);
 
                 let mut oldest_entry = map.remove(&oldest_key).unwrap();
                 match Arc::try_unwrap(oldest_entry.value.take().unwrap()) {
