@@ -118,10 +118,6 @@ build:
     - CARGO_OPTS: [ "", "--all-features" ]
   script:
     - cargo +stable build --verbose --color always $CARGO_OPTS
-  artifacts:
-    paths:
-      - target/
-      - Dockerfile
 
 build:docs:
   extends: .rust_template
