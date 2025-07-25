@@ -2,6 +2,10 @@
 
 Provides access to VM image formats.
 
+Documentation:
+* Stable (released): [https://docs.rs/imago](https://docs.rs/imago/latest/imago)
+* *main* branch: [https://hreitz.gitlab.io/imago](https://hreitz.gitlab.io/imago)
+
 Simple example (requires the `sync-wrappers` feature):
 ```rust
 use imago::file::File;
