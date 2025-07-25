@@ -2848,7 +2848,7 @@ fn check_table(
         )));
     }
 
-    if offset % (cluster_size as u64) != 0 {
+    if !offset.is_multiple_of(cluster_size as u64) {
         return Err(invalid_data(format!("{name}: Unaligned offset: {offset}")));
     }
 

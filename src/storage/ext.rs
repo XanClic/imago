@@ -111,7 +111,7 @@ impl<S: Storage> StorageExt for S {
         let req_align_mask = req_align as u64 - 1;
         // Length must be aligned to both memory and request alignments
         let len_align_mask = req_align_mask | (mem_align as u64 - 1);
-        debug_assert!((len_align_mask + 1) % (req_align as u64) == 0);
+        debug_assert!((len_align_mask + 1).is_multiple_of(req_align as u64));
 
         let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !req_align_mask;
@@ -167,7 +167,7 @@ impl<S: Storage> StorageExt for S {
         // Length must be aligned to both memory and request alignments
         let len_align_mask = req_align_mask | (mem_align - 1);
         let len_align = req_align_mask + 1;
-        debug_assert!(len_align % req_align == 0);
+        debug_assert!(len_align.is_multiple_of(req_align));
 
         let unpadded_end = offset + bufv.len();
         let padded_offset = offset & !(req_align_mask as u64);
