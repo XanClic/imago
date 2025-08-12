@@ -44,7 +44,7 @@ workflow:
 
 .rust_template:
   extends: .base_job_template
-  image: $CI_REGISTRY_IMAGE/imago-ci/fedora-rustup:latest
+  image: $CI_REGISTRY/hreitz/imago/imago-ci/fedora-rustup:latest
   cache:
     - key: $CI_COMMIT_REF
       paths: [ target/ ]
