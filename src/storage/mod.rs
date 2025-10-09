@@ -27,6 +27,10 @@ pub struct StorageOpenOptions {
 
     /// Whether to bypass the host page cache (if applicable).
     pub(crate) direct: bool,
+
+    /// macOS-only: Use fsync() instead of F_FULLFSYNC on `sync()` method.
+    #[cfg(target_os = "macos")]
+    pub(crate) relaxed_sync: bool,
 }
 
 /// Implementation for storage objects.
@@ -531,5 +535,38 @@ impl StorageOpenOptions {
     pub fn direct(mut self, direct: bool) -> Self {
         self.direct = direct;
         self
+    }
+
+    /// macOS-only: whether to use relaxed synchronization on `File`.
+    ///
+    /// If relaxed synchronization is enabled, `File::sync()` will use the `fsync()` syscall
+    /// instead of `fcntl(F_FULLFSYNC)`, which is a lighter synchronization mechanism that flushes
+    /// the filesystem cache to the drive, but doesn't request the drive to flush its internal
+    /// buffers to persistent storage.
+    #[cfg(target_os = "macos")]
+    pub fn relaxed_sync(mut self, relaxed_sync: bool) -> Self {
+        self.relaxed_sync = relaxed_sync;
+        self
+    }
+
+    /// Get the set filename (if any).
+    pub fn get_filename(&self) -> Option<&Path> {
+        self.filename.as_deref()
+    }
+
+    /// Return the set writable state.
+    pub fn get_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Return the set direct state.
+    pub fn get_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// macOS-only: return the relaxed synchronization state.
+    #[cfg(target_os = "macos")]
+    pub fn get_relaxed_sync(&self) -> bool {
+        self.relaxed_sync
     }
 }

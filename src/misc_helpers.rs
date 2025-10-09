@@ -53,11 +53,13 @@ impl<V, E: ErrorContext> ResultErrorContext for Result<V, E> {
 /// bounds, we cannot implement this for `AsRef` (to have a common trait).
 ///
 /// Also includes a lifetime so that it is possible to borrow things for longer.
+#[cfg(feature = "vm-memory")]
 pub trait ImagoAsRef<'a, T: ?Sized> {
     /// Return a simple reference for `self`.
     fn as_ref(&self) -> &'a T;
 }
 
+#[cfg(feature = "vm-memory")]
 impl<'a, T: ?Sized, U: ImagoAsRef<'a, T>> ImagoAsRef<'a, T> for &'a U {
     fn as_ref(&self) -> &'a T {
         <U as ImagoAsRef<T>>::as_ref(self)
@@ -70,6 +72,30 @@ impl<'a, B: vm_memory::bitmap::BitmapSlice> ImagoAsRef<'a, vm_memory::VolatileSl
 {
     fn as_ref(&self) -> &'a vm_memory::VolatileSlice<'a, B> {
         self
+    }
+}
+
+/// Repeat a syscall while it returns `EINTR`.
+///
+/// Invoke the given syscall, check whether it returned an error (i.e. the integer value -1), and
+/// if so, turn it into an `io::Error`.  If that error is `EINTR`, re-run the syscall, multiple
+/// times if necessary.
+///
+/// If no error was returned (i.e. not -1), return the returned value.
+#[cfg(unix)]
+pub(crate) fn while_eintr<R: From<i8> + PartialEq, F: FnMut() -> R>(
+    mut syscall: F,
+) -> io::Result<R> {
+    loop {
+        let ret: R = syscall();
+        if ret == R::from(-1i8) {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(err);
+            }
+        } else {
+            return Ok(ret);
+        }
     }
 }
 

@@ -3,6 +3,7 @@ stages:
   - check
   - build
   - test
+  - publish
 
 workflow:
   rules:
@@ -43,7 +44,7 @@ workflow:
 
 .rust_template:
   extends: .base_job_template
-  image: $CI_REGISTRY_IMAGE/imago-ci/fedora-rustup:latest
+  image: $CI_REGISTRY/hreitz/imago/imago-ci/fedora-rustup:latest
   cache:
     - key: $CI_COMMIT_REF
       paths: [ target/ ]
@@ -117,10 +118,6 @@ build:
     - CARGO_OPTS: [ "", "--all-features" ]
   script:
     - cargo +stable build --verbose --color always $CARGO_OPTS
-  artifacts:
-    paths:
-      - target/
-      - Dockerfile
 
 build:docs:
   extends: .rust_template
@@ -152,3 +149,20 @@ test:test:
       --all-targets
       --all-features
       --no-fail-fast'
+
+publish:docs:
+  stage: publish
+  image: alpine
+  dependencies:
+    - build:docs
+  script:
+    - mkdir -p public
+    - mv target/doc public/doc
+    - echo '/imago /imago/doc/imago/index.html 302' > public/_redirects
+    - echo '/ /doc/imago/index.html 302' >> public/_redirects
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+  pages: true
