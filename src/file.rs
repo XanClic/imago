@@ -56,6 +56,10 @@ pub struct File {
 
     /// Storage helper.
     common_storage_helper: CommonStorageHelper,
+
+    /// macOS-only: Use fsync() instead of F_FULLFSYNC on `sync()` method.
+    #[cfg(target_os = "macos")]
+    relaxed_sync: bool,
 }
 
 impl TryFrom<fs::File> for File {
@@ -68,7 +72,13 @@ impl TryFrom<fs::File> for File {
     /// When using this, the resulting object will not know its own filename.  That makes it
     /// impossible to auto-resolve relative paths to it, e.g. qcow2 backing file names.
     fn try_from(file: fs::File) -> io::Result<Self> {
-        Self::new(file, None, false)
+        Self::new(
+            file,
+            None,
+            false,
+            #[cfg(target_os = "macos")]
+            false,
+        )
     }
 }
 
@@ -362,6 +372,12 @@ impl Storage for File {
     }
 
     async fn sync(&self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if self.relaxed_sync {
+            // Safe: File descriptor is valid and there aren't any other arguments.
+            while_eintr(|| unsafe { libc::fsync(self.file.write().unwrap().as_raw_fd()) })?;
+            return Ok(());
+        }
         self.file.write().unwrap().sync_all()
     }
 
@@ -447,7 +463,12 @@ impl File {
     ///
     /// `direct_io` should be `true` if direct I/O was requested, and can be `false` if that status
     /// is unknown.
-    fn new(mut file: fs::File, filename: Option<PathBuf>, direct_io: bool) -> io::Result<Self> {
+    fn new(
+        mut file: fs::File,
+        filename: Option<PathBuf>,
+        direct_io: bool,
+        #[cfg(target_os = "macos")] relaxed_sync: bool,
+    ) -> io::Result<Self> {
         let size = get_file_size(&file).err_context(|| "Failed to determine file size")?;
 
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -486,6 +507,8 @@ impl File {
             mem_align,
             size: size.into(),
             common_storage_helper: Default::default(),
+            #[cfg(target_os = "macos")]
+            relaxed_sync,
         })
     }
 
@@ -767,7 +790,13 @@ impl File {
                 .err_context(|| "Failed to disable host cache")?;
         }
 
-        Self::new(file, Some(filename_owned), opts.direct)
+        Self::new(
+            file,
+            Some(filename_owned),
+            opts.direct,
+            #[cfg(target_os = "macos")]
+            opts.relaxed_sync,
+        )
     }
 
     /// Attempt to discard range by truncating the file.
