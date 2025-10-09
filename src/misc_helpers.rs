@@ -75,6 +75,30 @@ impl<'a, B: vm_memory::bitmap::BitmapSlice> ImagoAsRef<'a, vm_memory::VolatileSl
     }
 }
 
+/// Repeat a syscall while it returns `EINTR`.
+///
+/// Invoke the given syscall, check whether it returned an error (i.e. the integer value -1), and
+/// if so, turn it into an `io::Error`.  If that error is `EINTR`, re-run the syscall, multiple
+/// times if necessary.
+///
+/// If no error was returned (i.e. not -1), return the returned value.
+#[cfg(unix)]
+pub(crate) fn while_eintr<R: From<i8> + PartialEq, F: FnMut() -> R>(
+    mut syscall: F,
+) -> io::Result<R> {
+    loop {
+        let ret: R = syscall();
+        if ret == R::from(-1i8) {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(err);
+            }
+        } else {
+            return Ok(ret);
+        }
+    }
+}
+
 /// Generate an `io::Error` of kind `InvalidData`.
 pub(crate) fn invalid_data<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
     error: E,

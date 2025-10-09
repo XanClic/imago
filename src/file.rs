@@ -3,6 +3,8 @@
 #[cfg(unix)]
 use crate::io_buffers::IoBuffer;
 use crate::io_buffers::{IoVector, IoVectorMut};
+#[cfg(unix)]
+use crate::misc_helpers::while_eintr;
 use crate::misc_helpers::ResultErrorContext;
 use crate::storage::drivers::CommonStorageHelper;
 use crate::{Storage, StorageOpenOptions};
@@ -117,26 +119,18 @@ impl Storage for File {
     ) -> io::Result<()> {
         while !bufv.is_empty() {
             let iovec = unsafe { bufv.as_iovec() };
-            let result = unsafe {
+            let preadv_offset = offset
+                .try_into()
+                .map_err(|_| io::Error::other("Read offset overflow"))?;
+
+            let len = while_eintr(|| unsafe {
                 libc::preadv(
                     self.file.read().unwrap().as_raw_fd(),
                     iovec.as_ptr(),
                     iovec.len() as libc::c_int,
-                    offset
-                        .try_into()
-                        .map_err(|_| io::Error::other("Read offset overflow"))?,
+                    preadv_offset,
                 )
-            };
-
-            let len = if result < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(err);
-            } else {
-                result as u64
-            };
+            })? as u64;
 
             if len == 0 {
                 // End of file
@@ -177,28 +171,20 @@ impl Storage for File {
     async unsafe fn pure_writev(&self, mut bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
         while !bufv.is_empty() {
             let iovec = unsafe { bufv.as_iovec() };
-            let result = unsafe {
+            let pwritev_offset = offset
+                .try_into()
+                .map_err(|_| io::Error::other("Write offset overflow"))?;
+
+            let len = while_eintr(|| unsafe {
                 libc::pwritev(
                     self.file.read().unwrap().as_raw_fd(),
                     iovec.as_ptr(),
                     iovec.len() as libc::c_int,
-                    offset
-                        .try_into()
-                        .map_err(|_| io::Error::other("Write offset overflow"))?,
+                    pwritev_offset,
                 )
-            };
+            })? as u64;
 
-            let len = if result < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(err);
-            } else {
-                result as u64
-            };
-
-            if result == 0 {
+            if len == 0 {
                 // Should not happen, i.e. is an error
                 return Err(io::ErrorKind::WriteZero.into());
             }
@@ -254,17 +240,14 @@ impl Storage for File {
 
         let file = self.file.read().unwrap();
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
-        let ret = unsafe {
+        while_eintr(|| unsafe {
             libc::fallocate(
                 file.as_raw_fd(),
                 libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
                 offset,
                 length,
             )
-        };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        })?;
 
         Ok(())
     }
@@ -340,10 +323,7 @@ impl Storage for File {
         };
         let file = self.file.read().unwrap();
         // Safe: FD is valid, passed pointer is valid and its type matches the call.
-        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) })?;
 
         Ok(())
     }
@@ -553,17 +533,16 @@ impl File {
     ) -> io::Result<bool> {
         // Use `libc::pread` so we get well-defined errors.
         // Safe: Passing the slice as the buffer it is.
-        let ret = unsafe {
+        let ret = while_eintr(|| unsafe {
             libc::pread(
                 file.as_raw_fd(),
                 slice.as_mut_ptr() as *mut libc::c_void,
                 slice.len(),
                 offset,
             )
-        };
+        });
 
-        if ret < 0 {
-            let err = io::Error::last_os_error();
+        if let Err(err) = ret {
             if err.raw_os_error() == Some(libc::EINVAL) {
                 return Ok(false);
             } else {
@@ -576,17 +555,16 @@ impl File {
         }
 
         // Safe: Passing the slice as the buffer it is.
-        let ret = unsafe {
+        let ret = while_eintr(|| unsafe {
             libc::pwrite(
                 file.as_raw_fd(),
                 slice.as_ptr() as *const libc::c_void,
                 slice.len(),
                 offset,
             )
-        };
+        });
 
-        if ret < 0 {
-            let err = io::Error::last_os_error();
+        if let Err(err) = ret {
             if err.raw_os_error() == Some(libc::EINVAL) {
                 Ok(false)
             } else if err.raw_os_error() == Some(libc::EBADF) {
@@ -681,14 +659,8 @@ impl File {
         #[cfg(target_os = "macos")]
         if opts.direct {
             // Safe: We check the return value.
-            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                return Err(io::Error::new(
-                    err.kind(),
-                    format!("Failed to disable host cache: {err}"),
-                ));
-            }
+            while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) })
+                .err_context(|| "Failed to disable host cache")?;
         }
 
         Self::new(file, Some(filename_owned), opts.direct)
