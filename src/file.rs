@@ -47,6 +47,12 @@ pub struct File {
     /// Minimal memory buffer alignment.
     mem_align: usize,
 
+    /// Minimum required alignment for zero writes.
+    zero_align: usize,
+
+    /// Minimum required alignment for effective discards.
+    discard_align: usize,
+
     /// Cached file length.
     ///
     /// Third parties changing the length concurrently is pretty certain to break things anyway.
@@ -96,6 +102,14 @@ impl Storage for File {
 
     fn req_align(&self) -> usize {
         self.req_align
+    }
+
+    fn zero_align(&self) -> usize {
+        self.zero_align
+    }
+
+    fn discard_align(&self) -> usize {
+        self.discard_align
     }
 
     fn size(&self) -> io::Result<u64> {
@@ -394,7 +408,7 @@ impl File {
             (1, 1)
         };
 
-        let (req_align, mem_align) =
+        let (req_align, mem_align, zero_align, discard_align) =
             Self::probe_alignments(&mut file, min_req_align, min_mem_align);
         assert!(req_align.is_power_of_two());
         assert!(mem_align.is_power_of_two());
@@ -404,6 +418,8 @@ impl File {
             filename,
             req_align,
             mem_align,
+            zero_align,
+            discard_align,
             size: size.into(),
             common_storage_helper: Default::default(),
             #[cfg(target_os = "macos")]
@@ -411,7 +427,7 @@ impl File {
         })
     }
 
-    /// Probe minimal request and memory alignments.
+    /// Probe minimal request, memory, zero and discard alignments.
     ///
     /// Start at `min_req_align` and `min_mem_align`.
     #[cfg(unix)]
@@ -419,7 +435,7 @@ impl File {
         file: &mut fs::File,
         min_req_align: usize,
         min_mem_align: usize,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize, usize) {
         let mut page_size = page_size::get();
         if !page_size.is_power_of_two() {
             let assume = page_size.checked_next_power_of_two().unwrap_or(4096);
@@ -427,6 +443,18 @@ impl File {
             warn!("Reported page size of {page_size} is not a power of two, assuming {assume}");
             page_size = assume;
         }
+
+        #[cfg(not(target_os = "macos"))]
+        let (zero_align, discard_align) = (1, 1);
+        #[cfg(target_os = "macos")]
+        let (zero_align, discard_align) = {
+            let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+            // Safe: FD is valid, passed pointer is valid and its type matches the call.
+            match while_eintr(|| unsafe { libc::fstatfs(file.as_raw_fd(), &mut statfs) }) {
+                Ok(_) => (statfs.f_bsize as usize, statfs.f_bsize as usize),
+                Err(_) => (page_size, page_size),
+            }
+        };
 
         let mut writable = true;
 
@@ -444,7 +472,7 @@ impl File {
                     "Failed to allocate memory to probe request alignment ({err}), \
                     falling back to {safe_req_align}/{safe_mem_align}"
                 );
-                return (safe_req_align, safe_mem_align);
+                return (safe_req_align, safe_mem_align, zero_align, discard_align);
             }
         };
 
@@ -536,7 +564,7 @@ impl File {
             }
         };
 
-        (req_align, mem_align)
+        (req_align, mem_align, zero_align, discard_align)
     }
 
     /// Do an alignment-probing I/O access.
@@ -653,9 +681,14 @@ impl File {
         _file: &mut fs::File,
         min_req_align: usize,
         min_mem_align: usize,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize, usize) {
         // TODO: Need to find out how Windows indicates unaligned I/O
-        (cmp::max(min_req_align, 4096), cmp::max(min_mem_align, 4096))
+        (
+            cmp::max(min_req_align, 4096),
+            cmp::max(min_mem_align, 4096),
+            1,
+            1,
+        )
     }
 
     /// Implementation for [`File::open()`] and [`File::open_sync()`].
