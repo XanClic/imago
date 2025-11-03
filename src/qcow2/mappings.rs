@@ -391,7 +391,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             current_guest_cluster = next;
 
             let chunk_length = cmp::min(full_length - allocated_length, 1 << cb) as usize;
-            let partial_skip_cow = overwrite.then(|| 0..chunk_length);
+            let partial_skip_cow = overwrite.then_some(0..chunk_length);
 
             let next_host_cluster = current_host_cluster + ClusterCount(1);
             let host_cluster = self
