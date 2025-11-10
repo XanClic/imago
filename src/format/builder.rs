@@ -7,6 +7,7 @@ use super::{Format, PreallocateMode};
 use crate::misc_helpers::ResultErrorContext;
 use crate::qcow2::Qcow2OpenBuilder;
 use crate::raw::RawOpenBuilder;
+use crate::vmdk::VmdkOpenBuilder;
 use crate::{FormatAccess, Storage, StorageOpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -324,6 +325,9 @@ pub(crate) enum FormatOrBuilder<S: Storage + 'static, F: WrappedFormat<S>> {
 
     /// Raw image builder
     RawBuilder(Box<RawOpenBuilder<S>>),
+
+    /// Vmdk image builder
+    VmdkBuilder(Box<VmdkOpenBuilder<S>>),
 }
 
 impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatOrBuilder<S, F> {
@@ -334,6 +338,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatOrBuilder<S, F> 
         match format {
             Format::Qcow2 => Self::Qcow2Builder(Box::new(Qcow2OpenBuilder::new_path(path))),
             Format::Raw => Self::RawBuilder(Box::new(RawOpenBuilder::new_path(path))),
+            Format::Vmdk => Self::VmdkBuilder(Box::new(VmdkOpenBuilder::new_path(path))),
         }
     }
 
@@ -351,6 +356,11 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatOrBuilder<S, F> 
                 Ok(F::wrap(FormatAccess::new(f)))
             }
             FormatOrBuilder::RawBuilder(b) => {
+                let b = b.storage_open_options(opts);
+                let f = gate.open_format(b).await?;
+                Ok(F::wrap(FormatAccess::new(f)))
+            }
+            FormatOrBuilder::VmdkBuilder(b) => {
                 let b = b.storage_open_options(opts);
                 let f = gate.open_format(b).await?;
                 Ok(F::wrap(FormatAccess::new(f)))

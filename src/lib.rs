@@ -105,6 +105,7 @@ pub mod qcow2;
 pub mod raw;
 pub mod storage;
 mod vector_select;
+pub mod vmdk;
 
 pub use format::access::{FormatAccess, Mapping};
 pub use format::builder::{FormatCreateBuilder, FormatDriverBuilder};
