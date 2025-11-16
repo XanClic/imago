@@ -144,6 +144,31 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// existing data mappings thanks to the mutable `self` reference, which ensures that old data
     /// mappings returned by [`FormatDriverInstance::get_mapping()`] cannot be held onto.
     async fn discard_to_zero(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
+        unsafe { self.discard_to_zero_unsafe(_offset, _length).await }
+    }
+
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Unsafe variant of [FormatDriverInstance::discard_to_zero()], only requiring an immutable
+    /// &self
+    ///
+    /// # Safety
+    /// This function is marked as unsafe because:
+    /// - It may invalidate all existing data mappings.
+    ///
+    /// The caller must ensure that no other references to this driver instance exist and that
+    /// the caller must ensure that all previously looked up mappings are no longer assumed to
+    /// be valid after this operation.
+    ///
+    /// Because mappings contain references to the block driver instance, one way to do so is
+    /// to have a mutable reference to the block driver instance, which will automatically
+    /// ensure there are no other references (and thus no mappings).  In that case, you can use
+    /// the safe variant [`Self::discard_to_zero()`].
+    async unsafe fn discard_to_zero_unsafe(
+        &self,
+        _offset: u64,
+        _length: u64,
+    ) -> io::Result<(u64, u64)> {
         Err(io::ErrorKind::Unsupported.into())
     }
 
@@ -152,6 +177,31 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// Effectively the same as [`FormatDriverInstance::discard_to_zero()`], but the discarded area
     /// may read as any data.  Backing file data should not reappear, however.
     async fn discard_to_any(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
+        unsafe { self.discard_to_any_unsafe(_offset, _length).await }
+    }
+
+    /// Discard the given range.
+    ///
+    /// Unsafe variant of [FormatDriverInstance::discard_to_any()], only requiring an immutable
+    /// &self
+    ///
+    /// # Safety
+    /// This function is marked as unsafe because:
+    /// - It may invalidate all existing data mappings.
+    ///
+    /// The caller must ensure that no other references to this driver instance exist and that
+    /// the caller must ensure that all previously looked up mappings are no longer assumed to
+    /// be valid after this operation.
+    ///
+    /// Because mappings contain references to the block driver instance, one way to do so is
+    /// to have a mutable reference to the block driver instance, which will automatically
+    /// ensure there are no other references (and thus no mappings).  In that case, you can use
+    /// the safe variant [`Self::discard_to_any()`].
+    async unsafe fn discard_to_any_unsafe(
+        &self,
+        _offset: u64,
+        _length: u64,
+    ) -> io::Result<(u64, u64)> {
         Err(io::ErrorKind::Unsupported.into())
     }
 
@@ -167,6 +217,31 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     ///
     /// May break existing data mappings thanks to the mutable `self` reference.
     async fn discard_to_backing(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
+        unsafe { self.discard_to_backing_unsafe(_offset, _length).await }
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Unsafe variant of [FormatDriverInstance::discard_to_backing()], only requiring an immutable
+    /// &self
+    ///
+    /// # Safety
+    /// This function is marked as unsafe because:
+    /// - It may invalidate all existing data mappings.
+    ///
+    /// The caller must ensure that no other references to this driver instance exist and that
+    /// the caller must ensure that all previously looked up mappings are no longer assumed to
+    /// be valid after this operation.
+    ///
+    /// Because mappings contain references to the block driver instance, one way to do so is
+    /// to have a mutable reference to the block driver instance, which will automatically
+    /// ensure there are no other references (and thus no mappings).  In that case, you can use
+    /// the safe variant [`Self::discard_to_backing()`].
+    async unsafe fn discard_to_backing_unsafe(
+        &self,
+        _offset: u64,
+        _length: u64,
+    ) -> io::Result<(u64, u64)> {
         Err(io::ErrorKind::Unsupported.into())
     }
 

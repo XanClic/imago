@@ -170,11 +170,19 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
         Ok((aligned_offset, aligned_length))
     }
 
-    async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+    async unsafe fn discard_to_zero_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
         self.ensure_zero_mapping(offset, length).await
     }
 
-    async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+    async unsafe fn discard_to_any_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
         let discard_align = self.inner.discard_align();
         assert!(discard_align.is_power_of_two());
 
@@ -191,8 +199,12 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
         Ok((aligned_offset, aligned_length))
     }
 
-    async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
-        self.discard_to_zero(offset, length).await
+    async unsafe fn discard_to_backing_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
+        unsafe { self.discard_to_zero_unsafe(offset, length).await }
     }
 
     async fn flush(&self) -> io::Result<()> {
