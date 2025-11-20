@@ -6,15 +6,14 @@
 pub(crate) mod drivers;
 pub mod ext;
 
-use crate::io_buffers::{IoBuffer, IoVector, IoVectorMut};
+use crate::io_buffers::{IoVector, IoVectorMut};
 use drivers::CommonStorageHelper;
-use ext::StorageExt;
 use std::fmt::{Debug, Display};
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{cmp, io};
 
 /// Parameters from which a storage object can be constructed.
 #[derive(Clone, Default)]
@@ -103,7 +102,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::mem_align()`] and [`Self::req_align()`], and safeguards we want to implement for
     /// safe concurrent access may not be available.
     ///
-    /// Use [`StorageExt::readv()`] instead.
+    /// Use [`StorageExt::readv()`](crate::StorageExt::readv()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()>;
 
@@ -120,7 +119,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::mem_align()`] and [`Self::req_align()`], and safeguards we want to implement for
     /// safe concurrent access may not be available.
     ///
-    /// Use [`StorageExt::writev()`] instead.
+    /// Use [`StorageExt::writev()`](crate::StorageExt::writev()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()>;
 
@@ -134,22 +133,10 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::zero_align()`], and safeguards we want to implement for safe concurrent access may
     /// not be available.
     ///
-    /// Use [`StorageExt::write_zeroes()`] instead.
+    /// Use [`StorageExt::write_zeroes()`](crate::StorageExt::write_zeroes()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
-    async unsafe fn pure_write_zeroes(&self, mut offset: u64, mut length: u64) -> io::Result<()> {
-        let buflen = cmp::min(length, 1048576) as usize;
-        let mut buf = IoBuffer::new(buflen, self.mem_align())?;
-        buf.as_mut().into_slice().fill(0);
-
-        while length > 0 {
-            let chunk_length = cmp::min(length, 1048576) as usize;
-            self.writev(buf.as_ref_range(0..chunk_length).into(), offset)
-                .await?;
-            offset += chunk_length as u64;
-            length -= chunk_length as u64;
-        }
-
-        Ok(())
+    async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        ext::write_full_zeroes(self, offset, length).await
     }
 
     /// Discard the given range, with undefined contents when read back.
@@ -164,7 +151,7 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     /// [`Self::discard_align()`], and safeguards we want to implement for safe concurrent access
     /// may not be available.
     ///
-    /// Use [`StorageExt::discard()`] instead.
+    /// Use [`StorageExt::discard()`](crate::StorageExt::discard()) instead.
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_discard(&self, _offset: u64, _length: u64) -> io::Result<()> {
         Ok(())
@@ -184,7 +171,8 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn sync(&self) -> io::Result<()>;
 
-    /// Return the storage helper object (used by the [`StorageExt`] implementation).
+    /// Return the storage helper object (used by the [`StorageExt`](crate::StorageExt)
+    /// implementation).
     fn get_storage_helper(&self) -> &CommonStorageHelper;
 }
 

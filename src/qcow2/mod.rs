@@ -21,6 +21,7 @@ use crate::{FormatAccess, Storage, StorageExt, StorageOpenOptions};
 use allocation::Allocator;
 use async_trait::async_trait;
 use cache::L2CacheBackend;
+use mappings::FixedMapping;
 use metadata::*;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
@@ -313,6 +314,20 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .then_some(())
             .ok_or_else(|| io::Error::other("Image is read-only"))
     }
+
+    /// Check whether `length + offset` is within the disk size.
+    fn check_disk_bounds<D: Display>(&self, length: u64, offset: u64, req: D) -> io::Result<()> {
+        let size = self.header.size();
+        let length_until_eof = size.saturating_sub(offset);
+        if length_until_eof >= length {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Cannot {req} beyond the disk size ({length} + {offset} > {size}"),
+            ))
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -363,10 +378,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         length: u64,
         overwrite: bool,
     ) -> io::Result<(&'a S, u64, u64)> {
-        let length_until_eof = self.header.size().saturating_sub(offset);
-        if length_until_eof < length {
-            return Err(io::Error::other("Cannot allocate beyond the disk size"));
-        }
+        self.check_disk_bounds(offset, length, "allocate")?;
 
         if length == 0 {
             return Ok((self.storage(), 0, 0));
@@ -375,6 +387,45 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.need_writable()?;
         let offset = GuestOffset(offset);
         self.do_ensure_data_mapping(offset, length, overwrite).await
+    }
+
+    async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "write")?;
+
+        self.ensure_fixed_mapping(
+            GuestOffset(offset),
+            length,
+            FixedMapping::ZeroRetainAllocation,
+        )
+        .await
+        .map(|(ofs, len)| (ofs.0, len))
+    }
+
+    async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "discard")?;
+
+        // Safe to discard: We have a mutable `self` reference
+        // Note this will return an `Unsupported` error for v2 images.  That’s OK, safely
+        // discarding on them is a hairy affair, and they are really outdated by now.
+        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
+            .await
+            .map(|(ofs, len)| (ofs.0, len))
+    }
+
+    async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.discard_to_zero(offset, length).await
+    }
+
+    async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        self.need_writable()?;
+        self.check_disk_bounds(offset, length, "discard")?;
+
+        // Safe to discard: We have a mutable `self` reference
+        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::FullDiscard)
+            .await
+            .map(|(ofs, len)| (ofs.0, len))
     }
 
     async fn readv_special(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
