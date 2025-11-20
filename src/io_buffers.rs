@@ -261,6 +261,10 @@ impl<'a> IoBufferRef<'a> {
     /// Caller must ensure that alignment and length requirements are met and that the resulting
     /// data is valid.
     pub unsafe fn into_typed_slice<T: Copy + Sized>(self) -> &'a [T] {
+        if self.is_empty() {
+            return &[];
+        }
+
         // Safety ensured by the caller; we ensure that nothing outside of this buffer will be part
         // of the slice
         unsafe { slice::from_raw_parts(self.as_ptr() as *const T, self.len() / size_of::<T>()) }
@@ -379,6 +383,10 @@ impl<'a> IoBufferMut<'a> {
     /// Caller must ensure that alignment and length requirements are met and that the resulting
     /// data is valid.
     pub unsafe fn into_typed_slice<T: Copy + Sized>(self) -> &'a mut [T] {
+        if self.is_empty() {
+            return &mut [];
+        }
+
         // Safety ensured by the caller; we ensure that nothing outside of this buffer will be part
         // of the slice
         unsafe { slice::from_raw_parts_mut(self.as_ptr() as *mut T, self.len() / size_of::<T>()) }
@@ -933,9 +941,13 @@ impl<'a> IoVector<'a> {
         let buffers = ptr_guards
             .iter()
             .map(|pg| {
-                // Safe because this whole module basically exists to follow the same design concepts
-                // as `VolatileSlice`.
-                let slice = unsafe { std::slice::from_raw_parts(pg.as_ptr(), pg.len()) };
+                let slice = if pg.len() == 0 {
+                    &[]
+                } else {
+                    // Safe because this whole module basically exists to follow the same design concepts
+                    // as `VolatileSlice`.
+                    unsafe { std::slice::from_raw_parts(pg.as_ptr(), pg.len()) }
+                };
                 IoSlice::new(slice)
             })
             .collect::<Vec<_>>();
@@ -1011,9 +1023,13 @@ impl<'a> IoVectorMut<'a> {
         let buffers = ptr_guards
             .iter()
             .map(|pg| {
-                // Safe because this whole module basically exists to follow the same design concepts
-                // as `VolatileSlice`.
-                let slice = unsafe { std::slice::from_raw_parts_mut(pg.as_ptr(), pg.len()) };
+                let slice = if pg.len() == 0 {
+                    &mut []
+                } else {
+                    // Safe because this whole module basically exists to follow the same design concepts
+                    // as `VolatileSlice`.
+                    unsafe { std::slice::from_raw_parts_mut(pg.as_ptr(), pg.len()) }
+                };
                 IoSliceMut::new(slice)
             })
             .collect::<Vec<_>>();
