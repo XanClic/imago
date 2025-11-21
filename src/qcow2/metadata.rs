@@ -826,8 +826,10 @@ impl Header {
 
     /// log2 of the number of entries per refcount block.
     pub fn rb_bits(&self) -> u32 {
-        // log2(cluster_size >> (refcount_order - 3))
-        self.cluster_bits() - (self.refcount_order() - 3)
+        // log2(cluster_size / (refcount_bits / 8 bits per byte))
+        // = log2(cluster_size * 8 / refcount_bits)
+        // = log2(cluster_size) + log2(8) - log2(refcount_bits)
+        self.cluster_bits() + 3 - self.refcount_order()
     }
 
     /// Number of entries per refcount block.
