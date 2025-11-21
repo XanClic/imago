@@ -644,28 +644,27 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             let _l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
         }
 
-        // Grow before preallocating (so we can preallocate)
-        self.header.set_size(new_size);
-
+        // Preallocate the entire new range (beyond the current image end)
         match prealloc_mode {
-            PreallocateMode::None => Ok(()),
-            PreallocateMode::Zero => self.preallocate_zero(old_size, grown_length).await,
+            PreallocateMode::None => (),
+            PreallocateMode::Zero => self.preallocate_zero(old_size, grown_length).await?,
             PreallocateMode::FormatAllocate => {
                 self.preallocate(old_size, grown_length, storage::PreallocateMode::Zero)
-                    .await
+                    .await?;
             }
             PreallocateMode::FullAllocate => {
                 self.preallocate(old_size, grown_length, storage::PreallocateMode::Allocate)
-                    .await
+                    .await?;
             }
-            PreallocateMode::WriteData => self.preallocate_write_data(old_size, grown_length).await,
+            PreallocateMode::WriteData => {
+                self.preallocate_write_data(old_size, grown_length).await?
+            }
         }
-        .inspect_err(|_| {
-            // Better reset to old size then
-            self.header.set_size(old_size)
-        })?;
 
-        // Do this last because we may not be able to undo it
+        // Now that preallocation is complete, it’s safe to actually set the new size (otherwise
+        // someone might see a backing image’s data peek through briefly in case it is longer than
+        // `old_size`)
+        self.header.set_size(new_size);
         self.header
             .write_size(self.metadata.as_ref())
             .await
