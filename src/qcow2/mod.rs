@@ -644,6 +644,18 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             let _l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
         }
 
+        // We are growing the image: If we have a backing file, and the preallocation mode is not
+        // `None`, we must zero out a partial cluster at the old image end.
+        if self.backing.is_some() && prealloc_mode != PreallocateMode::None {
+            let cluster_size = self.header.cluster_size() as u64;
+            if !old_size.is_multiple_of(cluster_size) {
+                let left_in_cluster = cluster_size - (old_size % cluster_size);
+                let tail_len = cmp::min(left_in_cluster, grown_length);
+
+                self.preallocate_write_data(old_size, tail_len).await?;
+            }
+        }
+
         // Preallocate the entire new range (beyond the current image end)
         match prealloc_mode {
             PreallocateMode::None => (),
