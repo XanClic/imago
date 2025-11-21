@@ -338,6 +338,21 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatCreateBuilder<S>
         let refcount_order = refcount_width.trailing_zeros();
         assert!(1 << refcount_order == refcount_width);
 
+        if self.backing.is_some() {
+            match prealloc {
+                PreallocateMode::None | PreallocateMode::Zero => (),
+
+                PreallocateMode::FormatAllocate
+                | PreallocateMode::FullAllocate
+                | PreallocateMode::WriteData => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Preallocation is not yet supported for images with a backing file",
+                    ))
+                }
+            }
+        }
+
         // Clear of data
         if image.size()? > 0 {
             image.resize(size, storage::PreallocateMode::None).await?;
