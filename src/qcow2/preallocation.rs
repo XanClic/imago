@@ -59,7 +59,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
         while offset < max_offset {
             let (file, fofs, flen) = self
-                .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true)
+                .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
                 .await?;
             // TODO: This is terrible, `do_ensure_data_mapping()` should get a parameter for this
             let file_end_ofs = fofs + flen;
@@ -88,7 +88,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
         while offset < max_offset {
             let (file, fofs, flen) = self
-                .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true)
+                .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
                 .await?;
             write_full_zeroes(file, fofs, flen).await?;
             offset += flen;

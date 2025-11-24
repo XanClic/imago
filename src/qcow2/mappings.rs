@@ -101,11 +101,17 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Make the given range be mapped by data clusters.
     ///
     /// Underlying implementation for [`Qcow2::ensure_data_mapping()`].
+    ///
+    /// `skip_cow` is equivalent to [`Qcow2::ensure_data_mapping()`]’s `overwrite`: It indicates
+    /// the area is to be overwritten, so COW can be skipped on it.  `skip_cow_to_eof` indicates
+    /// that the mapping will go until the EOF, so no COW needs to be performed at all past
+    /// `offset`.  Only use this for preallocation on resize or create.
     pub(super) async fn do_ensure_data_mapping(
         &self,
         offset: GuestOffset,
         length: u64,
-        overwrite: bool,
+        skip_cow: bool,
+        skip_cow_to_eof: bool,
     ) -> io::Result<(&S, u64, u64)> {
         let l2_table = self.ensure_l2(offset).await?;
 
@@ -136,7 +142,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .ensure_data_mapping_no_cleanup(
                 offset,
                 length,
-                overwrite,
+                skip_cow,
+                skip_cow_to_eof,
                 l2_table,
                 &mut leaked_allocations,
             )
@@ -354,15 +361,20 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         &self,
         offset: GuestOffset,
         full_length: u64,
-        overwrite: bool,
+        skip_cow: bool,
+        skip_cow_to_eof: bool,
         mut l2_table: L2TableWriteGuard<'_>,
         leaked_allocations: &mut Vec<(HostCluster, ClusterCount)>,
     ) -> io::Result<(u64, u64)> {
         let cb = self.header.cluster_bits();
 
-        let partial_skip_cow = overwrite.then(|| {
+        let partial_skip_cow = skip_cow.then(|| {
             let start = offset.in_cluster_offset(cb);
-            let end = cmp::min(start as u64 + full_length, 1 << cb) as usize;
+            let end = if skip_cow_to_eof {
+                1 << cb
+            } else {
+                cmp::min(start as u64 + full_length, 1 << cb) as usize
+            };
             start..end
         });
 
@@ -391,7 +403,11 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             current_guest_cluster = next;
 
             let chunk_length = cmp::min(full_length - allocated_length, 1 << cb) as usize;
-            let partial_skip_cow = overwrite.then_some(0..chunk_length);
+            let partial_skip_cow = match (skip_cow, skip_cow_to_eof) {
+                (false, _) => None,
+                (true, false) => Some(0..chunk_length),
+                (true, true) => Some(0..(1 << cb)),
+            };
 
             let next_host_cluster = current_host_cluster + ClusterCount(1);
             let host_cluster = self

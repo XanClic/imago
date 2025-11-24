@@ -482,7 +482,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
         self.need_writable()?;
         let offset = GuestOffset(offset);
-        self.do_ensure_data_mapping(offset, length, overwrite).await
+        self.do_ensure_data_mapping(offset, length, overwrite, false).await
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
