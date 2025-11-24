@@ -283,13 +283,12 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = libc::off_t::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = libc::off_t::try_from(length) else {
-            return Ok(());
-        };
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let file = self.file.read().unwrap();
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
@@ -314,13 +313,12 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = i64::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = i64::try_from(length) else {
-            return Ok(());
-        };
+        let offset: i64 = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: i64 = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let end = offset.saturating_add(length).saturating_add(1);
         let params = FILE_ZERO_DATA_INFORMATION {
@@ -360,13 +358,12 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = libc::off_t::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = libc::off_t::try_from(length) else {
-            return Ok(());
-        };
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let params = libc::fpunchhole_t {
             fp_flags: 0,
