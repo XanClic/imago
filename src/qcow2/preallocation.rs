@@ -14,6 +14,10 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             io::Error::new(io::ErrorKind::InvalidInput, "Preallocate range overflow")
         })?;
 
+        // It does not matter what happens after the virtual disk end, so we may align up to the
+        // next full cluster (this prevents needless COW at the image end)
+        let max_offset = max_offset.next_multiple_of(self.header.cluster_size() as u64);
+
         while offset < max_offset {
             let (zofs, zlen) = self
                 .ensure_fixed_mapping(
