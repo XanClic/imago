@@ -24,11 +24,12 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
                 .await?;
             let zofs = zofs.0;
             if zofs > offset {
-                self.preallocate_write_data(offset, zofs - offset).await?;
+                self.preallocate(offset, zofs - offset, storage::PreallocateMode::Zero)
+                    .await?;
             }
             offset = zofs + zlen;
             if zlen == 0 && offset < max_offset {
-                self.preallocate_write_data(offset, max_offset - offset)
+                self.preallocate(offset, max_offset - offset, storage::PreallocateMode::Zero)
                     .await?;
                 break;
             }
@@ -61,37 +62,29 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             let (file, fofs, flen) = self
                 .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
                 .await?;
-            // TODO: This is terrible, `do_ensure_data_mapping()` should get a parameter for this
-            let file_end_ofs = fofs + flen;
-            if let Ok(file_size) = file.size() {
-                if file_size < file_end_ofs {
-                    file.resize(file_end_ofs, storage_prealloc_mode).await?;
+
+            match storage_prealloc_mode {
+                storage::PreallocateMode::None => (), // handled below
+                storage::PreallocateMode::Zero => {
+                    file.write_zeroes(fofs, flen).await?;
+                }
+                storage::PreallocateMode::Allocate => {
+                    file.write_allocated_zeroes(fofs, flen).await?;
+                }
+                storage::PreallocateMode::WriteData => {
+                    write_full_zeroes(file, fofs, flen).await?;
                 }
             }
+
             offset += flen;
         }
 
-        Ok(())
-    }
-
-    /// Write zeroes to the given range.
-    ///
-    /// Bypasses disk bound checking, i.e. can and will write beyond the image end.
-    pub(super) async fn preallocate_write_data(
-        &self,
-        mut offset: u64,
-        length: u64,
-    ) -> io::Result<()> {
-        let max_offset = offset.checked_add(length).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Preallocate range overflow")
-        })?;
-
-        while offset < max_offset {
-            let (file, fofs, flen) = self
-                .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
-                .await?;
-            write_full_zeroes(file, fofs, flen).await?;
-            offset += flen;
+        // This should be just for `storage::PreallocateMode::None`
+        if let Ok(file_size) = file.size() {
+            if file_size < offset {
+                file.resize(file_end_ofs, storage::PreallocateMode::None)
+                    .await?;
+            }
         }
 
         Ok(())

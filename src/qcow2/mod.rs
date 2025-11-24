@@ -482,7 +482,8 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
         self.need_writable()?;
         let offset = GuestOffset(offset);
-        self.do_ensure_data_mapping(offset, length, overwrite, false).await
+        self.do_ensure_data_mapping(offset, length, overwrite, false)
+            .await
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -613,8 +614,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
         if let Some(data_file) = self.storage.as_ref() {
             // Options that allocate data mappings in qcow2 will resize the data file via
-            // `preallocate()` or `preallocate_write_data()`.  Those that don’t won’t, so they need
-            // to be handled here.
+            // `preallocate()`.  Those that don’t won’t, so they need to be handled here.
             match prealloc_mode {
                 PreallocateMode::None => {
                     data_file
@@ -652,7 +652,8 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
                 let left_in_cluster = cluster_size - (old_size % cluster_size);
                 let tail_len = cmp::min(left_in_cluster, grown_length);
 
-                self.preallocate_write_data(old_size, tail_len).await?;
+                self.preallocate(old_size, tail_len, storage::PreallocateMode::Zero)
+                    .await?;
             }
         }
 
@@ -669,7 +670,8 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
                     .await?;
             }
             PreallocateMode::WriteData => {
-                self.preallocate_write_data(old_size, grown_length).await?
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::WriteData)
+                    .await?
             }
         }
 
