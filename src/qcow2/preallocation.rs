@@ -14,6 +14,10 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             io::Error::new(io::ErrorKind::InvalidInput, "Preallocate range overflow")
         })?;
 
+        // It does not matter what happens after the virtual disk end, so we may align up to the
+        // next full cluster (this prevents needless COW at the image end)
+        let max_offset = max_offset.next_multiple_of(self.header.cluster_size() as u64);
+
         while offset < max_offset {
             let (zofs, zlen) = self
                 .ensure_fixed_mapping(
@@ -54,10 +58,6 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             io::Error::new(io::ErrorKind::InvalidInput, "Preallocate range overflow")
         })?;
 
-        if let Some(data_file) = self.storage.as_ref() {
-            data_file.resize(max_offset, storage_prealloc_mode).await?;
-        }
-
         while offset < max_offset {
             let (file, fofs, flen) = self
                 .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
@@ -79,11 +79,11 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             offset += flen;
         }
 
+        let file = self.storage.as_ref().unwrap_or(self.metadata.as_ref());
         // This should be just for `storage::PreallocateMode::None`
         if let Ok(file_size) = file.size() {
             if file_size < offset {
-                file.resize(file_end_ofs, storage::PreallocateMode::None)
-                    .await?;
+                file.resize(offset, storage::PreallocateMode::None).await?;
             }
         }
 
