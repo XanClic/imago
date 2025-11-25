@@ -85,7 +85,7 @@ impl CommonStorageHelper {
         let mut intersecting = FutureVector::new();
 
         let range_block = {
-            // Acquire write lock first
+            // Consistent ordering to avoid deadlock: Always acquire weak before strong
             let mut weak = self.weak_write_blockers.write().unwrap();
             let strong = self.strong_write_blockers.read().unwrap();
 
@@ -109,9 +109,9 @@ impl CommonStorageHelper {
         let mut intersecting = FutureVector::new();
 
         let range_block = {
-            // Acquire write lock first
-            let mut strong = self.strong_write_blockers.write().unwrap();
+            // Consistent ordering to avoid deadlock: Always acquire weak before strong
             let weak = self.weak_write_blockers.read().unwrap();
+            let mut strong = self.strong_write_blockers.write().unwrap();
 
             weak.collect_intersecting_await_futures(&range, &mut intersecting);
             strong.collect_intersecting_await_futures(&range, &mut intersecting);
