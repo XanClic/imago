@@ -97,10 +97,20 @@ impl<S: Storage> ImplicitOpenGate<S> for DenyImplicitOpenGate {
         ))
     }
 
-    async fn open_storage(&mut self, _builder: StorageOpenOptions) -> io::Result<S> {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Opening implicitly referenced storage object denied",
-        ))
+    async fn open_storage(&mut self, builder: StorageOpenOptions) -> io::Result<S> {
+        if let Some(filename) = builder.get_filename() {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Opening implicitly referenced storage object {:?} denied",
+                    filename,
+                ),
+            ))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Opening implicitly referenced storage object denied",
+            ))
+        }
     }
 }
