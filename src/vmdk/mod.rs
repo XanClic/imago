@@ -1,38 +1,57 @@
 //! VMDK implementation.
+
 use crate::format::builder::{FormatDriverBuilder, FormatDriverBuilderBase};
-use crate::format::gate::{ImplicitOpenGate, PermissiveImplicitOpenGate};
+use crate::format::drivers::FormatDriverInstance;
+use crate::format::gate::ImplicitOpenGate;
 use crate::format::wrapped::WrappedFormat;
 use crate::format::{Format, PreallocateMode};
-use crate::misc_helpers::ResultErrorContext;
-use crate::raw::Raw;
-use crate::{FormatAccess, Storage, StorageOpenOptions};
-use std::io;
-use std::sync::Arc;
-
-use crate::format::drivers::FormatDriverInstance;
+use crate::io_buffers::IoBuffer;
+use crate::misc_helpers::{invalid_data, ResultErrorContext};
 use crate::storage::ext::StorageExt;
-use crate::ShallowMapping;
+use crate::{FormatAccess, ShallowMapping, Storage, StorageOpenOptions};
 use async_trait::async_trait;
 use std::fmt::{self, Display, Formatter};
 use std::marker::PhantomData;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::{cmp, io};
 
 /// As usual, VMDK sector size is 512 bytes as a fixed value
 const VMDK_SECTOR_SIZE: u64 = 512;
 /// VMDK SPARSE data signature
 const VMDK4_MAGIC: u32 = 0x564d444b; // 'KDMV'
+/// Supported version range
+const VMDK_VERSION_RANGE: RangeInclusive<u32> = 1..=3;
 
-/// Represents the backing storage for a VMDK extent
+/// Represents the data storage for a VMDK extent
 #[derive(Debug, Clone)]
-enum VmdkBacking<S: Storage + 'static, F: WrappedFormat<S> + 'static> {
-    /// A FLAT extent backing with a RAW file starting from the exact offset
-    IndirectFlat(F, u64),
+enum VmdkStorage<S: Storage + 'static> {
+    /// A FLAT extent with a RAW file starting from the exact offset
+    Flat {
+        /// Storage object containing linear (raw) data
+        file: S,
+        /// Offset in `file` where the data for this extent begins
+        offset: u64,
+    },
     /// A zero-filled extent
-    Zero(),
-    /// An unreachable variant used as a Storage marker
-    _Unreachable(PhantomData<S>),
+    Zero,
+}
+
+/// VMDK extent information after parsing, before opening
+#[derive(Debug)]
+enum VmdkParsedStorage {
+    /// A FLAT extent with a RAW file starting from the exact offset
+    Flat {
+        /// Path to storage object containing linear (raw) data
+        filename: String,
+        /// Offset in the storage object where the data for this extent begins
+        offset: u64,
+    },
+    /// A zero-filled extent
+    Zero,
 }
 
 /// Access type for VMDK extents
@@ -46,25 +65,46 @@ enum VmdkAccessType {
     NoAccess,
 }
 
-/// VMDK extent descriptor
-#[derive(Debug, Clone)]
-struct VmdkExtent<S: Storage + 'static, F: WrappedFormat<S> + 'static> {
+/// VMDK extent
+#[derive(Debug)]
+struct VmdkExtent<S: Storage + 'static> {
+    /// Access type (RW, RDONLY, NOACCESS).
+    access_type: VmdkAccessType,
+    /// Part of the virtual disk covered by this extent.
+    ///
+    /// The start is equal to the end of the extent before it (0 if none), and the end is equal to
+    /// the start plus this extent’s length.
+    disk_range: Range<u64>,
+    /// Data source
+    ///
+    /// Present if and only if the access type is not NOACCESS.
+    storage: Option<VmdkStorage<S>>,
+}
+
+/// VMDK extent descriptor information after parsing, before opening
+#[derive(Debug)]
+struct VmdkParsedExtent {
     /// Access type (RW, RDONLY, NOACCESS).
     access_type: VmdkAccessType,
     /// Number of sectors.
     sectors: u64,
-    /// Backing source
-    backing: VmdkBacking<S, F>,
-
-    /// Phantom data to hold the storage type.
-    _storage: PhantomData<S>,
+    /// Data source
+    ///
+    /// Present if and only if the access type is not NOACCESS.
+    storage: Option<VmdkParsedStorage>,
 }
 
 /// VMDK disk image format implementation.
 #[derive(Debug)]
-pub struct Vmdk<S: Storage + 'static, F: WrappedFormat<S> + 'static> {
-    /// Storage object containing the VMDK metadata.
-    metadata: Arc<S>,
+pub struct Vmdk<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAccess<S>> {
+    /// Storage object containing the VMDK descriptor file
+    descriptor_file: Arc<S>,
+
+    /// Backing image type.
+    ///
+    /// We do not support backing (parent) images yet, but capture the type so that when we do
+    /// support it, the change will be syntactically compatible.
+    parent_type: PhantomData<F>,
 
     /// Base options to be used for implicitly opened storage objects.
     storage_open_options: StorageOpenOptions,
@@ -75,65 +115,71 @@ pub struct Vmdk<S: Storage + 'static, F: WrappedFormat<S> + 'static> {
     /// Parsed VMDK descriptor.
     desc: VmdkDesc,
 
+    /// Extent information as parsed from the VMDK descriptor file.
+    parsed_extents: Vec<VmdkParsedExtent>,
+
     /// Storage objects for each extent.
-    extents: Vec<VmdkExtent<S, F>>,
+    extents: Vec<VmdkExtent<S>>,
 }
 
 /// VMDK descriptor information.
 #[derive(Debug, Clone)]
-pub struct VmdkDesc {
+struct VmdkDesc {
     /// Version number of the VMDK descriptor
-    pub version: u32,
+    version: u32,
     /// Content ID
-    pub cid: String,
+    cid: String,
     /// Content ID of the parent link
-    pub parent_cid: String,
+    parent_cid: String,
     /// Type of virtual disk
-    pub create_type: String,
+    create_type: String,
     /// The disk geometry value (sectors)
-    pub sectors: u64,
+    sectors: u64,
     /// The disk geometry value (heads)
-    pub heads: u64,
+    heads: u64,
     /// The disk geometry value (cylinders)
-    pub cylinders: u64,
+    cylinders: u64,
 }
 
-impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
+impl VmdkParsedExtent {
     /// Parse an extent descriptor line.
-    async fn parse_extent_line(&self, line: &str) -> io::Result<VmdkExtent<S, F>> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        // https://github.com/libyal/libvmdk/blob/main/documentation/VMWare%20Virtual%20Disk%20Format%20(VMDK).asciidoc#221-extent-descriptor
-        // At least 3 parts are required for all VMDK extents
-        if parts.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid extent format",
-            ));
-        }
+    fn try_from_descriptor_line(line: &str) -> io::Result<VmdkParsedExtent> {
+        // See https://github.com/libyal/libvmdk/blob/main/documentation/VMWare%20Virtual%20Disk%20Format%20(VMDK).asciidoc#221-extent-descriptor
 
-        let access_type = match parts[0] {
+        let mut parts = line.split_whitespace();
+
+        let access_type = match parts
+            .next()
+            .ok_or_else(|| invalid_data("Access type missing"))?
+        {
             "RW" => VmdkAccessType::RW,
             "RDONLY" => VmdkAccessType::RdOnly,
             "NOACCESS" => VmdkAccessType::NoAccess,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid access type",
-                ))
-            }
+            other => return Err(invalid_data(format!("Invalid access type '{other}'"))),
         };
 
-        let sectors = parts[1]
+        let sectors = parts
+            .next()
+            .ok_or_else(|| invalid_data("Sector count missing"))?
             .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid sector count"))?;
-        let extent_type = parts[2];
+            .map_err(|_| invalid_data("Invalid sector count"))?;
 
-        if extent_type == "ZERO" {
-            return Ok(VmdkExtent {
+        if access_type == VmdkAccessType::NoAccess {
+            return Ok(VmdkParsedExtent {
                 access_type,
                 sectors,
-                backing: VmdkBacking::Zero(),
-                _storage: PhantomData,
+                storage: None,
+            });
+        }
+
+        let extent_type = parts
+            .next()
+            .ok_or_else(|| invalid_data("Extent type missing"))?;
+        if extent_type == "ZERO" {
+            return Ok(VmdkParsedExtent {
+                access_type,
+                sectors,
+                storage: Some(VmdkParsedStorage::Zero),
             });
         }
         if extent_type != "FLAT" {
@@ -143,59 +189,138 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
             ));
         }
 
-        if parts.len() != 5 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid FLAT extent format",
-            ));
+        // filename is enclosed in quotes and may contain spaces, so split the whole line by quotes
+        // (We could simplify this if we could do `line.splitn_whitespace(4)` at the beginning of
+        // this function, but `splitn_whitespace()` does not exist.)
+        let mut quote_split = line.splitn(3, '"').map(|part| part.trim());
+        // We know the line isn’t empty, so we must at least get one part
+        let before_filename = quote_split.next().unwrap();
+        let filename = quote_split
+            .next()
+            .ok_or_else(|| invalid_data("Extent filename missing"))?;
+        let after_filename = quote_split
+            .next()
+            .ok_or_else(|| invalid_data("Extent filename not terminated"))?;
+
+        let part_count_before_filename = before_filename.split_whitespace().count();
+        if part_count_before_filename != 3 {
+            return Err(invalid_data(format!(
+                "Expected filename at field index 3, found at {part_count_before_filename}"
+            )));
         }
 
-        // filename should be in quotes
-        let filename = parts[3];
-        if !filename.starts_with('"') || !filename.ends_with('"') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Filename must be quoted",
-            ));
-        }
-        let filename = &filename[1..filename.len() - 1];
+        // Continue parsing after filename
+        parts = after_filename.split_whitespace();
 
-        let absolute = self
-            .metadata
-            .resolve_relative_path(filename)
-            .err_context(|| format!("Cannot resolve backing file name {filename}"))?;
+        let offset = parts
+            .next()
+            .map_or(Ok(0), |ofs_str| ofs_str.parse())
+            .map_err(|_| invalid_data("Invalid offset"))?;
 
-        let file_opts = self
-            .storage_open_options
-            .clone()
-            .filename(absolute.clone())
-            .write(false);
-
-        let mut gate = PermissiveImplicitOpenGate::default();
-        let file = gate
-            .open_storage(file_opts)
-            .await
-            .err_context(|| format!("Backing file {absolute:?}"))?;
-        let opts = Raw::builder(file).storage_open_options(self.storage_open_options.clone());
-        let raw = gate.open_format(opts).await?;
-
-        let offset = parts[4]
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid offset"))?;
-        let backing = VmdkBacking::IndirectFlat(F::wrap(FormatAccess::new(raw)), offset);
-
-        Ok(VmdkExtent {
+        Ok(VmdkParsedExtent {
             access_type,
             sectors,
-            backing,
-            _storage: PhantomData,
+            storage: Some(VmdkParsedStorage::Flat {
+                filename: filename.to_string(),
+                offset,
+            }),
+        })
+    }
+}
+
+/// Remove double quotes around `input` if there are any.
+fn strip_quotes(input: &str) -> &str {
+    input
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(input)
+}
+
+/// Helper to parse an integer from the descriptor file.
+fn parse_desc_value<F: FromStr>(key: &str, value: &str) -> io::Result<F> {
+    let stripped = strip_quotes(value);
+
+    stripped
+        .parse::<F>()
+        .map_err(|_| invalid_data(format!("Invalid '{key}' value: {stripped}")))
+}
+
+impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
+    /// Create a new [`FormatDriverBuilder`] instance for the given image.
+    pub fn builder(image: S) -> VmdkOpenBuilder<S, F> {
+        VmdkOpenBuilder::new(image)
+    }
+
+    /// Create a new [`FormatDriverBuilder`] instance for an image under the given path.
+    pub fn builder_path<P: AsRef<Path>>(image_path: P) -> VmdkOpenBuilder<S, F> {
+        VmdkOpenBuilder::new_path(image_path)
+    }
+
+    /// Open an extent from the information in `extent`.
+    ///
+    /// `in_disk_offset` is the offset in the virtual disk where this extent fits in.  It should be
+    /// the end offset of the extent before it.
+    async fn open_implicit_extent<G: ImplicitOpenGate<S>>(
+        &self,
+        extent: &VmdkParsedExtent,
+        in_disk_offset: u64,
+        open_gate: &mut G,
+    ) -> io::Result<VmdkExtent<S>> {
+        let sectors = extent.sectors;
+        let size = sectors.checked_mul(VMDK_SECTOR_SIZE).ok_or_else(|| {
+            invalid_data(format!(
+                "Extent size overflow: {sectors} * {VMDK_SECTOR_SIZE}"
+            ))
+        })?;
+        let disk_range = in_disk_offset..in_disk_offset.checked_add(size).ok_or_else(|| {
+            invalid_data(format!("Extent offset overflow: {in_disk_offset} + {size}"))
+        })?;
+
+        let Some(storage) = extent.storage.as_ref() else {
+            return Ok(VmdkExtent {
+                access_type: extent.access_type.clone(),
+                disk_range,
+                storage: None,
+            });
+        };
+
+        let storage = match storage {
+            VmdkParsedStorage::Flat { filename, offset } => {
+                let absolute = self
+                    .descriptor_file
+                    .resolve_relative_path(filename)
+                    .err_context(|| format!("Cannot resolve storage file name {filename}"))?;
+
+                let mut file_opts = self.storage_open_options.clone().filename(absolute.clone());
+                if extent.access_type == VmdkAccessType::RdOnly {
+                    file_opts = file_opts.write(false);
+                }
+
+                let file = open_gate
+                    .open_storage(file_opts)
+                    .await
+                    .err_context(|| format!("Data storage file {absolute:?}"))?;
+
+                VmdkStorage::Flat {
+                    file,
+                    offset: *offset,
+                }
+            }
+
+            VmdkParsedStorage::Zero => VmdkStorage::Zero,
+        };
+
+        Ok(VmdkExtent {
+            access_type: extent.access_type.clone(),
+            disk_range,
+            storage: Some(storage),
         })
     }
 
     /// Checks if the VMDK version is supported and returns an error if not
-    async fn error_out_unsupported_version(&self) -> io::Result<()> {
+    fn error_out_unsupported_version(&self) -> io::Result<()> {
         let version = self.desc.version;
-        if !(1..=3).contains(&version) {
+        if !VMDK_VERSION_RANGE.contains(&version) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("unsupported version {version}"),
@@ -204,8 +329,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
         Ok(())
     }
 
-    /// Parse the VMDK descriptor
-    async fn parse_vmdk_descriptor(&mut self, line: &str) -> io::Result<()> {
+    /// Parse a line in the VMDK descriptor file
+    fn parse_descriptor_line(&mut self, line: &str) -> io::Result<()> {
         let line = line.trim();
 
         if line.is_empty() || line.starts_with('#') {
@@ -213,134 +338,120 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
         }
 
         // Parse extent descriptors (RW/RDONLY/NOACCESS)
-        if line.starts_with("RW ") || line.starts_with("RDONLY ") || line.starts_with("NOACCESS ") {
-            let extent = self.parse_extent_line(line).await?;
-            self.extents.push(extent);
-            return Ok(());
+        if let Some((access, _)) = line.split_once(char::is_whitespace) {
+            if matches!(access, "RW" | "RDONLY" | "NOACCESS") {
+                let extent = VmdkParsedExtent::try_from_descriptor_line(line)?;
+                self.parsed_extents.push(extent);
+                return Ok(());
+            }
         }
 
-        let v: Vec<_> = line.split("=").map(|a| a.trim()).collect();
-
-        if v.is_empty() || v.len() != 2 {
+        let Some((key, value)) = line.split_once('=') else {
+            // Silently ignore
             return Ok(());
-        }
+        };
+        let key = key.trim();
+        let value = value.trim();
 
-        match v[0] {
+        match key {
             "version" => {
-                let version: u32 = v[1].parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid version format")
-                })?;
-
-                self.desc.version = version;
-                self.error_out_unsupported_version().await?;
-                return Ok(());
+                self.desc.version = value
+                    .parse()
+                    .map_err(|_| invalid_data("Invalid version format"))?;
             }
-            "CID" => {
-                self.desc.cid = v[1].to_string();
-                return Ok(());
-            }
-            "parentCID" => {
-                self.desc.parent_cid = v[1].to_string();
-                return Ok(());
-            }
-            "createType" => {
-                let mut stripped = v[1];
-                if stripped.starts_with('"') && stripped.ends_with('"') && stripped.len() >= 2 {
-                    stripped = &stripped[1..stripped.len() - 1]
-                }
-                self.desc.create_type = stripped.to_string();
-                return Ok(());
-            }
+            "CID" => self.desc.cid = value.to_string(),
+            "parentCID" => self.desc.parent_cid = value.to_string(),
+            "createType" => self.desc.create_type = strip_quotes(value).to_string(),
             "parentFileNameHint" => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "unsupported VMDK differential image (delta link)",
                 ))
             }
+            "ddb.geometry.sectors" => self.desc.sectors = parse_desc_value(key, value)?,
+            "ddb.geometry.heads" => self.desc.heads = parse_desc_value(key, value)?,
+            "ddb.geometry.cylinders" => self.desc.cylinders = parse_desc_value(key, value)?,
 
-            "ddb.geometry.sectors" => {
-                let mut stripped = v[1];
-                if stripped.starts_with('"') && stripped.ends_with('"') && stripped.len() >= 2 {
-                    stripped = &stripped[1..stripped.len() - 1]
-                }
-                self.desc.sectors = stripped.parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid ddb.geometry.sectors")
-                })?;
-                return Ok(());
+            // Ignore unidentified "ddb." (The Disk Database) items
+            key if key.starts_with("ddb.") => (),
+
+            key => {
+                return Err(invalid_data(format!(
+                    "Unrecognized VMDK descriptor file key '{key}'"
+                )))
             }
-            "ddb.geometry.heads" => {
-                let mut stripped = v[1];
-                if stripped.starts_with('"') && stripped.ends_with('"') && stripped.len() >= 2 {
-                    stripped = &stripped[1..stripped.len() - 1]
-                }
-                self.desc.heads = stripped.parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid ddb.geometry.heads")
-                })?;
-                return Ok(());
-            }
-            "ddb.geometry.cylinders" => {
-                let mut stripped = v[1];
-                if stripped.starts_with('"') && stripped.ends_with('"') && stripped.len() >= 2 {
-                    stripped = &stripped[1..stripped.len() - 1]
-                }
-                self.desc.cylinders = stripped.parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid ddb.geometry.cylinders")
-                })?;
-                return Ok(());
-            }
-            _ => (),
         }
 
-        // Ignore unidentified "ddb." (The Disk Database) items
-        if v[0].starts_with("ddb.") {
-            return Ok(());
-        }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid VMDK descriptor line",
-        ))
+        Ok(())
     }
 
-    /// Read a single VMDK descriptor line
-    async fn read_descriptor_line(
-        metadata: &S,
-        buffer: &mut Vec<u8>,
-        offset: &mut u64,
-    ) -> io::Result<bool> {
-        buffer.clear();
-
-        loop {
-            // Extend buffer if needed
-            let old_len = buffer.len();
-            buffer.resize(old_len + 65536, 0);
-
-            // Read the chunk
-            match metadata
-                .read(&mut buffer[old_len..], *offset + old_len as u64)
-                .await
-            {
-                Ok(_) => {
-                    // Check for NIL terminator or '\n' in the newly read chunk
-                    let new_data = &buffer[old_len..];
-                    if let Some(pos) = new_data.iter().position(|&b| b == 0 || b == b'\n') {
-                        let eof = buffer[old_len + pos] == 0;
-
-                        buffer.truncate(old_len + pos);
-                        *offset += (old_len + pos) as u64 + (!eof as u64);
-                        return Ok(eof);
-                    }
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
+    /// Read and parse the VMDK descriptor by reading in lines until we find the end
+    async fn parse_descriptor_file(&mut self) -> io::Result<()> {
+        let desc_file_sz = self.descriptor_file.size()?;
+        if desc_file_sz < 4 {
+            return Err(invalid_data("VMDK descriptor file too short"));
         }
+        // Sanity check to avoid unbounded allocation
+        if desc_file_sz > 2 * 1024 * 1024 {
+            return Err(invalid_data(
+                "VMDK descriptor file too long (max. 2 MB supported)",
+            ));
+        }
+
+        let desc_file_sz: usize = desc_file_sz.try_into().unwrap();
+        let mut desc_file = IoBuffer::new(desc_file_sz, self.descriptor_file.mem_align())?;
+        self.descriptor_file.read(desc_file.as_mut(), 0).await?;
+
+        let desc_file = desc_file.as_ref().into_slice();
+
+        // Check if it's a SPARSE format, bail it out now
+        if u32::from_le_bytes(desc_file[..4].try_into().unwrap()) == VMDK4_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported VMDK sparse data file",
+            ));
+        }
+
+        for (line_i, line) in desc_file.split(|chr| *chr == b'\n').enumerate() {
+            let line = str::from_utf8(line).map_err(|e| {
+                invalid_data(format!(
+                    "{}: Line {}: {e}",
+                    self.descriptor_file,
+                    line_i + 1
+                ))
+            })?;
+
+            self.parse_descriptor_line(line)
+                .err_context(|| format!("{}: Line {}", self.descriptor_file, line_i + 1))?;
+        }
+
+        self.error_out_unsupported_version()?;
+        self.size = self
+            .parsed_extents
+            .iter()
+            .try_fold(0u64, |sum, extent| {
+                let sectors = extent.sectors;
+                let size = sectors.checked_mul(VMDK_SECTOR_SIZE).ok_or_else(|| {
+                    invalid_data(format!(
+                        "Extent size overflow: {sectors} * {VMDK_SECTOR_SIZE}"
+                    ))
+                })?;
+                sum.checked_add(size)
+                    .ok_or_else(|| invalid_data(format!("Extent offset overflow: {sum} + {size}")))
+            })?
+            .into();
+
+        Ok(())
     }
 
     /// Internal implementation for opening a VMDK image.
-    async fn do_open(metadata: S, storage_open_options: StorageOpenOptions) -> io::Result<Self> {
-        let mut q = Vmdk {
-            metadata: Arc::new(metadata),
+    async fn do_open(
+        descriptor_file: S,
+        storage_open_options: StorageOpenOptions,
+    ) -> io::Result<Self> {
+        let mut vmdk = Vmdk {
+            descriptor_file: Arc::new(descriptor_file),
+            parent_type: PhantomData,
             desc: VmdkDesc {
                 version: 0,
                 cid: String::new(),
@@ -350,82 +461,73 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Vmdk<S, F> {
                 heads: 0,
                 cylinders: 0,
             },
+            parsed_extents: vec![],
             extents: vec![],
             size: 0.into(),
             storage_open_options,
         };
 
-        // Check if it's a SPARSE format, bail it out now
-        let mut magic_buf = vec![0u8; 4];
-        q.metadata.read(&mut magic_buf, 0).await?;
-        if let Ok(magic) = magic_buf.as_slice().try_into().map(u32::from_le_bytes) {
-            if magic == VMDK4_MAGIC {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "unsupported VMDK sparse data file",
-                ));
-            }
-        }
-
-        // Read and parse the VMDK descriptor by reading in lines until we find the end
-        let mut line = Vec::new();
-        let mut empty = true;
-        let mut offset = 0;
-        loop {
-            let eof = Self::read_descriptor_line(&q.metadata, &mut line, &mut offset).await?;
-
-            if eof {
-                break;
-            }
-            let res: Result<&str, std::io::Error> = match std::str::from_utf8(&line) {
-                Ok(l) => Ok(l),
-                Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            q.parse_vmdk_descriptor(res?).await?;
-            empty = false
-        }
-
-        if empty {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Empty VMDK descriptor",
-            ));
-        }
-
-        q.size = (q.desc.sectors * q.desc.heads * q.desc.cylinders * VMDK_SECTOR_SIZE).into();
-        Ok(q)
+        vmdk.parse_descriptor_file().await?;
+        Ok(vmdk)
     }
 
     /// Opens a VMDK file.
-    pub async fn open_image(metadata: S, writable: bool) -> io::Result<Self> {
+    ///
+    /// This will not open any other storage objects needed, i.e. no extent data files.  Handling
+    /// those manually is not yet supported, so you have to make use of the implicit references
+    /// given in the image header, for which you can use
+    /// [`Vmdk::open_implicit_dependencies_gated()`].
+    pub async fn open_image(descriptor_file: S, writable: bool) -> io::Result<Self> {
         if writable {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "unsupported writable VMDK",
+                "No VMDK write support",
             ));
         }
-        Self::do_open(metadata, StorageOpenOptions::new()).await
+        Self::do_open(descriptor_file, StorageOpenOptions::new()).await
     }
 
-    /// Wrap `inner`, allowing it to be used as a disk image in raw format.
-    #[cfg(feature = "sync-wrappers")]
-    pub fn open_image_sync(metadata: S, writable: bool) -> io::Result<Self> {
-        tokio::runtime::Builder::new_current_thread()
-            .build()?
-            .block_on(Self::open_image(metadata, writable))
-    }
+    /// Open all implicit dependencies.
+    ///
+    /// In the case of VMDK, these are the extent data files.
+    pub async fn open_implicit_dependencies_gated<G: ImplicitOpenGate<S>>(
+        &mut self,
+        mut gate: G,
+    ) -> io::Result<()> {
+        if self.extents.is_empty() {
+            let mut in_disk_offset = 0;
+            for extent in &self.parsed_extents {
+                let opened = self
+                    .open_implicit_extent(extent, in_disk_offset, &mut gate)
+                    .await?;
+                in_disk_offset = opened.disk_range.end;
+                self.extents.push(opened);
+            }
+        }
 
-    /// A pseudo synchronous wrapper. Currently it's just a placeholder
-    /// since I'm not sure if VMDK needs this compared to QCOW2.
-    #[cfg(feature = "sync-wrappers")]
-    pub fn open_implicit_dependencies_sync(&mut self) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Return the extent covering `offset`, if any.
+    fn get_extent_at(&self, offset: u64) -> Option<&VmdkExtent<S>> {
+        self.extents
+            .binary_search_by(|extent| {
+                if extent.disk_range.contains(&offset) {
+                    cmp::Ordering::Equal
+                } else if extent.disk_range.end < offset {
+                    cmp::Ordering::Less
+                } else {
+                    cmp::Ordering::Greater
+                }
+            })
+            .ok()
+            .map(|index| &self.extents[index])
     }
 }
 
 impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Display for Vmdk<S, F> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "vmdk[{}]", self.metadata)
+        write!(f, "vmdk[{}]", self.descriptor_file)
     }
 }
 
@@ -437,11 +539,45 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverInstance f
         Format::Vmdk
     }
 
-    async unsafe fn probe(_storage: &S) -> io::Result<bool>
+    async unsafe fn probe(storage: &S) -> io::Result<bool>
     where
         Self: Sized,
     {
-        Ok(true)
+        // Check that the potential descriptor file has a reasonable length, is utf8, and contains
+        // a supported `version` key.
+        // (Or has the `VMDK4_MAGIC`.)
+
+        let desc_file_size = storage.size()?;
+        if !(4..=2 * 1024 * 1024).contains(&desc_file_size) {
+            return Ok(false);
+        }
+
+        let desc_file_size: usize = desc_file_size.try_into().unwrap();
+        let mut desc_file = IoBuffer::new(desc_file_size, storage.mem_align())?;
+        storage.read(desc_file.as_mut(), 0).await?;
+
+        let desc_file = desc_file.as_ref().into_slice();
+        if u32::from_le_bytes(desc_file[..4].try_into().unwrap()) == VMDK4_MAGIC {
+            return Ok(true);
+        }
+
+        for line in desc_file.split(|chr| *chr == b'\n') {
+            let Ok(line) = str::from_utf8(line) else {
+                return Ok(false);
+            };
+
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == "version" {
+                let Ok(version) = value.trim().parse() else {
+                    return Ok(false);
+                };
+                return Ok(VMDK_VERSION_RANGE.contains(&version));
+            }
+        }
+
+        Ok(false)
     }
 
     fn size(&self) -> u64 {
@@ -453,11 +589,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverInstance f
     }
 
     fn collect_storage_dependencies(&self) -> Vec<&S> {
-        let mut v = Vec::new();
-
+        let mut v = vec![self.descriptor_file.as_ref()];
         for e in &self.extents {
-            if let VmdkBacking::IndirectFlat(inner, _) = &e.backing {
-                v.append(&mut inner.inner().inner().collect_storage_dependencies())
+            let Some(storage) = e.storage.as_ref() else {
+                continue;
+            };
+            match storage {
+                VmdkStorage::Flat { file, offset: _ } => v.push(file),
+                VmdkStorage::Zero => (),
             }
         }
         v
@@ -469,49 +608,47 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverInstance f
 
     async fn get_mapping<'a>(
         &'a self,
-        mut offset: u64,
+        offset: u64,
         max_length: u64,
     ) -> io::Result<(ShallowMapping<'a, S>, u64)> {
-        let mut remaining = match self.size().checked_sub(offset) {
+        let max_length = match self.size().checked_sub(offset) {
             None | Some(0) => return Ok((ShallowMapping::Eof {}, 0)),
-            Some(remaining) => std::cmp::min(remaining, max_length),
+            Some(remaining) => cmp::min(remaining, max_length),
         };
 
-        for e in &self.extents {
-            let bytes = e.sectors * VMDK_SECTOR_SIZE;
+        let Some(extent) = self.get_extent_at(offset) else {
+            return Ok((ShallowMapping::Eof {}, 0));
+        };
 
-            if offset > bytes {
-                offset -= bytes;
-                remaining -= bytes;
-                continue;
-            }
-
-            if e.access_type == VmdkAccessType::NoAccess {
+        let writable = match extent.access_type {
+            VmdkAccessType::RW => true,
+            VmdkAccessType::RdOnly => false,
+            VmdkAccessType::NoAccess => {
+                // Is that right?  Should this be ::Special?
                 return Err(io::Error::other("NOACCESS extent is accessed"));
             }
+        };
 
-            match &e.backing {
-                VmdkBacking::IndirectFlat(inner, base_offset) => {
-                    let offset = offset + base_offset;
-                    return Ok((
-                        ShallowMapping::Indirect {
-                            layer: inner.inner(),
-                            offset,
-                            writable: false,
-                        },
-                        std::cmp::min(bytes, remaining),
-                    ));
-                }
-                VmdkBacking::Zero() => {
-                    return Ok((
-                        ShallowMapping::Zero { explicit: true },
-                        std::cmp::min(bytes, remaining),
-                    ));
-                }
-                _ => todo!(),
-            }
-        }
-        Ok((ShallowMapping::Eof {}, 0))
+        // `access_type != NoAccess`, so `unwrap()` is safe
+        let mapping = match extent.storage.as_ref().unwrap() {
+            VmdkStorage::Flat {
+                file,
+                offset: base_offset,
+            } => ShallowMapping::Raw {
+                storage: file,
+                offset: base_offset.checked_add(offset).ok_or_else(|| {
+                    invalid_data(format!("Extent offset overflow: {base_offset} + {offset}"))
+                })?,
+                writable,
+            },
+
+            VmdkStorage::Zero => ShallowMapping::Zero { explicit: true },
+        };
+
+        Ok((
+            mapping,
+            cmp::min(max_length, extent.disk_range.end - offset),
+        ))
     }
 
     async fn ensure_data_mapping<'a>(
@@ -575,9 +712,17 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverBuilder<S>
     }
 
     async fn open<G: ImplicitOpenGate<S>>(self, mut gate: G) -> io::Result<Self::Format> {
-        let writable = self.0.get_writable();
+        if self.0.get_writable() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "No VMDK write support",
+            ));
+        }
+
         let file = self.0.open_image(&mut gate).await?;
-        Vmdk::open_image(file, writable).await
+        let mut vmdk = Vmdk::open_image(file, false).await?;
+        vmdk.open_implicit_dependencies_gated(gate).await?;
+        Ok(vmdk)
     }
 
     fn get_image_path(&self) -> Option<PathBuf> {
