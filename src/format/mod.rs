@@ -19,6 +19,9 @@ pub enum Format {
 
     /// Qcow2 format (version 2 or 3)
     Qcow2,
+
+    /// VMDK format
+    Vmdk,
 }
 
 /// Format layer preallocation modes.
