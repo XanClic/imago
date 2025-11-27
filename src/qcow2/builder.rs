@@ -338,6 +338,8 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatCreateBuilder<S>
         let refcount_order = refcount_width.trailing_zeros();
         assert!(1 << refcount_order == refcount_width);
 
+        Qcow2::<S, F>::check_valid_preallocation(prealloc, self.backing.is_some())?;
+
         // Clear of data
         if image.size()? > 0 {
             image.resize(size, storage::PreallocateMode::None).await?;

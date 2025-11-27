@@ -403,6 +403,29 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             ))
         }
     }
+
+    /// Check whether we support the given preallocation mode.
+    ///
+    /// `with_backing` designates whether the (new) image (should) have a backing file.
+    fn check_valid_preallocation(
+        prealloc_mode: PreallocateMode,
+        with_backing: bool,
+    ) -> io::Result<()> {
+        if !with_backing {
+            return Ok(());
+        }
+
+        match prealloc_mode {
+            PreallocateMode::None | PreallocateMode::Zero => Ok(()),
+
+            PreallocateMode::FormatAllocate
+            | PreallocateMode::FullAllocate
+            | PreallocateMode::WriteData => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Preallocation is not yet supported for images with a backing file",
+            )),
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -610,6 +633,8 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         if grown_length == 0 {
             return Ok(()); // only grow, else do nothing
         }
+
+        Self::check_valid_preallocation(prealloc_mode, self.backing.is_some())?;
 
         if let Some(data_file) = self.storage.as_ref() {
             // Options that allocate data mappings in qcow2 will resize the data file via
