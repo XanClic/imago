@@ -639,7 +639,9 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverInstance f
             } => ShallowMapping::Raw {
                 storage: file,
                 offset: base_offset.checked_add(in_extent_offset).ok_or_else(|| {
-                    invalid_data(format!("Extent offset overflow: {base_offset} + {offset}"))
+                    invalid_data(format!(
+                        "Extent offset overflow: {base_offset} + {in_extent_offset}"
+                    ))
                 })?,
                 writable,
             },
