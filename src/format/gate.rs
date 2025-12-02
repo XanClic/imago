@@ -1,7 +1,7 @@
 //! Gate functionality to control implicitly opened dependencies.
 
 use super::builder::FormatDriverBuilder;
-use crate::{Storage, StorageOpenOptions};
+use crate::{FormatAccess, Storage, StorageOpenOptions};
 use std::io;
 
 /// Gate implicit image and storage object dependencies.
@@ -24,7 +24,7 @@ use std::io;
 /// [`Storage::open()`] is *not* run through `ImplicitOpenGate`.
 ///
 /// See [`PermissiveImplicitOpenGate`] and [`DenyImplicitOpenGate`].
-pub trait ImplicitOpenGate<S: Storage>: Default {
+pub trait ImplicitOpenGate<S: Storage + 'static> {
     /// Open an implicitly referenced format layer.
     ///
     /// You can e.g. check the supposed format via `F::FORMAT`, and its filename via
@@ -33,8 +33,10 @@ pub trait ImplicitOpenGate<S: Storage>: Default {
     /// Note that this is not invoked for images that are explicitly opened, i.e. whenever
     /// [`FormatDriverBuilder::open()`] is called by imago users.
     #[allow(async_fn_in_trait)] // No need for Send
-    async fn open_format<F: FormatDriverBuilder<S>>(&mut self, builder: F)
-        -> io::Result<F::Format>;
+    async fn open_format<F: FormatDriverBuilder<S>>(
+        &mut self,
+        builder: F,
+    ) -> io::Result<FormatAccess<S>>;
 
     /// Open an implicitly referenced storage object.
     ///
@@ -61,13 +63,15 @@ pub trait ImplicitOpenGate<S: Storage>: Default {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PermissiveImplicitOpenGate();
 
-impl<S: Storage> ImplicitOpenGate<S> for PermissiveImplicitOpenGate {
+impl<S: Storage + 'static> ImplicitOpenGate<S> for PermissiveImplicitOpenGate {
     async fn open_format<F: FormatDriverBuilder<S>>(
         &mut self,
         builder: F,
-    ) -> io::Result<F::Format> {
+    ) -> io::Result<FormatAccess<S>> {
         // Recursion, need to box
-        Box::pin(builder.open(Self::default())).await
+        Ok(FormatAccess::new(
+            Box::pin(builder.open(Self::default())).await?,
+        ))
     }
 
     async fn open_storage(&mut self, builder: StorageOpenOptions) -> io::Result<S> {
@@ -86,11 +90,11 @@ impl<S: Storage> ImplicitOpenGate<S> for PermissiveImplicitOpenGate {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DenyImplicitOpenGate();
 
-impl<S: Storage> ImplicitOpenGate<S> for DenyImplicitOpenGate {
+impl<S: Storage + 'static> ImplicitOpenGate<S> for DenyImplicitOpenGate {
     async fn open_format<F: FormatDriverBuilder<S>>(
         &mut self,
         builder: F,
-    ) -> io::Result<F::Format> {
+    ) -> io::Result<FormatAccess<S>> {
         let msg = if let Some(filename) = builder.get_image_path() {
             format!("Opening implicitly referenced format layer {filename:?} denied")
         } else {

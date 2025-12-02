@@ -273,7 +273,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     ) -> io::Result<F> {
         let opts = Raw::builder(file).storage_open_options(self.storage_open_options.clone());
         let raw = gate.open_format(opts).await?;
-        Ok(F::wrap(FormatAccess::new(raw)))
+        Ok(F::wrap(raw))
     }
 
     /// Wrap `file` in the `Qcow2` format.  Helper for [`Qcow2::implicit_backing_file()`].
@@ -286,7 +286,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             Qcow2::<S>::builder(file).storage_open_options(self.storage_open_options.clone());
         // Recursive, so needs to be boxed
         let qcow2 = Box::pin(gate.open_format(opts)).await?;
-        Ok(F::wrap(FormatAccess::new(qcow2)))
+        Ok(F::wrap(qcow2))
     }
 
     /// Return the image’s implicit backing image (as given in the image header).
