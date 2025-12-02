@@ -522,7 +522,11 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         .map(|(ofs, len)| (ofs.0, len))
     }
 
-    async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+    async unsafe fn discard_to_zero_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
         self.need_writable()?;
         self.check_disk_bounds(offset, length, "discard")?;
 
@@ -534,11 +538,20 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             .map(|(ofs, len)| (ofs.0, len))
     }
 
-    async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
-        self.discard_to_zero(offset, length).await
+    async unsafe fn discard_to_any_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
+        // Safe: Our caller guarantees that invalidating mappings is safe
+        unsafe { self.discard_to_zero_unsafe(offset, length).await }
     }
 
-    async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+    async unsafe fn discard_to_backing_unsafe(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<(u64, u64)> {
         self.need_writable()?;
         self.check_disk_bounds(offset, length, "discard")?;
 
