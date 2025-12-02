@@ -143,8 +143,9 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// Effectively the same as [`FormatDriverInstance::ensure_zero_mapping()`], but may break
     /// existing data mappings thanks to the mutable `self` reference, which ensures that old data
     /// mappings returned by [`FormatDriverInstance::get_mapping()`] cannot be held onto.
-    async fn discard_to_zero(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
-        unsafe { self.discard_to_zero_unsafe(_offset, _length).await }
+    async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        // Safe: `&mut self` guarantees nobody has concurrent data mappings
+        unsafe { self.discard_to_zero_unsafe(offset, length).await }
     }
 
     /// Discard the given range, ensure it is read back as zeroes.
@@ -176,8 +177,9 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     ///
     /// Effectively the same as [`FormatDriverInstance::discard_to_zero()`], but the discarded area
     /// may read as any data.  Backing file data should not reappear, however.
-    async fn discard_to_any(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
-        unsafe { self.discard_to_any_unsafe(_offset, _length).await }
+    async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        // Safe: `&mut self` guarantees nobody has concurrent data mappings
+        unsafe { self.discard_to_any_unsafe(offset, length).await }
     }
 
     /// Discard the given range.
@@ -216,8 +218,9 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
     /// possible (like for [`FormatDriverInstance::discard_to_backing()`].
     ///
     /// May break existing data mappings thanks to the mutable `self` reference.
-    async fn discard_to_backing(&mut self, _offset: u64, _length: u64) -> io::Result<(u64, u64)> {
-        unsafe { self.discard_to_backing_unsafe(_offset, _length).await }
+    async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
+        // Safe: `&mut self` guarantees nobody has concurrent data mappings
+        unsafe { self.discard_to_backing_unsafe(offset, length).await }
     }
 
     /// Discard the given range, such that the backing image becomes visible.
