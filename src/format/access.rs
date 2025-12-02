@@ -620,7 +620,29 @@ impl<S: Storage + 'static> FormatAccess<S> {
     ///
     /// Areas that cannot be discarded (because of format-inherent alignment restrictions) are
     /// still overwritten with zeroes, unless discarding is not supported altogether.
-    pub async fn discard_to_zero(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+    pub async fn discard_to_zero(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        // Safe: `&mut self` guarantees nobody has concurrent data mappings
+        unsafe { self.discard_to_zero_unsafe(offset, length).await }
+    }
+
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Unsafe variant of [`FormatAccess::discard_to_zero()`], only requiring an immutable `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`FormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`FormatAccess::discard_to_zero()`].
+    pub async unsafe fn discard_to_zero_unsafe(
+        &self,
+        mut offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
         let max_offset = offset.checked_add(length).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -629,10 +651,12 @@ impl<S: Storage + 'static> FormatAccess<S> {
         })?;
 
         while offset < max_offset {
-            let (zofs, zlen) = self
-                .inner
-                .discard_to_zero(offset, max_offset - offset)
-                .await?;
+            // Safe: Caller guarantees this is safe
+            let (zofs, zlen) = unsafe {
+                self.inner
+                    .discard_to_zero_unsafe(offset, max_offset - offset)
+                    .await?
+            };
             if zlen == 0 {
                 break;
             }
@@ -654,16 +678,39 @@ impl<S: Storage + 'static> FormatAccess<S> {
     ///
     /// Discarding being unsupported by this format is still returned as an error
     /// ([`std::io::ErrorKind::Unsupported`])
-    pub async fn discard_to_any(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+    pub async fn discard_to_any(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { self.discard_to_any_unsafe(offset, length).await }
+    }
+
+    /// Discard the given range, not guaranteeing specific data on read-back.
+    ///
+    /// Unsafe variant of [`FormatAccess::discard_to_any()`], only requiring an immutable `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`FormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`FormatAccess::discard_to_any()`].
+    pub async unsafe fn discard_to_any_unsafe(
+        &self,
+        mut offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
         let max_offset = offset.checked_add(length).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Discard-to-any range overflow")
         })?;
 
         while offset < max_offset {
-            let (dofs, dlen) = self
-                .inner
-                .discard_to_any(offset, max_offset - offset)
-                .await?;
+            // Safe: Caller guarantees this is safe
+            let (dofs, dlen) = unsafe {
+                self.inner
+                    .discard_to_any_unsafe(offset, max_offset - offset)
+                    .await?
+            };
             if dlen == 0 {
                 break;
             }
@@ -679,7 +726,30 @@ impl<S: Storage + 'static> FormatAccess<S> {
     /// visible, and keep the rest as-is.  This breaks existing data mappings, so needs a mutable
     /// reference to `self`, which ensures that existing data references (which have the lifetime
     /// of an immutable `self` reference) cannot be kept.
-    pub async fn discard_to_backing(&mut self, mut offset: u64, length: u64) -> io::Result<()> {
+    pub async fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        // Safe: `&mut self` guarantees nobody has concurrent data mappings
+        unsafe { self.discard_to_backing_unsafe(offset, length).await }
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Unsafe variant of [`FormatAccess::discard_to_backing()`], only requiring an immutable
+    /// `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`FormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`FormatAccess::discard_to_backing()`].
+    pub async unsafe fn discard_to_backing_unsafe(
+        &self,
+        mut offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
         let max_offset = offset.checked_add(length).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -688,10 +758,12 @@ impl<S: Storage + 'static> FormatAccess<S> {
         })?;
 
         while offset < max_offset {
-            let (dofs, dlen) = self
-                .inner
-                .discard_to_backing(offset, max_offset - offset)
-                .await?;
+            // Safe: Caller guarantees this is safe
+            let (dofs, dlen) = unsafe {
+                self.inner
+                    .discard_to_backing_unsafe(offset, max_offset - offset)
+                    .await?
+            };
             if dlen == 0 {
                 break;
             }
