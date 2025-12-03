@@ -170,6 +170,26 @@ impl<S: Storage + 'static> SyncFormatAccess<S> {
             .block_on(self.inner.discard_to_zero(offset, length))
     }
 
+    /// Discard the given range, ensure it is read back as zeroes.
+    ///
+    /// Unsafe variant of [`SyncFormatAccess::discard_to_zero()`], only requiring an immutable
+    /// `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`SyncFormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`SyncFormatAccess::discard_to_zero()`].
+    pub unsafe fn discard_to_zero_unsafe(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Safe: Caller guarantees this is safe
+        self.runtime
+            .block_on(unsafe { self.inner.discard_to_zero_unsafe(offset, length) })
+    }
+
     /// Discard the given range, not guaranteeing specific data on read-back.
     ///
     /// Discard as much of the given range as possible, and keep the rest as-is.  Does not
@@ -183,6 +203,26 @@ impl<S: Storage + 'static> SyncFormatAccess<S> {
             .block_on(self.inner.discard_to_any(offset, length))
     }
 
+    /// Discard the given range, not guaranteeing specific data on read-back.
+    ///
+    /// Unsafe variant of [`SyncFormatAccess::discard_to_any()`], only requiring an immutable
+    /// `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`SyncFormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`SyncFormatAccess::discard_to_any()`].
+    pub unsafe fn discard_to_any_unsafe(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Safe: Caller guarantees this is safe
+        self.runtime
+            .block_on(unsafe { self.inner.discard_to_any_unsafe(offset, length) })
+    }
+
     /// Discard the given range, such that the backing image becomes visible.
     ///
     /// Discard as much of the given range as possible so that a backing image’s data becomes
@@ -192,6 +232,26 @@ impl<S: Storage + 'static> SyncFormatAccess<S> {
     pub fn discard_to_backing(&mut self, offset: u64, length: u64) -> io::Result<()> {
         self.runtime
             .block_on(self.inner.discard_to_backing(offset, length))
+    }
+
+    /// Discard the given range, such that the backing image becomes visible.
+    ///
+    /// Unsafe variant of [`SyncFormatAccess::discard_to_backing()`], only requiring an immutable
+    /// `&self`.
+    ///
+    /// # Safety
+    ///
+    /// This function may invalidate existing data mappings.  The caller must ensure to invalidate
+    /// all concurrently existing data mappings they have.  Note that this includes concurrent
+    /// accesses through this type ([`SyncFormatAccess`]), which may hold these mappings internally
+    /// while they run.
+    ///
+    /// One way to ensure safety is to have a mutable reference to `self`, which allows using the
+    /// safe variant [`SyncFormatAccess::discard_to_backing()`].
+    pub unsafe fn discard_to_backing_unsafe(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Safe: Caller guarantees this is safe
+        self.runtime
+            .block_on(unsafe { self.inner.discard_to_backing_unsafe(offset, length) })
     }
 
     /// Flush internal buffers.

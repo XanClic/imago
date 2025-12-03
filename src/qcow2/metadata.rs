@@ -5,8 +5,8 @@ use crate::io_buffers::IoBuffer;
 use crate::macros::numerical_enum;
 use crate::misc_helpers::invalid_data;
 use crate::{Storage, StorageExt};
-use bincode::Options;
-use serde::{Deserialize, Serialize};
+use bincode::config::{BigEndian, Configuration as BincodeConfiguration, Fixint};
+use bincode::{Decode, Encode};
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::num::TryFromIntError;
@@ -40,8 +40,13 @@ pub(super) const MIN_REFCOUNT_WIDTH: usize = 1;
 /// Maximum number of bits per refcount entry.
 pub(super) const MAX_REFCOUNT_WIDTH: usize = 64;
 
+/// Bincode configuration for the qcow2 integer format
+const BINCODE_CFG: BincodeConfiguration<BigEndian, Fixint> = bincode::config::standard()
+    .with_fixed_int_encoding()
+    .with_big_endian();
+
 /// Qcow2 v2 header.
-#[derive(Deserialize, Serialize)]
+#[derive(Decode, Encode)]
 struct V2Header {
     /// Qcow magic string ("QFI\xfb").
     magic: u32,
@@ -114,7 +119,7 @@ impl V2Header {
 }
 
 /// Qcow2 v3 header.
-#[derive(Deserialize, Serialize)]
+#[derive(Decode, Encode)]
 struct V3HeaderBase {
     /// Bitmask of incompatible features.  An implementation must fail to open an image if an
     /// unknown bit is set.
@@ -265,7 +270,7 @@ numerical_enum! {
 }
 
 /// Header for a header extension.
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Default, Decode, Encode)]
 struct HeaderExtensionHeader {
     /// Type code of the header extension.
     extension_type: u32,
@@ -337,14 +342,10 @@ impl Header {
     /// If `writable` is false, do not perform any modifications (e.g. clearing auto-clear bits).
     pub async fn load<S: Storage>(image: &S, writable: bool) -> io::Result<Self> {
         // TODO: More sanity checks.
-        let bincode = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_big_endian();
-
         let mut header_buf = vec![0u8; V2Header::RAW_SIZE];
         image.read(header_buf.as_mut_slice(), 0).await?;
 
-        let header: V2Header = bincode.deserialize(&header_buf).map_err(invalid_data)?;
+        let header: V2Header = decode_binary(&header_buf)?;
         if header.magic != MAGIC {
             return Err(invalid_data("Not a qcow2 file"));
         }
@@ -356,7 +357,7 @@ impl Header {
             image
                 .read(header_buf.as_mut_slice(), V2Header::RAW_SIZE as u64)
                 .await?;
-            bincode.deserialize(&header_buf).map_err(invalid_data)?
+            decode_binary(&header_buf)?
         } else {
             return Err(invalid_data(format!(
                 "qcow2 v{} is not supported",
@@ -464,8 +465,7 @@ impl Header {
 
                 ext_offset += HeaderExtensionHeader::RAW_SIZE as u64;
 
-                let ext_hdr: HeaderExtensionHeader =
-                    bincode.deserialize(&ext_hdr_buf).map_err(invalid_data)?;
+                let ext_hdr: HeaderExtensionHeader = decode_binary(&ext_hdr_buf)?;
                 let ext_end = ext_offset
                     .checked_add(ext_hdr.length as u64)
                     .ok_or_else(|| invalid_data("Header size overflow"))?;
@@ -562,13 +562,9 @@ impl Header {
 
     /// Write the qcow2 header to disk.
     pub async fn write<S: Storage>(&mut self, image: &S) -> io::Result<()> {
-        let bincode = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_big_endian();
-
         let header_len = if self.v2.version > 2 {
-            let len = bincode.serialized_size(&self.v2).unwrap() as usize
-                + bincode.serialized_size(&self.v3).unwrap() as usize
+            let len = encoded_size(&self.v2).unwrap()
+                + encoded_size(&self.v3).unwrap()
                 + self.unknown_header_fields.len();
             let len = len.next_multiple_of(8);
             self.v3.header_length = len as u32;
@@ -622,9 +618,9 @@ impl Header {
             self.v2.backing_file_size = 0;
         };
 
-        let mut full_buf = bincode.serialize(&self.v2).map_err(invalid_data)?;
+        let mut full_buf = encode_binary(&self.v2)?;
         if self.v2.version > 2 {
-            full_buf.append(&mut bincode.serialize(&self.v3).map_err(invalid_data)?);
+            full_buf.append(&mut encode_binary(&self.v3)?);
             full_buf.extend_from_slice(&self.unknown_header_fields);
             full_buf.resize(full_buf.len().next_multiple_of(8), 0);
         }
@@ -957,10 +953,6 @@ impl Header {
 
     /// Serialize all header extensions.
     fn serialize_extensions(&self) -> io::Result<Vec<u8>> {
-        let bincode = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_big_endian();
-
         let mut result = Vec::new();
         for e in &self.extensions {
             let mut data = e.serialize_data()?;
@@ -970,7 +962,7 @@ impl Header {
                     invalid_data(format!("Header extension too long ({}): {err}", data.len()))
                 })?,
             };
-            result.append(&mut bincode.serialize(&ext_hdr).map_err(invalid_data)?);
+            result.append(&mut encode_binary(&ext_hdr)?);
             result.append(&mut data);
             result.resize(result.len().next_multiple_of(8), 0);
         }
@@ -979,7 +971,7 @@ impl Header {
             extension_type: HeaderExtensionType::End as u32,
             length: 0,
         };
-        result.append(&mut bincode.serialize(&end_ext).map_err(invalid_data)?);
+        result.append(&mut encode_binary(&end_ext)?);
         result.resize(result.len().next_multiple_of(8), 0);
 
         Ok(result)
@@ -987,11 +979,7 @@ impl Header {
 
     /// Helper for functions that just need to change little bits in the v2 header part.
     async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
-        let bincode = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_big_endian();
-
-        let v2_header = bincode.serialize(&self.v2).map_err(invalid_data)?;
+        let v2_header = encode_binary(&self.v2)?;
         image.write(&v2_header, 0).await
     }
 
@@ -2867,4 +2855,34 @@ fn check_table(
     }
 
     Ok(())
+}
+
+/// Helper function replacing `bincode::serialized_size()`.
+///
+/// This function has not yet been implemented in bincode 2.
+fn encoded_size<E: Encode>(val: E) -> io::Result<usize> {
+    let mut length = bincode::enc::write::SizeWriter::default();
+    bincode::encode_into_writer(val, &mut length, BINCODE_CFG)
+        .map_err(|err| invalid_data(err.to_string()))?;
+    Ok(length.bytes_written)
+}
+
+/// Helper function replacing `bincode::encode_to_vec()`.
+///
+/// Bincode provides an `encode_to_vec()` function, but only under the `alloc` feature.  For some
+/// reason, enabling that feature pulls in a serde dependency, so re-implement it here.
+fn encode_binary<E: Encode>(val: &E) -> io::Result<Vec<u8>> {
+    let mut vec = vec![0; encoded_size(val)?];
+    bincode::encode_into_slice(val, &mut vec, BINCODE_CFG)
+        .map_err(|err| invalid_data(err.to_string()))?;
+    Ok(vec)
+}
+
+/// Helper function wrapping `bincode::decode_from_slice()`.
+///
+/// We already have [`encode_binary()`] as a helper, we might as well have a helper for decoding.
+fn decode_binary<D: Decode<()>>(slice: &[u8]) -> io::Result<D> {
+    bincode::decode_from_slice(slice, BINCODE_CFG)
+        .map(|(result, _)| result)
+        .map_err(|err| invalid_data(err.to_string()))
 }
