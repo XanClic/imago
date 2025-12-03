@@ -57,6 +57,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             io::Error::new(io::ErrorKind::InvalidInput, "Preallocate range overflow")
         })?;
 
+        // External data file: Resize with preallocation to exact size
         if let Some(data_file) = self.storage.as_ref() {
             data_file.resize(max_offset, storage_prealloc_mode).await?;
         }
@@ -65,13 +66,23 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             let (file, fofs, flen) = self
                 .do_ensure_data_mapping(GuestOffset(offset), max_offset - offset, true, true)
                 .await?;
-            // TODO: This is terrible, `do_ensure_data_mapping()` should get a parameter for this
-            let file_end_ofs = fofs + flen;
-            if let Ok(file_size) = file.size() {
-                if file_size < file_end_ofs {
-                    file.resize(file_end_ofs, storage_prealloc_mode).await?;
+
+            // Data in metadata file: Allocate data areas as we go
+            if self.storage.is_none() {
+                match storage_prealloc_mode {
+                    storage::PreallocateMode::None => (), // handled below
+                    storage::PreallocateMode::Zero => {
+                        file.write_zeroes(fofs, flen).await?;
+                    }
+                    storage::PreallocateMode::Allocate => {
+                        file.write_allocated_zeroes(fofs, flen).await?;
+                    }
+                    storage::PreallocateMode::WriteData => {
+                        write_full_zeroes(file, fofs, flen).await?;
+                    }
                 }
             }
+
             offset += flen;
         }
 
