@@ -403,6 +403,29 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             ))
         }
     }
+
+    /// Check whether we support the given preallocation mode.
+    ///
+    /// `with_backing` designates whether the (new) image (should) have a backing file.
+    fn check_valid_preallocation(
+        prealloc_mode: PreallocateMode,
+        with_backing: bool,
+    ) -> io::Result<()> {
+        if !with_backing {
+            return Ok(());
+        }
+
+        match prealloc_mode {
+            PreallocateMode::None | PreallocateMode::Zero => Ok(()),
+
+            PreallocateMode::FormatAllocate
+            | PreallocateMode::FullAllocate
+            | PreallocateMode::WriteData => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Preallocation is not yet supported for images with a backing file",
+            )),
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -482,7 +505,8 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
         self.need_writable()?;
         let offset = GuestOffset(offset);
-        self.do_ensure_data_mapping(offset, length, overwrite).await
+        self.do_ensure_data_mapping(offset, length, overwrite, false)
+            .await
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -611,10 +635,11 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             return Ok(()); // only grow, else do nothing
         }
 
+        Self::check_valid_preallocation(prealloc_mode, self.backing.is_some())?;
+
         if let Some(data_file) = self.storage.as_ref() {
             // Options that allocate data mappings in qcow2 will resize the data file via
-            // `preallocate()` or `preallocate_write_data()`.  Those that don’t won’t, so they need
-            // to be handled here.
+            // `preallocate()`.  Those that don’t won’t, so they need to be handled here.
             match prealloc_mode {
                 PreallocateMode::None => {
                     data_file
@@ -644,28 +669,28 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             let _l1_locked = self.grow_l1_table(l1_locked, l1_index).await?;
         }
 
-        // Grow before preallocating (so we can preallocate)
-        self.header.set_size(new_size);
-
+        // Preallocate the entire new range (beyond the current image end)
         match prealloc_mode {
-            PreallocateMode::None => Ok(()),
-            PreallocateMode::Zero => self.preallocate_zero(old_size, grown_length).await,
+            PreallocateMode::None => (),
+            PreallocateMode::Zero => self.preallocate_zero(old_size, grown_length).await?,
             PreallocateMode::FormatAllocate => {
                 self.preallocate(old_size, grown_length, storage::PreallocateMode::Zero)
-                    .await
+                    .await?;
             }
             PreallocateMode::FullAllocate => {
                 self.preallocate(old_size, grown_length, storage::PreallocateMode::Allocate)
-                    .await
+                    .await?;
             }
-            PreallocateMode::WriteData => self.preallocate_write_data(old_size, grown_length).await,
+            PreallocateMode::WriteData => {
+                self.preallocate(old_size, grown_length, storage::PreallocateMode::WriteData)
+                    .await?
+            }
         }
-        .inspect_err(|_| {
-            // Better reset to old size then
-            self.header.set_size(old_size)
-        })?;
 
-        // Do this last because we may not be able to undo it
+        // Now that preallocation is complete, it’s safe to actually set the new size (otherwise
+        // someone might see a backing image’s data peek through briefly in case it is longer than
+        // `old_size`)
+        self.header.set_size(new_size);
         self.header
             .write_size(self.metadata.as_ref())
             .await

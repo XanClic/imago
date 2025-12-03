@@ -274,6 +274,24 @@ impl Storage for File {
         unsafe { self.pure_discard(offset, length) }.await
     }
 
+    #[cfg(target_os = "linux")]
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
+
+        let file = self.file.read().unwrap();
+        // Safe: File descriptor is valid, and the rest are simple integer parameters.
+        while_eintr(|| unsafe {
+            libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_ZERO_RANGE, offset, length)
+        })?;
+
+        Ok(())
+    }
+
     // Beware when adding new discard methods: This is called by `pure_write_zeroes()`, so the
     // current expectation is that discarded ranges will read back as zeroes.  If the new method
     // does not guarantee that, you will need to modify `pure_write_zeroes()`.
@@ -283,13 +301,12 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = libc::off_t::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = libc::off_t::try_from(length) else {
-            return Ok(());
-        };
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let file = self.file.read().unwrap();
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
@@ -314,13 +331,12 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = i64::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = i64::try_from(length) else {
-            return Ok(());
-        };
+        let offset: i64 = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: i64 = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let end = offset.saturating_add(length).saturating_add(1);
         let params = FILE_ZERO_DATA_INFORMATION {
@@ -360,13 +376,12 @@ impl Storage for File {
             return Ok(());
         }
 
-        // If offset or length are too big, just skip discarding.
-        let Ok(offset) = libc::off_t::try_from(offset) else {
-            return Ok(());
-        };
-        let Ok(length) = libc::off_t::try_from(length) else {
-            return Ok(());
-        };
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
 
         let params = libc::fpunchhole_t {
             fp_flags: 0,

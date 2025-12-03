@@ -44,7 +44,9 @@ pub enum PreallocateMode {
 
     /// Metadata preallocation.
     ///
-    /// Do not write data, but ensure all blocks are mapped as data.  They must read as zero still.
+    /// Do not write data, but ensure all blocks are mapped as data.  For images without a backing
+    /// file, that data must read as zeroes.  For images with a backing file, that data must be the
+    /// same as the backing file’s contents, and zeroes beyond the backing file EOF.
     FormatAllocate,
 
     /// Metadata and extent preallocation.
@@ -54,6 +56,8 @@ pub enum PreallocateMode {
 
     /// Full data preallocation.
     ///
-    /// Write zeroes to the whole range.
+    /// Write data to the whole range.  For images without a backing file, that data must read as
+    /// zeroes.  For images with a backing file, that data must be the same as the backing file’s
+    /// contents, and zeroes beyond the backing file EOF.
     WriteData,
 }

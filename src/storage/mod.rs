@@ -191,6 +191,23 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         ext::write_full_zeroes(self, offset, length).await
     }
 
+    /// Ensure the given range is allocated, and reads back as zeroes.
+    ///
+    /// The default implementation writes actual zeroes as data, which is inefficient.  Storage
+    /// drivers should override it with a more efficient implementation.
+    ///
+    /// # Safety
+    /// This is a pure write to storage.  The request must be fully aligned to
+    /// [`Self::zero_align()`], and safeguards we want to implement for safe concurrent access may
+    /// not be available.
+    ///
+    /// Use [`StorageExt::write_allocated_zeroes()`](crate::StorageExt::write_allocated_zeroes())
+    /// instead.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        ext::write_full_zeroes(self, offset, length).await
+    }
+
     /// Discard the given range, with undefined contents when read back.
     ///
     /// Tell the storage layer this range is no longer needed and need not be backed by actual
@@ -320,6 +337,16 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
         length: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
 
+    /// Object-safe wrapper around [`Storage::pure_write_allocated_zeroes()`].
+    ///
+    /// # Safety
+    /// Same considerations are for [`Storage::pure_write_allocated_zeroes()`] apply.
+    unsafe fn dyn_pure_write_allocated_zeroes(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
+
     /// Object-safe wrapper around [`Storage::pure_discard()`].
     ///
     /// # Safety
@@ -423,6 +450,10 @@ impl<S: Storage> Storage for &S {
         unsafe { (*self).pure_write_zeroes(offset, length).await }
     }
 
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { (*self).pure_write_allocated_zeroes(offset, length).await }
+    }
+
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { (*self).pure_discard(offset, length).await }
     }
@@ -499,6 +530,14 @@ impl<S: Storage + 'static> DynStorage for S {
         length: u64,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
         Box::pin(unsafe { <S as Storage>::pure_write_zeroes(self, offset, length) })
+    }
+
+    unsafe fn dyn_pure_write_allocated_zeroes(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(unsafe { <S as Storage>::pure_write_allocated_zeroes(self, offset, length) })
     }
 
     unsafe fn dyn_pure_discard(
@@ -587,6 +626,14 @@ impl Storage for Box<dyn DynStorage> {
         unsafe { self.as_ref().dyn_pure_write_zeroes(offset, length).await }
     }
 
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe {
+            self.as_ref()
+                .dyn_pure_write_allocated_zeroes(offset, length)
+                .await
+        }
+    }
+
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { self.as_ref().dyn_pure_discard(offset, length).await }
     }
@@ -661,6 +708,14 @@ impl Storage for Arc<dyn DynStorage> {
 
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { self.as_ref().dyn_pure_write_zeroes(offset, length) }.await
+    }
+
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe {
+            self.as_ref()
+                .dyn_pure_write_allocated_zeroes(offset, length)
+        }
+        .await
     }
 
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {

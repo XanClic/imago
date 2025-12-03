@@ -65,6 +65,10 @@ pub trait StorageExt: Storage {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()>;
 
+    /// Ensure the given range is allocated and reads back as zeroes.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()>;
+
     /// Discard the given range, with undefined contents when read back.
     ///
     /// Tell the storage layer this range is no longer needed and need not be backed by actual
@@ -244,49 +248,11 @@ impl<S: Storage> StorageExt for S {
     }
 
     async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        let zero_align = self.zero_align();
-        debug_assert!(zero_align.is_power_of_two());
-        let align_mask = zero_align as u64 - 1;
+        write_efficient_zeroes(self, offset, length, false).await
+    }
 
-        let unaligned_end = offset
-            .checked_add(length)
-            .ok_or_else(|| io::Error::other("Zero-write wrap-around"))?;
-        let aligned_offset = (offset + align_mask) & !align_mask;
-        let aligned_end = unaligned_end & !align_mask;
-
-        if aligned_end > aligned_offset {
-            let _sw_guard = self.weak_write_blocker(aligned_offset..aligned_end).await;
-            // Safe: Alignment checked, and weak write blocker set up
-            unsafe { self.pure_write_zeroes(aligned_offset, aligned_end - aligned_offset) }.await?;
-        }
-
-        let zero_buf = if aligned_offset > offset || aligned_end < unaligned_end {
-            let mut buf = IoBuffer::new(
-                cmp::max(aligned_offset - offset, unaligned_end - aligned_end) as usize,
-                self.mem_align(),
-            )?;
-            buf.as_mut().into_slice().fill(0);
-            Some(buf)
-        } else {
-            None
-        };
-
-        if aligned_offset > offset {
-            let buf = zero_buf
-                .as_ref()
-                .unwrap()
-                .as_ref_range(0..((aligned_offset - offset) as usize));
-            self.write(buf, offset).await?;
-        }
-        if aligned_end < unaligned_end {
-            let buf = zero_buf
-                .as_ref()
-                .unwrap()
-                .as_ref_range(0..((unaligned_end - aligned_end) as usize));
-            self.write(buf, aligned_end).await?;
-        }
-
-        Ok(())
+    async fn write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        write_efficient_zeroes(self, offset, length, true).await
     }
 
     async fn discard(&self, offset: u64, length: u64) -> io::Result<()> {
@@ -361,6 +327,86 @@ pub(crate) async fn write_full_zeroes<S: StorageExt>(
             .await?;
         offset += chunk_length as u64;
         length -= chunk_length as u64;
+    }
+
+    Ok(())
+}
+
+/// Write zeroes efficiently to the given area.
+///
+/// This implements `write_zeroes()` and `write_allocated_zeroes()`.
+///
+/// If `allocate` is `true`, use [`Storage::pure_write_allocated_zeroes()`]; else, use
+/// [`Storage::pure_write_zeroes()`].
+///
+/// If the `pure_*` call fails with [`io::ErrorKind::Unsupported`], fall back to
+/// [`write_full_zeroes()`].
+pub(crate) async fn write_efficient_zeroes<S: StorageExt>(
+    storage: S,
+    offset: u64,
+    length: u64,
+    allocate: bool,
+) -> io::Result<()> {
+    let zero_align = storage.zero_align();
+    debug_assert!(zero_align.is_power_of_two());
+    let align_mask = zero_align as u64 - 1;
+
+    let unaligned_end = offset
+        .checked_add(length)
+        .ok_or_else(|| io::Error::other("Zero-write wrap-around"))?;
+    let aligned_offset = (offset + align_mask) & !align_mask;
+    let aligned_end = unaligned_end & !align_mask;
+
+    if aligned_end > aligned_offset {
+        let result = {
+            let _sw_guard = storage
+                .weak_write_blocker(aligned_offset..aligned_end)
+                .await;
+            // Safe: Alignment checked, and weak write blocker set up
+            if allocate {
+                unsafe {
+                    storage
+                        .pure_write_allocated_zeroes(aligned_offset, aligned_end - aligned_offset)
+                }
+                .await
+            } else {
+                unsafe { storage.pure_write_zeroes(aligned_offset, aligned_end - aligned_offset) }
+                    .await
+            }
+        };
+        if let Err(err) = result {
+            return if err.kind() == io::ErrorKind::Unsupported {
+                write_full_zeroes(storage, offset, length).await
+            } else {
+                Err(err)
+            };
+        }
+    }
+
+    let zero_buf = if aligned_offset > offset || aligned_end < unaligned_end {
+        let mut buf = IoBuffer::new(
+            cmp::max(aligned_offset - offset, unaligned_end - aligned_end) as usize,
+            storage.mem_align(),
+        )?;
+        buf.as_mut().into_slice().fill(0);
+        Some(buf)
+    } else {
+        None
+    };
+
+    if aligned_offset > offset {
+        let buf = zero_buf
+            .as_ref()
+            .unwrap()
+            .as_ref_range(0..((aligned_offset - offset) as usize));
+        storage.write(buf, offset).await?;
+    }
+    if aligned_end < unaligned_end {
+        let buf = zero_buf
+            .as_ref()
+            .unwrap()
+            .as_ref_range(0..((unaligned_end - aligned_end) as usize));
+        storage.write(buf, aligned_end).await?;
     }
 
     Ok(())
