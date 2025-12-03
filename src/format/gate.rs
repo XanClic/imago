@@ -89,18 +89,24 @@ pub struct DenyImplicitOpenGate();
 impl<S: Storage> ImplicitOpenGate<S> for DenyImplicitOpenGate {
     async fn open_format<F: FormatDriverBuilder<S>>(
         &mut self,
-        _builder: F,
+        builder: F,
     ) -> io::Result<F::Format> {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Opening implicitly referenced format layer denied",
-        ))
+        let msg = if let Some(filename) = builder.get_image_path() {
+            format!("Opening implicitly referenced format layer {filename:?} denied")
+        } else {
+            "Opening implicitly referenced format layer denied".into()
+        };
+
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, msg))
     }
 
-    async fn open_storage(&mut self, _builder: StorageOpenOptions) -> io::Result<S> {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Opening implicitly referenced storage object denied",
-        ))
+    async fn open_storage(&mut self, builder: StorageOpenOptions) -> io::Result<S> {
+        let msg = if let Some(filename) = builder.get_filename() {
+            format!("Opening implicitly referenced storage object {filename:?} denied")
+        } else {
+            "Opening implicitly referenced storage object denied".into()
+        };
+
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, msg))
     }
 }
