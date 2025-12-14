@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{io, mem};
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
-use tracing::{error, span, trace, Level};
+use tracing::{error, instrument, trace};
 
 /// Cache entry structure, wrapping the cached object.
 pub(crate) struct AsyncLruCacheEntry<V> {
@@ -169,6 +169,15 @@ impl<
     /// Set up a flush dependency.
     ///
     /// Ensure that before anything in this cache is flushed, `flush_before` is flushed first.
+    #[instrument(
+        level = "trace",
+        name = "AsyncLruCache::depend_on",
+        skip_all,
+        fields(
+            self = Arc::as_ptr(&self.0) as usize,
+            other = Arc::as_ptr(&other.0) as usize,
+        )
+    )]
     pub async fn depend_on<
         K2: Clone + Copy + Debug + PartialEq + Eq + Hash + Send + Sync + 'static,
         V2: Send + Sync + 'static,
@@ -177,14 +186,6 @@ impl<
         &self,
         other: &AsyncLruCache<K2, V2, B2>,
     ) -> io::Result<()> {
-        let _span = span!(
-            Level::TRACE,
-            "AsyncLruCache::depend_on",
-            self = Arc::as_ptr(&self.0) as usize,
-            other = Arc::as_ptr(&other.0) as usize
-        )
-        .entered();
-
         let cloned: Arc<AsyncLruCacheInner<K2, V2, B2>> = Arc::clone(&other.0);
         let cloned: Arc<dyn FlushableCache> = cloned;
 
@@ -227,11 +228,10 @@ impl<
     ///
     /// Call with a guard that should be dropped only after this cache is flushed, so that no new
     /// dependencies can enter while we are still flushing this cache.
+    #[instrument(level = "trace", name = "AsyncLruCache::flush_dependencies", skip_all)]
     async fn flush_dependencies(
         flush_before: &mut MutexGuard<'_, Vec<Arc<dyn FlushableCache>>>,
     ) -> io::Result<()> {
-        let _span = span!(Level::TRACE, "AsyncLruCache::flush_dependencies").entered();
-
         while let Some(dep) = flush_before.pop() {
             trace!("Flushing dependency {:?}", Arc::as_ptr(&dep) as *const _);
             if let Err(err) = dep.flush().await {
@@ -245,17 +245,16 @@ impl<
     /// Ensure there is at least one free entry in the cache.
     ///
     /// Do this by evicting (flushing) existing entries, if necessary.
+    #[instrument(
+        level = "trace",
+        name = "AsyncLruCache::ensure_free_entry",
+        skip_all,
+        fields(self = &self as *const _ as usize),
+    )]
     async fn ensure_free_entry(
         &self,
         map: &mut RwLockWriteGuard<'_, HashMap<K, AsyncLruCacheEntry<V>>>,
     ) -> io::Result<()> {
-        let _span = span!(
-            Level::TRACE,
-            "AsyncLruCache::ensure_free_entry",
-            self = &self as *const _ as usize
-        )
-        .entered();
-
         while map.len() >= self.limit {
             trace!("{} / {} used", map.len(), self.limit);
 
@@ -392,14 +391,13 @@ impl<
     /// Flush all cache entries.
     ///
     /// Those entries are not evicted, but remain in the cache.
+    #[instrument(
+        level = "trace",
+        name = "AsyncLruCache::flush",
+        skip_all,
+        fields(self = &self as *const _ as usize)
+    )]
     async fn flush(&self) -> io::Result<()> {
-        let _span = span!(
-            Level::TRACE,
-            "AsyncLruCache::flush",
-            self = &self as *const _ as usize
-        )
-        .entered();
-
         let mut futs = FutureVector::new();
 
         let mut dep_guard = self.flush_before.lock().await;
@@ -423,14 +421,13 @@ impl<
     /// # Safety
     /// Depending on the nature of the cache, this operation may be unsafe.  Perform at your own
     /// risk.
+    #[instrument(
+        level = "trace",
+        name = "AsyncLruCache::invalidate",
+        skip_all,
+        fields(self = &self as *const _ as usize)
+    )]
     async unsafe fn invalidate(&self) -> io::Result<()> {
-        let _span = span!(
-            Level::TRACE,
-            "AsyncLruCache::invalidate",
-            self = &self as *const _ as usize
-        )
-        .entered();
-
         let mut in_use = Vec::new();
 
         let mut map = self.map.write().await;
