@@ -291,7 +291,18 @@ impl Storage for File {
     }
 
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        self.discard_to_zero(offset, length).await
+        if let Err(err) = self.discard_to_zero(offset, length).await {
+            // Ignore `Unsupported` errors: As per the `pure_discard` documentation, a no-op
+            // implementation is acceptable.  In addition, the default implementation returns
+            // `Ok(())`, and it makes no sense to be harsher than that here.
+            if err.kind() == io::ErrorKind::Unsupported {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        } else {
+            Ok(())
+        }
     }
 
     async fn flush(&self) -> io::Result<()> {
