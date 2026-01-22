@@ -268,10 +268,8 @@ impl Storage for File {
         Ok(())
     }
 
-    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        // All of our discard methods also ensure the range reads back as zeroes
-        unsafe { self.pure_discard(offset, length) }.await
+        self.discard_to_zero(offset, length).await
     }
 
     #[cfg(target_os = "linux")]
@@ -292,108 +290,8 @@ impl Storage for File {
         Ok(())
     }
 
-    // Beware when adding new discard methods: This is called by `pure_write_zeroes()`, so the
-    // current expectation is that discarded ranges will read back as zeroes.  If the new method
-    // does not guarantee that, you will need to modify `pure_write_zeroes()`.
-    #[cfg(target_os = "linux")]
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.try_discard_by_truncate(offset, length)? {
-            return Ok(());
-        }
-
-        let offset: libc::off_t = offset
-            .try_into()
-            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
-        let length: libc::off_t = length
-            .try_into()
-            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
-
-        let file = self.file.read().unwrap();
-        // Safe: File descriptor is valid, and the rest are simple integer parameters.
-        while_eintr(|| unsafe {
-            libc::fallocate(
-                file.as_raw_fd(),
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                offset,
-                length,
-            )
-        })?;
-
-        Ok(())
-    }
-
-    // Beware when adding new discard methods: This is called by `pure_write_zeroes()`, so the
-    // current expectation is that discarded ranges will read back as zeroes.  If the new method
-    // does not guarantee that, you will need to modify `pure_write_zeroes()`.
-    #[cfg(windows)]
-    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.try_discard_by_truncate(offset, length)? {
-            return Ok(());
-        }
-
-        let offset: i64 = offset
-            .try_into()
-            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
-        let length: i64 = length
-            .try_into()
-            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
-
-        let end = offset.saturating_add(length).saturating_add(1);
-        let params = FILE_ZERO_DATA_INFORMATION {
-            FileOffset: offset,
-            BeyondFinalZero: end,
-        };
-        let mut _returned = 0;
-        let file = self.file.read().unwrap();
-        // Safe: File handle is valid, mandatory pointers (input, returned length) are passed and
-        // valid, the parameter type matches the call, and the input size matches the object
-        // passed.
-        let ret = unsafe {
-            DeviceIoControl(
-                file.as_raw_handle(),
-                FSCTL_SET_ZERO_DATA,
-                (&params as *const FILE_ZERO_DATA_INFORMATION).cast::<std::ffi::c_void>(),
-                size_of_val(&params) as u32,
-                std::ptr::null_mut(),
-                0,
-                &mut _returned,
-                std::ptr::null_mut(),
-            )
-        };
-        if ret == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(())
-    }
-
-    // Beware when adding new discard methods: This is called by `pure_write_zeroes()`, so the
-    // current expectation is that discarded ranges will read back as zeroes.  If the new method
-    // does not guarantee that, you will need to modify `pure_write_zeroes()`.
-    #[cfg(target_os = "macos")]
-    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.try_discard_by_truncate(offset, length)? {
-            return Ok(());
-        }
-
-        let offset: libc::off_t = offset
-            .try_into()
-            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
-        let length: libc::off_t = length
-            .try_into()
-            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
-
-        let params = libc::fpunchhole_t {
-            fp_flags: 0,
-            reserved: 0,
-            fp_offset: offset,
-            fp_length: length,
-        };
-        let file = self.file.read().unwrap();
-        // Safe: FD is valid, passed pointer is valid and its type matches the call.
-        while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) })?;
-
-        Ok(())
+        self.discard_to_zero(offset, length).await
     }
 
     async fn flush(&self) -> io::Result<()> {
@@ -874,6 +772,107 @@ impl File {
 
         file.set_len(offset)?;
         Ok(true)
+    }
+
+    /// Ensure the given range reads back as zeroes, or return an error.
+    async fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.try_discard_by_truncate(offset, length)? {
+            return Ok(());
+        }
+
+        self.discard_to_zero_os_specific(offset, length).await
+    }
+
+    /// Via OS-specific means, ensure the given range reads back as zeroes, or return an error.
+    #[cfg(target_os = "linux")]
+    async fn discard_to_zero_os_specific(&self, offset: u64, length: u64) -> io::Result<()> {
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
+
+        let file = self.file.read().unwrap();
+        // Safe: File descriptor is valid, and the rest are simple integer parameters.
+        while_eintr(|| unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset,
+                length,
+            )
+        })?;
+
+        Ok(())
+    }
+
+    /// Via OS-specific means, ensure the given range reads back as zeroes, or return an error.
+    #[cfg(windows)]
+    async fn discard_to_zero_os_specific(&self, offset: u64, length: u64) -> io::Result<()> {
+        let offset: i64 = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: i64 = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
+
+        let end = offset.saturating_add(length).saturating_add(1);
+        let params = FILE_ZERO_DATA_INFORMATION {
+            FileOffset: offset,
+            BeyondFinalZero: end,
+        };
+        let mut _returned = 0;
+        let file = self.file.read().unwrap();
+        // Safe: File handle is valid, mandatory pointers (input, returned length) are passed and
+        // valid, the parameter type matches the call, and the input size matches the object
+        // passed.
+        let ret = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_SET_ZERO_DATA,
+                (&params as *const FILE_ZERO_DATA_INFORMATION).cast::<std::ffi::c_void>(),
+                size_of_val(&params) as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut _returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Via OS-specific means, ensure the given range reads back as zeroes, or return an error.
+    #[cfg(target_os = "macos")]
+    async fn discard_to_zero_os_specific(&self, offset: u64, length: u64) -> io::Result<()> {
+        let offset: libc::off_t = offset
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes offset error: {e}")))?;
+        let length: libc::off_t = length
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Discard/write-zeroes length error: {e}")))?;
+
+        let params = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: offset,
+            fp_length: length,
+        };
+        let file = self.file.read().unwrap();
+        // Safe: FD is valid, passed pointer is valid and its type matches the call.
+        while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) })?;
+
+        Ok(())
+    }
+
+    /// Via OS-specific means, ensure the given range reads back as zeroes, or return an error.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    async fn discard_to_zero_os_specific(&self, offset: u64, length: u64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 }
 
