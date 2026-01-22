@@ -24,7 +24,7 @@ use std::os::windows::fs::{FileExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::{cmp, fs};
 #[cfg(unix)]
@@ -66,6 +66,9 @@ pub struct File {
     /// macOS-only: Use fsync() instead of F_FULLFSYNC on `sync()` method.
     #[cfg(target_os = "macos")]
     relaxed_sync: bool,
+
+    /// Set once we know that discard is unsupported and we can skip trying.
+    discard_unsupported: AtomicBool,
 }
 
 impl TryFrom<fs::File> for File {
@@ -449,6 +452,7 @@ impl File {
             common_storage_helper: Default::default(),
             #[cfg(target_os = "macos")]
             relaxed_sync,
+            discard_unsupported: AtomicBool::new(false),
         })
     }
 
@@ -791,7 +795,16 @@ impl File {
             return Ok(());
         }
 
-        self.discard_to_zero_os_specific(offset, length).await
+        if self.discard_unsupported.load(Ordering::Relaxed) {
+            Err(io::ErrorKind::Unsupported.into())
+        } else if let Err(err) = self.discard_to_zero_os_specific(offset, length).await {
+            if err.kind() == io::ErrorKind::Unsupported {
+                self.discard_unsupported.store(true, Ordering::Relaxed);
+            }
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     /// Via OS-specific means, ensure the given range reads back as zeroes, or return an error.
