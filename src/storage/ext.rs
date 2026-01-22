@@ -267,9 +267,10 @@ impl<S: Storage> StorageExt for S {
         let aligned_end = unaligned_end & !align_mask;
 
         if aligned_end > aligned_offset {
-            let _sw_guard = self.weak_write_blocker(offset..(offset + length)).await;
+            let _sw_guard = self.weak_write_blocker(aligned_offset..aligned_end).await;
+            let aligned_len = aligned_end - aligned_offset;
             // Safe: Alignment checked, and weak write blocker set up
-            unsafe { self.pure_discard(offset, length) }.await?;
+            unsafe { self.pure_discard(aligned_offset, aligned_len) }.await?;
         }
 
         // Nothing to do for the unaligned part; discarding is always just advisory.
