@@ -288,7 +288,8 @@ impl Storage for File {
         // Safe: File descriptor is valid, and the rest are simple integer parameters.
         while_eintr(|| unsafe {
             libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_ZERO_RANGE, offset, length)
-        })?;
+        })
+        .map_err(Self::map_os_err)?;
 
         Ok(())
     }
@@ -361,7 +362,8 @@ impl Storage for File {
                     let len = (new_size - current_size)
                         .try_into()
                         .map_err(io::Error::other)?;
-                    while_eintr(|| unsafe { libc::fallocate(file.as_raw_fd(), 0, ofs, len) })?;
+                    while_eintr(|| unsafe { libc::fallocate(file.as_raw_fd(), 0, ofs, len) })
+                        .map_err(Self::map_os_err)?;
                 }
 
                 #[cfg(target_os = "macos")]
@@ -381,7 +383,8 @@ impl Storage for File {
                     };
                     while_eintr(|| unsafe {
                         libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut params)
-                    })?;
+                    })
+                    .map_err(Self::map_os_err)?;
 
                     file.set_len(new_size)?;
                 }
@@ -760,6 +763,51 @@ impl File {
         )
     }
 
+    /// For special operations, ensure the error kind is usable.
+    ///
+    /// When invoking OS I/O operations directly, we turn the returned raw OS error code into an
+    /// `io::Error` object via `io::Error::last_os_error()`.  To differentiate between different
+    /// error cases, in generic imago code, we then don’t use that raw error code, but the error
+    /// kind (`io::ErrorKind`) instead, specifically it’s important to properly return an error of
+    /// kind `io::ErrorKind::Unsupported` when an operation is unsupported, so fall-backs can be
+    /// employed.
+    ///
+    /// Rust’s standard library only assigns this error kind (`Unsupported`) to `EOPNOTSUPP` (=
+    /// `ENOTSUP`) and `ENOSYS`.  However, some “special” operations (`fallocate()`,
+    /// `fcntl(F_PUNCHHOLE)`, `ioctl()`, ...) can return other error codes for when an operation is
+    /// not supported on a specific file, e.g. `ENODEV` or `ENXIO`.
+    ///
+    /// Assign the appropriate error kind to such errors so the generic code can handle them.
+    #[cfg(unix)]
+    fn map_os_err(err: io::Error) -> io::Error {
+        let Some(raw) = err.raw_os_error() else {
+            return err;
+        };
+
+        let has_kind = err.kind();
+        let want_kind = match raw {
+            #[allow(unreachable_patterns)] // `ENOTSUP` may be equal to `EOPNOTSUPP`
+            libc::ENOTSUP | libc::EOPNOTSUPP | libc::ENODEV | libc::ENXIO | libc::ENOTTY => {
+                io::ErrorKind::Unsupported
+            }
+            _ => has_kind,
+        };
+
+        if has_kind != want_kind {
+            io::Error::new(want_kind, err)
+        } else {
+            err
+        }
+    }
+
+    /// For special operations, ensure the error kind is usable.
+    ///
+    /// For non-UNIX systems, this is an identity map.
+    #[cfg(not(unix))]
+    fn map_os_err(err: io::Error) -> io::Error {
+        err
+    }
+
     /// Attempt to discard range by truncating the file.
     ///
     /// If the given range is at the end of the file, discard it by simply truncating the file.
@@ -826,7 +874,8 @@ impl File {
                 offset,
                 length,
             )
-        })?;
+        })
+        .map_err(Self::map_os_err)?;
 
         Ok(())
     }
@@ -864,7 +913,7 @@ impl File {
             )
         };
         if ret == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Self::map_os_err(io::Error::last_os_error()));
         }
 
         Ok(())
@@ -888,7 +937,8 @@ impl File {
         };
         let file = self.file.read().unwrap();
         // Safe: FD is valid, passed pointer is valid and its type matches the call.
-        while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) })?;
+        while_eintr(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &params) })
+            .map_err(Self::map_os_err)?;
 
         Ok(())
     }
