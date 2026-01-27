@@ -267,9 +267,18 @@ impl<S: Storage> StorageExt for S {
         let aligned_end = unaligned_end & !align_mask;
 
         if aligned_end > aligned_offset {
-            let _sw_guard = self.weak_write_blocker(offset..(offset + length)).await;
+            let _sw_guard = self.weak_write_blocker(aligned_offset..aligned_end).await;
+            let aligned_len = aligned_end - aligned_offset;
             // Safe: Alignment checked, and weak write blocker set up
-            unsafe { self.pure_discard(offset, length) }.await?;
+            if let Err(err) = unsafe { self.pure_discard(aligned_offset, aligned_len) }.await {
+                // Ignore ENOTSUP errors: Where the fall-back for write-zeroes in case of ENOTSUP
+                // is `write_full_zeroes()`, in case of discard, we don’t need to do anything,
+                // because the state after discard is undefined anyway (so a no-op is OK).  So the
+                // fall-back is just to return `Ok(())`.
+                if err.kind() != io::ErrorKind::Unsupported {
+                    return Err(err);
+                }
+            }
         }
 
         // Nothing to do for the unaligned part; discarding is always just advisory.
