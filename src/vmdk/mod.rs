@@ -26,6 +26,9 @@ const VMDK4_MAGIC: u32 = 0x564d444b; // 'KDMV'
 /// Supported version range
 const VMDK_VERSION_RANGE: RangeInclusive<u32> = 1..=3;
 
+/// Supported VMDK create types
+const VMDK_SUPPORTED_CREATE_TYPES: &[&str] = &["monolithicFlat", "twoGbMaxExtentFlat"];
+
 /// Represents the data storage for a VMDK extent
 #[derive(Debug, Clone)]
 enum VmdkStorage<S: Storage + 'static> {
@@ -544,8 +547,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverInstance f
         Self: Sized,
     {
         // Check that the potential descriptor file has a reasonable length, is utf8, and contains
-        // a supported `version` key.
-        // (Or has the `VMDK4_MAGIC`.)
+        // a supported `version` key and a supported `createType`.
 
         let desc_file_size = storage.size()?;
         if !(4..=2 * 1024 * 1024).contains(&desc_file_size) {
@@ -558,22 +560,43 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverInstance f
 
         let desc_file = desc_file.as_ref().into_slice();
         if u32::from_le_bytes(desc_file[..4].try_into().unwrap()) == VMDK4_MAGIC {
-            return Ok(true);
+            return Ok(false);
         }
 
-        for line in desc_file.split(|chr| *chr == b'\n') {
-            let Ok(line) = str::from_utf8(line) else {
-                return Ok(false);
-            };
+        let Ok(text) = std::str::from_utf8(desc_file) else {
+            return Ok(false);
+        };
 
-            let Some((key, value)) = line.split_once('=') else {
+        let mut has_version = false;
+        let mut has_valid_type = false;
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
                 continue;
-            };
-            if key.trim() == "version" {
-                let Ok(version) = value.trim().parse() else {
-                    return Ok(false);
-                };
-                return Ok(VMDK_VERSION_RANGE.contains(&version));
+            }
+
+            if let Some((key, value)) = line.split_once('=') {
+                match key.trim() {
+                    "version" => {
+                        let Ok(v) = value.trim().parse() else { return Ok(false) };
+                        if !VMDK_VERSION_RANGE.contains(&v) {
+                            return Ok(false);
+                        }
+                        has_version = true;
+                    }
+                    "createType" => {
+                        if !VMDK_SUPPORTED_CREATE_TYPES.contains(&strip_quotes(value.trim())) {
+                            return Ok(false);
+                        }
+                        has_valid_type = true;
+                    }
+                    _ => {}
+                }
+
+                if has_version && has_valid_type {
+                    return Ok(true);
+                }
             }
         }
 
