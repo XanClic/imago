@@ -894,7 +894,7 @@ impl File {
 
     /// Attempt to discard range by truncating the file.
     ///
-    /// If the given range is at the end of the file, discard it by simply truncating the file.
+    /// If the range reaches the end of the file, truncate and restore the original file length.
     /// Return `true` on success.
     ///
     /// If the range is not at the end of the file, i.e. another method of discarding is needed,
@@ -918,6 +918,7 @@ impl File {
         }
 
         file.set_len(offset)?;
+        file.set_len(size)?;
         Ok(true)
     }
 
@@ -1126,9 +1127,10 @@ mod ioctl {
 #[cfg(test)]
 mod tests {
     use super::File;
-    use std::fs;
+    use crate::{Storage, StorageExt, StorageOpenOptions};
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{fs, io};
 
     #[cfg(windows)]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
@@ -1195,5 +1197,35 @@ mod tests {
 
         assert_eq!(alignments, (1, 1, expected_fs_align.0, expected_fs_align.1));
         assert_eq!(len, 0);
+    }
+
+    struct TempPath(std::path::PathBuf);
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn tail_discard_keeps_file_length() -> io::Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("imago-tail-discard-{}.raw", std::process::id()));
+        let _temp_path = TempPath(path.clone());
+        std::fs::write(&path, vec![0xabu8; 8192])?;
+
+        let file = File::open(StorageOpenOptions::new().write(true).filename(&path)).await?;
+        file.discard(4096, 4096).await?;
+        assert_eq!(std::fs::metadata(&path)?.len(), 8192);
+
+        let mut prefix = vec![0u8; 4096];
+        file.read(&mut prefix, 0).await?;
+        assert_eq!(prefix, vec![0xabu8; 4096]);
+
+        let mut tail = vec![0xffu8; 4096];
+        file.read(&mut tail, 4096).await?;
+        assert!(tail.iter().all(|&byte| byte == 0));
+
+        io::Result::Ok(())
     }
 }
