@@ -1034,40 +1034,6 @@ impl File {
     }
 }
 
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-
-    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
-    async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
-        let path = std::env::temp_dir().join(format!(
-            "imago-zero-data-boundary-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::write(&path, vec![0x5a; 12288]).unwrap();
-        let host = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let storage = File::try_from(host).unwrap();
-        let zero_result = storage.discard_to_zero_os_specific(4096, 4096).await;
-        drop(storage);
-
-        let contents = fs::read(&path);
-        let _ = fs::remove_file(&path);
-        zero_result.unwrap();
-        let contents = contents.unwrap();
-        assert_eq!(contents[4095], 0x5a);
-        assert!(contents[4096..8192].iter().all(|byte| *byte == 0));
-        assert_eq!(contents[8192], 0x5a);
-    }
-}
-
 impl Display for File {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if let Some(filename) = self.filename.as_ref() {
@@ -1157,12 +1123,44 @@ mod ioctl {
     ioctl_read!(diocgmediasize, 'd', 129, libc::off_t);
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::File;
     use std::fs;
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(windows)]
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
+        let path = std::env::temp_dir().join(format!(
+            "imago-zero-data-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, vec![0x5a; 12288]).unwrap();
+        let host = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let storage = File::try_from(host).unwrap();
+        let zero_result = storage.discard_to_zero_os_specific(4096, 4096).await;
+        drop(storage);
+
+        let contents = fs::read(&path);
+        let _ = fs::remove_file(&path);
+        zero_result.unwrap();
+        let contents = contents.unwrap();
+        assert_eq!(contents[4095], 0x5a);
+        assert!(contents[4096..8192].iter().all(|byte| *byte == 0));
+        assert_eq!(contents[8192], 0x5a);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn buffered_writable_file_is_not_modified_during_construction() {
         let unique = SystemTime::now()
