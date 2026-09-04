@@ -894,7 +894,7 @@ impl File {
 
     /// Attempt to discard range by truncating the file.
     ///
-    /// If the given range is at the end of the file, discard it by simply truncating the file.
+    /// If the range reaches the end of the file, truncate and restore the original file length.
     /// Return `true` on success.
     ///
     /// If the range is not at the end of the file, i.e. another method of discarding is needed,
@@ -918,6 +918,7 @@ impl File {
         }
 
         file.set_len(offset)?;
+        file.set_len(size)?;
         Ok(true)
     }
 
@@ -1034,40 +1035,6 @@ impl File {
     }
 }
 
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-
-    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
-    async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
-        let path = std::env::temp_dir().join(format!(
-            "imago-zero-data-boundary-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::write(&path, vec![0x5a; 12288]).unwrap();
-        let host = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let storage = File::try_from(host).unwrap();
-        let zero_result = storage.discard_to_zero_os_specific(4096, 4096).await;
-        drop(storage);
-
-        let contents = fs::read(&path);
-        let _ = fs::remove_file(&path);
-        zero_result.unwrap();
-        let contents = contents.unwrap();
-        assert_eq!(contents[4095], 0x5a);
-        assert!(contents[4096..8192].iter().all(|byte| *byte == 0));
-        assert_eq!(contents[8192], 0x5a);
-    }
-}
-
 impl Display for File {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if let Some(filename) = self.filename.as_ref() {
@@ -1157,12 +1124,45 @@ mod ioctl {
     ioctl_read!(diocgmediasize, 'd', 129, libc::off_t);
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::File;
-    use std::fs;
+    use crate::{Storage, StorageExt, StorageOpenOptions};
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{fs, io};
 
+    #[cfg(windows)]
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
+        let path = std::env::temp_dir().join(format!(
+            "imago-zero-data-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, vec![0x5a; 12288]).unwrap();
+        let host = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let storage = File::try_from(host).unwrap();
+        let zero_result = storage.discard_to_zero_os_specific(4096, 4096).await;
+        drop(storage);
+
+        let contents = fs::read(&path);
+        let _ = fs::remove_file(&path);
+        zero_result.unwrap();
+        let contents = contents.unwrap();
+        assert_eq!(contents[4095], 0x5a);
+        assert!(contents[4096..8192].iter().all(|byte| *byte == 0));
+        assert_eq!(contents[8192], 0x5a);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn buffered_writable_file_is_not_modified_during_construction() {
         let unique = SystemTime::now()
@@ -1197,5 +1197,35 @@ mod tests {
 
         assert_eq!(alignments, (1, 1, expected_fs_align.0, expected_fs_align.1));
         assert_eq!(len, 0);
+    }
+
+    struct TempPath(std::path::PathBuf);
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn tail_discard_keeps_file_length() -> io::Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("imago-tail-discard-{}.raw", std::process::id()));
+        let _temp_path = TempPath(path.clone());
+        std::fs::write(&path, vec![0xabu8; 8192])?;
+
+        let file = File::open(StorageOpenOptions::new().write(true).filename(&path)).await?;
+        file.discard(4096, 4096).await?;
+        assert_eq!(std::fs::metadata(&path)?.len(), 8192);
+
+        let mut prefix = vec![0u8; 4096];
+        file.read(&mut prefix, 0).await?;
+        assert_eq!(prefix, vec![0xabu8; 4096]);
+
+        let mut tail = vec![0xffu8; 4096];
+        file.read(&mut tail, 4096).await?;
+        assert!(tail.iter().all(|&byte| byte == 0));
+
+        io::Result::Ok(())
     }
 }
