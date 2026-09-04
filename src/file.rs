@@ -82,10 +82,13 @@ impl TryFrom<fs::File> for File {
     /// When using this, the resulting object will not know its own filename.  That makes it
     /// impossible to auto-resolve relative paths to it, e.g. qcow2 backing file names.
     fn try_from(file: fs::File) -> io::Result<Self> {
+        let open_mode = Self::detect_open_mode(&file);
         Self::new(
             file,
             None,
-            false,
+            open_mode.0,
+            #[cfg(unix)]
+            open_mode.1,
             #[cfg(target_os = "macos")]
             false,
         )
@@ -406,44 +409,62 @@ impl Storage for File {
 
 #[maybe_async]
 impl File {
-    /// Central internal function to create a `File` object.
+    /// Use an existing file with explicitly known open options.
     ///
-    /// `direct_io` should be `true` if direct I/O was requested, and can be `false` if that status
-    /// is unknown.
+    /// The filename is not used to reopen the file, but is retained to resolve relative paths.
+    /// The writable and direct I/O options must match how the file was opened.
+    pub fn from_open_file(file: fs::File, opts: StorageOpenOptions) -> io::Result<Self> {
+        Self::new(
+            file,
+            opts.filename,
+            opts.direct,
+            #[cfg(unix)]
+            opts.writable,
+            #[cfg(target_os = "macos")]
+            opts.relaxed_sync,
+        )
+    }
+
+    /// Central internal function to create a `File` object.
     fn new(
         mut file: fs::File,
         filename: Option<PathBuf>,
         direct_io: bool,
+        #[cfg(unix)] writable: bool,
         #[cfg(target_os = "macos")] relaxed_sync: bool,
     ) -> io::Result<Self> {
         let size = get_file_size(&file).err_context(|| "Failed to determine file size")?;
 
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let direct_io = direct_io || {
-            // Safe: No argument, returns result.
-            let res = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-            res > 0 && (res & libc::O_DIRECT) != 0
-        };
-
-        let (min_req_align, min_mem_align) = if direct_io {
+        let (req_align, mem_align, zero_align, discard_align) = if direct_io {
             #[cfg(unix)]
-            {
-                (
-                    Self::get_min_dio_req_align(&file),
-                    Self::get_min_dio_mem_align(&file),
-                )
-            }
-
+            let (min_req_align, min_mem_align) = (
+                Self::get_min_dio_req_align(&file),
+                Self::get_min_dio_mem_align(&file),
+            );
             #[cfg(not(unix))]
-            {
-                (1, 1)
-            } // probe it then
-        } else {
-            (1, 1)
-        };
+            let (min_req_align, min_mem_align) = (1, 1);
 
-        let (req_align, mem_align, zero_align, discard_align) =
-            Self::probe_alignments(&mut file, min_req_align, min_mem_align);
+            Self::probe_alignments(
+                &mut file,
+                min_req_align,
+                min_mem_align,
+                #[cfg(unix)]
+                writable,
+            )
+        } else {
+            // Buffered I/O has no request/memory alignment (page cache).
+            // Write-zeroes/discard still need the filesystem block size when
+            // writable; read-only files never issue those operations.
+            #[cfg(unix)]
+            let (zero_align, discard_align) = if writable {
+                Self::get_fs_zero_discard_align(&file)
+            } else {
+                (1, 1)
+            };
+            #[cfg(not(unix))]
+            let (zero_align, discard_align) = (1, 1);
+            (1, 1, zero_align, discard_align)
+        };
         assert!(req_align.is_power_of_two());
         assert!(mem_align.is_power_of_two());
 
@@ -462,22 +483,48 @@ impl File {
         })
     }
 
-    /// Probe minimal request, memory, zero and discard alignments.
+    /// Detect access and direct I/O modes for an externally supplied file.
     ///
-    /// Start at `min_req_align` and `min_mem_align`.
+    /// Returns `(direct_io, writable)`, indicating whether direct I/O is enabled and whether the
+    /// file is open for writing.
     #[cfg(unix)]
-    fn probe_alignments(
-        file: &mut fs::File,
-        min_req_align: usize,
-        min_mem_align: usize,
-    ) -> (usize, usize, usize, usize) {
-        let mut page_size = page_size::get();
-        if !page_size.is_power_of_two() {
-            let assume = page_size.checked_next_power_of_two().unwrap_or(4096);
-            let assume = cmp::max(4096, assume);
-            warn!("Reported page size of {page_size} is not a power of two, assuming {assume}");
-            page_size = assume;
+    fn detect_open_mode(file: &fs::File) -> (bool, bool) {
+        // Safe: No argument, returns result.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        let writable = flags < 0 || (flags & libc::O_ACCMODE) != libc::O_RDONLY;
+        #[cfg(not(target_os = "macos"))]
+        let direct_io = flags >= 0 && (flags & libc::O_DIRECT) != 0;
+        #[cfg(target_os = "macos")]
+        let direct_io = false;
+        (direct_io, writable)
+    }
+
+    /// Conservatively assume externally supplied files are writable on non-Unix systems.
+    ///
+    /// Returns `(direct_io, writable)`, indicating whether direct I/O is enabled and whether the
+    /// file is open for writing.
+    #[cfg(not(unix))]
+    fn detect_open_mode(_file: &fs::File) -> (bool, bool) {
+        (false, true)
+    }
+
+    /// Host page size, rounded up to a power of two.
+    #[cfg(unix)]
+    fn host_page_size() -> usize {
+        let page_size = page_size::get();
+        if page_size.is_power_of_two() {
+            return page_size;
         }
+        let assume = page_size.checked_next_power_of_two().unwrap_or(4096);
+        let assume = cmp::max(4096, assume);
+        warn!("Reported page size of {page_size} is not a power of two, assuming {assume}");
+        assume
+    }
+
+    /// Filesystem block size used as write-zeroes / discard alignment.
+    #[cfg(unix)]
+    fn get_fs_zero_discard_align(file: &fs::File) -> (usize, usize) {
+        let page_size = Self::host_page_size();
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let (mut zero_align, mut discard_align) = {
@@ -496,7 +543,10 @@ impl File {
         };
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let (mut zero_align, mut discard_align) = (page_size, page_size);
+        let (mut zero_align, mut discard_align) = {
+            let _ = file;
+            (page_size, page_size)
+        };
 
         // Double-check to make absolutely sure both are powers of two
         if !zero_align.is_power_of_two() {
@@ -506,7 +556,21 @@ impl File {
             discard_align = page_size;
         }
 
-        let mut writable = true;
+        (zero_align, discard_align)
+    }
+
+    /// Probe minimal direct I/O request, memory, zero and discard alignments.
+    ///
+    /// Start at `min_req_align` and `min_mem_align`.
+    #[cfg(unix)]
+    fn probe_alignments(
+        file: &mut fs::File,
+        min_req_align: usize,
+        min_mem_align: usize,
+        mut writable: bool,
+    ) -> (usize, usize, usize, usize) {
+        let page_size = Self::host_page_size();
+        let (zero_align, discard_align) = Self::get_fs_zero_discard_align(file);
 
         let max_req_align = 65536;
         let max_mem_align = cmp::max(page_size, max_req_align);
@@ -776,6 +840,8 @@ impl File {
             file,
             Some(filename_owned),
             opts.direct,
+            #[cfg(unix)]
+            opts.writable,
             #[cfg(target_os = "macos")]
             opts.relaxed_sync,
         )
@@ -1089,4 +1155,47 @@ mod ioctl {
 
     #[cfg(target_os = "freebsd")]
     ioctl_read!(diocgmediasize, 'd', 129, libc::off_t);
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::File;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn buffered_writable_file_is_not_modified_during_construction() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "imago-buffered-probe-{}-{unique}",
+            std::process::id()
+        ));
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+
+        let storage = File::try_from(file).unwrap();
+        let alignments = (
+            storage.req_align,
+            storage.mem_align,
+            storage.zero_align,
+            storage.discard_align,
+        );
+        let len = fs::metadata(&path).unwrap().len();
+        let expected_fs_align = {
+            let probe = fs::File::open(&path).unwrap();
+            super::File::get_fs_zero_discard_align(&probe)
+        };
+        drop(storage);
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(alignments, (1, 1, expected_fs_align.0, expected_fs_align.1));
+        assert_eq!(len, 0);
+    }
 }
