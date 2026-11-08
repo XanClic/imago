@@ -619,10 +619,13 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         self.prepare_write().await?;
         self.check_disk_bounds(offset, length, "discard")?;
 
-        // Safe to discard: We have a mutable `self` reference
-        // Note this will return an `Unsupported` error for v2 images.  That’s OK, safely
-        // discarding on them is a hairy affair, and they are really outdated by now.
-        self.ensure_fixed_mapping(GuestOffset(offset), length, FixedMapping::ZeroDiscard)
+        // Without backing storage, unmapped v2 clusters also read as zeroes.
+        let mapping = if self.header.require_version(3).is_err() && self.backing.is_none() {
+            FixedMapping::FullDiscard
+        } else {
+            FixedMapping::ZeroDiscard
+        };
+        self.ensure_fixed_mapping(GuestOffset(offset), length, mapping)
             .await
             .map(|(ofs, len)| (ofs.0, len))
     }

@@ -100,6 +100,18 @@ pub struct MemStorageState {
     #[cfg(feature = "async")]
     pub release_sync: AtomicBool,
 
+    /// Fail the next physical discard before changing storage.
+    pub fail_next_discard: AtomicBool,
+
+    /// Physical discard ranges, for ownership and recovery checks.
+    pub discarded: Mutex<Vec<(u64, u64)>>,
+
+    /// Keep physical discards pending for cancellation checks.
+    #[cfg(feature = "async")]
+    pub hold_discards: AtomicBool,
+    #[cfg(feature = "async")]
+    pub held_discards: Mutex<Vec<(u64, u64)>>,
+
     /// If set, the next write fails (and its offset is entered into `failed`), independently of
     /// `hold_range`.
     pub fail_next_write: AtomicBool,
@@ -166,6 +178,11 @@ impl MemStorageState {
                 .lock()
                 .push(StorageEvent::Write(offset, buf.to_vec()));
         }
+    }
+
+    fn discard(&self, offset: u64, length: u64) {
+        self.discarded.lock().push((offset, length));
+        self.write(offset, &vec![0; length as usize]);
     }
 
     /// Perform all held writes, even if their futures have been dropped.
@@ -347,6 +364,20 @@ impl Storage for MemStorage {
         Ok(())
     }
 
+    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.state.fail_next_discard.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("injected discard failure"));
+        }
+        #[cfg(feature = "async")]
+        if self.state.hold_discards.load(Ordering::Relaxed) {
+            self.state.held_discards.lock().push((offset, length));
+            // Held discards complete through settle_writes after cancellation.
+            return std::future::pending().await;
+        }
+        self.state.discard(offset, length);
+        Ok(())
+    }
+
     async fn flush(&self) -> io::Result<()> {
         if let Some(events) = self.state.events.lock().as_mut() {
             events.append(&mut *self.state.buffered_events.lock());
@@ -380,6 +411,13 @@ impl Storage for MemStorage {
     async fn settle_writes(&self) -> io::Result<()> {
         #[cfg(feature = "async")]
         self.state.complete_held_writes();
+        #[cfg(feature = "async")]
+        {
+            let discards = mem::take(&mut *self.state.held_discards.lock());
+            for (offset, length) in discards {
+                self.state.discard(offset, length);
+            }
+        }
         Ok(())
     }
 

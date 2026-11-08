@@ -65,6 +65,71 @@ async fn test_dropped_write_vs_discard_and_realloc() {
     );
 }
 
+/// Cancelling a physical discard must retain ownership until its late I/O has completed.
+#[tokio::test]
+async fn test_cancelled_physical_discard_keeps_clusters_owned() -> io::Result<()> {
+    for version in [2u32, 3] {
+        let state = Arc::new(MemStorageState::default());
+        let image = create_image(&state, 64 * 1024).await;
+        image.flush().await?;
+        drop(image);
+        state.data.lock()[4..8].copy_from_slice(&version.to_be_bytes());
+        let image = open_image(&state).await;
+
+        image.write(&[0x11u8; 1024][..], 0).await?;
+        image.flush().await?;
+        image.sync().await?;
+        let old_offset = host_offset(&image, 0).await;
+        assert_eq!(host_offset(&image, 512).await, old_offset + 512);
+        let cluster = old_offset / 512;
+        let reftable = read_u64(&state, 48);
+        let refblock = read_u64(&state, reftable + (cluster / 256) * 8);
+        let refcount_offset = (refblock + (cluster % 256) * 2) as usize;
+        assert!(
+            cluster % 256 < 255,
+            "fixture must keep the run in one refblock"
+        );
+
+        state.hold_discards.store(true, Ordering::Relaxed);
+        // Only metadata flushes run concurrently; no data access holds a discarded mapping.
+        let mut discard = Box::pin(unsafe { image.discard_to_zero_unsafe(0, 1024) });
+        assert!(crate::test::mem_storage::poll_once(discard.as_mut()).is_pending());
+        assert_eq!(*state.held_discards.lock(), [(old_offset, 1024)]);
+        // A concurrent flush must observe both final references while discard is pending.
+        image.flush().await?;
+        assert_eq!(
+            &state.data.lock()[refcount_offset..refcount_offset + 4],
+            &[0, 1, 0, 1]
+        );
+        drop(discard);
+        state.hold_discards.store(false, Ordering::Relaxed);
+
+        let new_data = [0x33u8; 1024];
+        image.write(&new_data[..], 1024).await?;
+        for guest_offset in [1024, 1536] {
+            let new_offset = host_offset(&image, guest_offset).await;
+            assert!(new_offset < old_offset || new_offset >= old_offset + 1024);
+        }
+        image.flush().await?;
+        image.sync().await?;
+        MemStorage::new(Arc::clone(&state), false)
+            .settle_writes()
+            .await?;
+        assert!(state.held_discards.lock().is_empty());
+        assert_eq!(*state.discarded.lock(), [(old_offset, 1024)]);
+        image.sync().await?;
+        drop(image);
+
+        let reopened = open_image(&state).await;
+        let mut actual = [0xa5u8; 2048];
+        reopened.read(&mut actual[..], 0).await?;
+        assert_eq!(&actual[..1024], &[0u8; 1024]);
+        assert_eq!(&actual[1024..], &new_data);
+        reopened.flush().await?;
+    }
+    Ok(())
+}
+
 /// A dropped L1 entry write must prevent growth and reuse while a late write can still land.
 #[tokio::test]
 async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {

@@ -475,7 +475,8 @@ impl<S: Storage> Allocator<S> {
             }
         }
         for entry in metadata_clusters {
-            self.free_clusters(entry.first_cluster, entry.count).await;
+            self.free_clusters(entry.first_cluster, entry.count, false)
+                .await;
         }
 
         if data_clusters.is_empty() {
@@ -495,8 +496,18 @@ impl<S: Storage> Allocator<S> {
             return;
         }
 
-        for entry in data_clusters {
-            self.free_clusters(entry.first_cluster, entry.count).await;
+        // Adjacent small clusters must reach the host's discard alignment together.
+        data_clusters.sort_unstable_by_key(|entry| entry.first_cluster);
+        let mut entries = data_clusters.into_iter().peekable();
+        while let Some(mut entry) = entries.next() {
+            while entries
+                .peek()
+                .is_some_and(|next| entry.first_cluster + entry.count == next.first_cluster)
+            {
+                entry.count += entries.next().unwrap().count;
+            }
+            self.free_clusters(entry.first_cluster, entry.count, true)
+                .await;
         }
     }
 
@@ -599,7 +610,8 @@ impl<S: Storage> Allocator<S> {
                 // Already allocated, or some real error occurred; free everything allocated so far.
                 // Do not go through `self.clusters_to_free`: As described above, the freed range
                 // must be available for allocation immediately, so that retrying converges.
-                self.free_clusters(start_index, index - start_index).await;
+                self.free_clusters(start_index, index - start_index, false)
+                    .await;
                 return result.map(|_| index - start_index);
             }
 
@@ -882,7 +894,12 @@ impl<S: Storage> Allocator<S> {
     ///
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
-    async fn free_clusters(&mut self, start: HostCluster, mut count: ClusterCount) {
+    async fn free_clusters(
+        &mut self,
+        mut start: HostCluster,
+        mut count: ClusterCount,
+        discard: bool,
+    ) {
         if count.0 == 0 || self.header.ensure_healthy().is_err() {
             return;
         }
@@ -899,15 +916,43 @@ impl<S: Storage> Allocator<S> {
             let in_rb_count = cmp::min((rb_entries - rb_index) as u64, count.0) as usize;
 
             match self.get_rb(rt_index).await {
-                Ok(Some(rb)) => {
-                    let mut rb = rb.lock_write().await;
+                Ok(Some(refblock)) => {
+                    let mut rb = refblock.lock_write().await;
                     if self.header.ensure_healthy().is_err() {
                         return;
                     }
-                    for i in rb_index..(rb_index + in_rb_count) {
+                    let end = rb_index + in_rb_count;
+                    let mut i = rb_index;
+                    while i < end {
+                        if discard && refblock.get(i) == 1 {
+                            let cluster = start + ClusterCount((i - rb_index) as u64);
+                            let offset = cluster.offset(self.header.cluster_bits());
+                            let first = i;
+                            while i < end && refblock.get(i) == 1 {
+                                i += 1;
+                            }
+                            let count = ClusterCount((i - first) as u64);
+                            // Keep the last reference until discard completes: cancellation must
+                            // not let an in-flight discard target a subsequently reused cluster.
+                            if let Err(err) = self
+                                .file
+                                .discard(offset.0, count.byte_size(self.header.cluster_bits()))
+                                .await
+                            {
+                                warn!("Cannot reclaim data cluster at {offset:?}: {err}");
+                                self.clusters_to_free
+                                    .push(ClustersToFreeEntry::data(cluster, count));
+                                continue;
+                            }
+                            for index in first..i {
+                                rb.decrement(index).unwrap();
+                            }
+                            continue;
+                        }
                         if let Err(err) = rb.decrement(i) {
                             event!(Level::WARN, "Failed to free cluster: {err}");
                         }
+                        i += 1;
                     }
                 }
 
@@ -917,10 +962,17 @@ impl<S: Storage> Allocator<S> {
                         "Failed to free {in_rb_count} clusters: Not allocated"
                     )
                 }
-                Err(err) => event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}"),
+                Err(err) => {
+                    event!(Level::WARN, "Failed to free {in_rb_count} clusters: {err}");
+                    let mut entry =
+                        ClustersToFreeEntry::data(start, ClusterCount(in_rb_count as u64));
+                    entry.metadata = !discard;
+                    self.clusters_to_free.push(entry);
+                }
             }
 
             count -= ClusterCount(in_rb_count as u64);
+            start += ClusterCount(in_rb_count as u64);
             rb_index = 0;
             rt_index += 1;
         }
@@ -1021,7 +1073,9 @@ mod tests {
                 qcow2.process_clusters_to_free().await;
                 let mut allocator = qcow2.allocator.as_ref().unwrap().lock().await;
                 allocator.process_clusters_to_free().await;
-                allocator.free_clusters(cluster, ClusterCount(1)).await;
+                allocator
+                    .free_clusters(cluster, ClusterCount(1), false)
+                    .await;
                 assert_eq!(rb.get(rb_index), 1);
                 allocator.allocate_cluster_at(cluster).await.unwrap_err();
                 drop(allocator);
