@@ -298,6 +298,113 @@ impl<S: Storage> Allocator<S> {
         })
     }
 
+    /// Validate active metadata, allocation ownership and COPIED bits before enabling writes.
+    pub async fn validate_active_metadata(&mut self, l1: &L1Table) -> io::Result<()> {
+        let cb = self.header.cluster_bits();
+        let mut l2_clusters: Vec<_> = (0..l1.entries())
+            .filter_map(|index| l1.get(index).l2_offset())
+            .map(|offset| offset.cluster(cb))
+            .collect();
+        l2_clusters.sort_unstable();
+        l2_clusters.dedup();
+
+        let mut metadata = vec![(0, 1)];
+        for (offset, count) in [
+            (self.header.l1_table_offset(), l1.cluster_count()),
+            (
+                self.header.reftable_offset(),
+                self.header.reftable_clusters(),
+            ),
+        ] {
+            if count.0 != 0 {
+                let start = offset.cluster(cb).0;
+                metadata.push((start, start + count.0));
+            }
+        }
+        metadata.extend(
+            (0..self.reftable.entries())
+                .filter_map(|index| self.reftable.get(index).refblock_offset())
+                .map(|offset| {
+                    let cluster = offset.cluster(cb).0;
+                    (cluster, cluster + 1)
+                }),
+        );
+        let mut references: Vec<_> = metadata
+            .iter()
+            .flat_map(|&(start, end)| (start..end).map(|cluster| (HostCluster(cluster), None)))
+            .collect();
+        metadata.extend(l2_clusters.iter().map(|cluster| (cluster.0, cluster.0 + 1)));
+        metadata.sort_unstable();
+        if metadata.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(invalid_data("Active qcow2 metadata overlaps"));
+        }
+
+        for index in 0..l1.entries() {
+            let entry = l1.get(index);
+            let Some(offset) = entry.l2_offset() else {
+                if entry.is_copied() {
+                    return Err(invalid_data("Unallocated L2 table has COPIED bit set"));
+                }
+                continue;
+            };
+            let cluster = offset.cluster(cb);
+            references.push((cluster, Some(entry.is_copied())));
+            let l2 = L2Table::load(
+                self.file.as_ref(),
+                &self.header,
+                cluster,
+                self.header.l2_entries(),
+            )
+            .await?;
+            for index in 0..l2.entries() {
+                let entry = l2.get(index);
+                let Some((start, count)) = entry.allocation(cb, false) else {
+                    if entry.is_copied() {
+                        return Err(invalid_data("Unallocated data cluster has COPIED bit set"));
+                    }
+                    continue;
+                };
+                let end = start.0 + count.0;
+                let next = metadata.partition_point(|&(_, end)| end <= start.0);
+                if metadata.get(next).is_some_and(|&(start, _)| start < end) {
+                    return Err(invalid_data(format!(
+                        "QCOW2 data overlaps active metadata at host cluster {}",
+                        start.0,
+                    )));
+                }
+                let copied = (!entry.is_compressed()).then_some(entry.is_copied());
+                references.extend((start.0..end).map(|cluster| (HostCluster(cluster), copied)));
+            }
+        }
+
+        references.sort_unstable_by_key(|&(cluster, _)| cluster);
+        for group in references.chunk_by(|left, right| left.0 == right.0) {
+            let cluster = group[0].0;
+            let (rt_index, rb_index) = cluster.rt_rb_indices(self.header.rb_bits());
+            let refcount = self
+                .get_rb(rt_index)
+                .await?
+                .map_or(0, |rb| rb.get(rb_index));
+            let required = group.len() as u64;
+            if refcount < required {
+                return Err(invalid_data(format!(
+                    "QCOW2 cluster {} has refcount {refcount}, needs at least {required} active references",
+                    cluster.0,
+                )));
+            }
+            if group
+                .iter()
+                .any(|&(_, copied)| copied.is_some_and(|copied| copied != (refcount == 1)))
+            {
+                return Err(invalid_data(format!(
+                    "QCOW2 cluster {} has inconsistent COPIED bit for refcount {refcount}",
+                    cluster.0,
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Free all clusters in `self.clusters_to_free` (i.e. decrement their refcount).
     ///
     /// Must not be called while allocating clusters: Freeing data clusters requires the refblock

@@ -68,13 +68,36 @@ impl<'a> CompressedClusterReadGuard<'a> {
         // Must fit (really shouldn’t be compressed if this exceeds the cluster size anyway)
         let length = self.length.get().try_into().map_err(io::Error::other)?;
         let mut compressed_buf = IoBuffer::new(length, storage.mem_align())?;
-        storage
-            .read(&mut compressed_buf, self.host_offset.0)
+        let actual = storage
+            .readv_counted((&mut compressed_buf).into(), self.host_offset.0)
             .await?;
+        let available = actual.map_or(length, |actual| cmp::min(actual, length as u64) as usize);
+        let short_read = available < length;
 
         let mut dec_ox = DecompressorOxide::new();
-        let (status, _read, written) =
-            inflate(&mut dec_ox, compressed_buf.as_ref().into_slice(), buf, 0, 0);
+        let (status, _read, written) = inflate(
+            &mut dec_ox,
+            &compressed_buf.as_ref().into_slice()[..available],
+            buf,
+            0,
+            0,
+        );
+
+        if short_read
+            && (written < buf.len()
+                || matches!(
+                    status,
+                    TINFLStatus::NeedsMoreInput | TINFLStatus::FailedCannotMakeProgress
+                ))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "Truncated compressed cluster (host offset {}+{available}, expected up to {length})",
+                    self.host_offset.0,
+                ),
+            ));
+        }
 
         // Because `length` will generally exceed the actual length, `HasMoreOutput` is expected
         // and can be ignored

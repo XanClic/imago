@@ -511,6 +511,9 @@ pub enum ShallowMapping<'a, S: Storage + 'static> {
         /// Offset in `storage` where this data is stored.
         offset: u64,
 
+        /// Whether a known short storage read must return [`io::ErrorKind::UnexpectedEof`].
+        read_exact: bool,
+
         /// Whether this mapping may be written to.
         ///
         /// If `true`, you can directly write to `offset` on `storage` to change the disk image’s

@@ -107,8 +107,9 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         metadata: S,
         writable: bool,
         storage_open_options: StorageOpenOptions,
+        require_self_contained: bool,
     ) -> io::Result<Self> {
-        let header = Arc::new(Header::load(&metadata, writable).await?);
+        let header = Arc::new(Header::load(&metadata, require_self_contained).await?);
 
         let cb = header.cluster_bits();
         let l1_offset = header.l1_table_offset();
@@ -124,13 +125,16 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         let clusters_to_free = Arc::new(ClustersToFreeList::default());
 
         let allocator = if writable {
-            let allocator = Allocator::new(
+            let mut allocator = Allocator::new(
                 Arc::clone(&metadata),
                 Arc::clone(&header),
                 Arc::clone(&caches),
                 Arc::clone(&clusters_to_free),
             )
             .await?;
+            if require_self_contained {
+                allocator.validate_active_metadata(&l1_table).await?;
+            }
             Some(Mutex::new(allocator))
         } else {
             None
@@ -169,7 +173,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// If you want to use the implicit references given in the image header, use
     /// [`Qcow2::open_implicit_dependencies()`].
     pub async fn open_image(metadata: S, writable: bool) -> io::Result<Self> {
-        Self::do_open(metadata, writable, StorageOpenOptions::new()).await
+        Self::do_open(metadata, writable, StorageOpenOptions::new(), false).await
     }
 
     /// Open a qcow2 file at the given path.
@@ -187,7 +191,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     pub async fn open_path<P: AsRef<Path>>(path: P, writable: bool) -> io::Result<Self> {
         let storage_opts = StorageOpenOptions::new().write(writable).filename(path);
         let metadata = S::open(storage_opts).await?;
-        Self::do_open(metadata, writable, StorageOpenOptions::new()).await
+        Self::do_open(metadata, writable, StorageOpenOptions::new(), false).await
     }
 
     /// Does this qcow2 image require an external data file?
@@ -269,7 +273,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         let opts = self
             .storage_open_options
             .clone()
-            .write(true)
+            .write(self.writable)
             .filename(absolute.clone());
 
         let file = gate
@@ -400,11 +404,15 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             .await
     }
 
-    /// Require write access, i.e. return an error for read-only images.
-    fn need_writable(&self) -> io::Result<()> {
-        self.writable
-            .then_some(())
-            .ok_or_else(|| io::Error::other("Image is read-only"))
+    /// Require write access and invalidate autoclear features before modifying the image.
+    async fn prepare_write(&self) -> io::Result<()> {
+        self.header.ensure_healthy()?;
+        if !self.writable {
+            return Err(io::Error::other("Image is read-only"));
+        }
+        self.header
+            .clear_autoclear_features(self.metadata.as_ref())
+            .await
     }
 
     /// Check whether `offset + length` is within the disk size.
@@ -522,7 +530,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
             return Ok(PreparedDataMapping::existing(self.storage(), 0, 0));
         }
 
-        self.need_writable()?;
+        self.prepare_write().await?;
         let (host_offset, length, state) = self
             .do_prepare_data_mapping(GuestOffset(offset), length, overwrite, false)
             .await?;
@@ -558,7 +566,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
-        self.need_writable()?;
+        self.prepare_write().await?;
         self.check_disk_bounds(offset, length, "write")?;
 
         self.ensure_fixed_mapping(
@@ -575,7 +583,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         offset: u64,
         length: u64,
     ) -> io::Result<(u64, u64)> {
-        self.need_writable()?;
+        self.prepare_write().await?;
         self.check_disk_bounds(offset, length, "discard")?;
 
         // Safe to discard: We have a mutable `self` reference
@@ -600,7 +608,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
         offset: u64,
         length: u64,
     ) -> io::Result<(u64, u64)> {
-        self.need_writable()?;
+        self.prepare_write().await?;
         self.check_disk_bounds(offset, length, "discard")?;
 
         // Safe to discard: We have a mutable `self` reference
@@ -708,7 +716,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn resize_grow(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
-        self.need_writable()?;
+        self.prepare_write().await?;
 
         let old_size = self.size();
         let grown_length = new_size.saturating_sub(old_size);
@@ -782,7 +790,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
     }
 
     async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
-        self.need_writable()?;
+        self.prepare_write().await?;
 
         let old_size = self.size();
         if new_size >= old_size {

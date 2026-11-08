@@ -649,6 +649,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverInstance f
                         "Extent offset overflow: {base_offset} + {in_extent_offset}"
                     ))
                 })?,
+                read_exact: false,
                 writable,
             },
 

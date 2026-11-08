@@ -27,6 +27,12 @@ pub trait StorageExt: Storage {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()>;
 
+    /// Read with alignment handling and EOF zero-fill, returning the actual prefix if known.
+    ///
+    /// Alignment padding is excluded from the count; `None` means the backend cannot count.
+    #[allow(async_fn_in_trait)]
+    async fn readv_counted(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<Option<u64>>;
+
     /// Write data from `bufv` to `offset`.
     ///
     /// Writes all data from `bufv`, i.e. will not do short writes.  When reaching the end of file,
@@ -96,21 +102,29 @@ pub trait StorageExt: Storage {
 
 #[maybe_async(AFIT)]
 impl<S: Storage> StorageExt for S {
-    async fn readv(&self, mut bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+    async fn readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        self.readv_counted(bufv, offset).await.map(|_| ())
+    }
+
+    async fn readv_counted(
+        &self,
+        mut bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
         if bufv.is_empty() {
-            return Ok(());
+            return Ok(Some(0));
         }
 
+        let request_len = bufv.len();
         let unpadded_end = offset
-            .checked_add(bufv.len())
+            .checked_add(request_len)
             .ok_or_else(|| io::Error::other("Read wrap-around"))?;
 
         let mem_align = self.mem_align();
         let req_align = self.req_align();
 
         if is_aligned(&bufv, offset, mem_align, req_align) {
-            // Safe: Alignment checked
-            return unsafe { self.pure_readv(bufv, offset) }.await;
+            return unsafe { self.pure_readv_counted(bufv, offset) }.await;
         }
 
         trace!(
@@ -144,9 +158,8 @@ impl<S: Storage> StorageExt for S {
         trace!("Padded read: {padded_offset:#x} + {padded_len}");
 
         let mut bounce_buf = IoBuffer::new(padded_len, mem_align)?;
-
-        // Safe: Alignment enforced
-        unsafe { self.pure_readv(bounce_buf.as_mut().into(), padded_offset) }.await?;
+        let actual_len =
+            unsafe { self.pure_readv_counted(bounce_buf.as_mut().into(), padded_offset) }.await?;
 
         let in_buf_ofs = (offset - padded_offset) as usize;
         // Must fit in `usize` because `padded_len: usize`
@@ -154,7 +167,7 @@ impl<S: Storage> StorageExt for S {
 
         bufv.copy_from_slice(bounce_buf.as_ref_range(in_buf_ofs..in_buf_end).into_slice());
 
-        Ok(())
+        Ok(actual_len.map(|len| len.saturating_sub(in_buf_ofs as u64).min(request_len)))
     }
 
     async fn writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
@@ -471,6 +484,16 @@ mod tests {
     use super::*;
     use crate::test::mem_storage::{MemStorage, MemStorageState};
     use std::sync::Arc;
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn readv_counted_legacy_backend_returns_unknown() -> io::Result<()> {
+        let storage: Box<dyn crate::storage::DynStorage> = Box::new(crate::null::Null::new(4));
+        let mut buf = [0xff; 8];
+        let count = storage.readv_counted((&mut buf[..]).into(), 0).await?;
+        assert_eq!(count, None);
+        assert_eq!(buf, [0; 8]);
+        Ok(())
+    }
 
     /// Requests whose end, or padded end, is beyond `u64::MAX` must return an error.
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]

@@ -26,6 +26,9 @@ pub struct Qcow2OpenBuilder<S: Storage + 'static, F: WrappedFormat<S> + 'static 
     /// `None` to open the file as specified by the image header, `Some(None)` to not open any data
     /// file, and `Some(Some(_))` to use that data file.
     data_file: Option<Option<StorageOrPath<S>>>,
+
+    /// Reject images referencing backing images or external data before modifying metadata.
+    require_self_contained: bool,
 }
 
 /// Options builder for creating (formatting) a qcow2 image.
@@ -59,7 +62,18 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2OpenBuilder<S, F>
             base,
             backing: None,
             data_file: None,
+            require_self_contained: false,
         }
+    }
+
+    /// Reject images that reference a backing image or require an external data file.
+    ///
+    /// The check runs before writable-open metadata updates. It cannot be bypassed by
+    /// overriding the backing image or data file with `None`.
+    /// A writable open also checks active metadata overlaps, allocation refcounts and COPIED bits.
+    pub fn require_self_contained(mut self, require: bool) -> Self {
+        self.require_self_contained = require;
+        self
     }
 
     /// Set a backing image.
@@ -138,7 +152,13 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverBuilder<S>
         let storage_opts = self.base.make_storage_opts();
         let metadata = self.base.open_image(&mut gate).await?;
 
-        let mut qcow2 = Qcow2::<S, F>::do_open(metadata, writable, storage_opts.clone()).await?;
+        let mut qcow2 = Qcow2::<S, F>::do_open(
+            metadata,
+            writable,
+            storage_opts.clone(),
+            self.require_self_contained,
+        )
+        .await?;
 
         if let Some(backing) = self.backing {
             let backing = match backing {

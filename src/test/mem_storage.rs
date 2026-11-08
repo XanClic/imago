@@ -1,8 +1,10 @@
 //! In-memory storage driver for tests.
 
 use crate::io_buffers::{IoVector, IoVectorMut};
+use crate::qcow2::Qcow2;
 use crate::storage::drivers::CommonStorageHelper;
 use crate::storage::{PreallocateMode, Storage};
+use crate::{DenyImplicitOpenGate, FormatCreateBuilder, FormatDriverBuilder};
 use parking_lot::Mutex;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -14,6 +16,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::{Context, Poll, Waker};
+
+#[maybe_async::maybe_async]
+pub(crate) async fn create_image(state: &Arc<MemStorageState>, size: u64) -> Qcow2<MemStorage> {
+    Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(state), false))
+        .cluster_size(512)
+        .size(size)
+        .create_open(DenyImplicitOpenGate::default(), |image| {
+            Ok(Qcow2::<MemStorage>::builder(image)
+                .backing(None)
+                .write(true))
+        })
+        .await
+        .unwrap()
+}
 
 /// State shared between a [`MemStorage`] object and the test.
 #[derive(Debug, Default)]
@@ -205,7 +221,15 @@ impl Storage for MemStorage {
         Ok(self.state.data.lock().len() as u64)
     }
 
-    async unsafe fn pure_readv(&self, mut bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        unsafe { self.pure_readv_counted(bufv, offset).await }.map(|_| ())
+    }
+
+    async unsafe fn pure_readv_counted(
+        &self,
+        mut bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
         #[cfg(feature = "async")]
         if self.state.hold_reads.load(Ordering::Relaxed) {
             self.state.held_reads.lock().push(offset);
@@ -228,7 +252,7 @@ impl Storage for MemStorage {
             bounce[..copy_len].copy_from_slice(&data[offset..offset + copy_len]);
         }
         bufv.copy_from_slice(&bounce);
-        Ok(())
+        Ok(Some(copy_len as u64))
     }
 
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {

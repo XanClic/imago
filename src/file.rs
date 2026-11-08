@@ -174,12 +174,17 @@ impl Storage for File {
         self.filename.as_ref().cloned()
     }
 
+    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        unsafe { self.pure_readv_counted(bufv, offset).await }.map(|_| ())
+    }
+
     #[cfg(unix)]
-    async unsafe fn pure_readv(
+    async unsafe fn pure_readv_counted(
         &self,
         mut bufv: IoVectorMut<'_>,
         mut offset: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<u64>> {
+        let mut actual_len = 0;
         while !bufv.is_empty() {
             let iovec = unsafe { bufv.as_iovec() };
             let preadv_offset = offset
@@ -205,36 +210,41 @@ impl Storage for File {
             offset = offset
                 .checked_add(len)
                 .ok_or_else(|| io::Error::other("Read offset overflow"))?;
+            actual_len += len;
         }
 
-        Ok(())
+        Ok(Some(actual_len))
     }
 
     #[cfg(windows)]
-    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
+    async unsafe fn pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        mut offset: u64,
+    ) -> io::Result<Option<u64>> {
+        let mut actual_len = 0;
+        let mut eof = false;
         for mut buffer in bufv.into_inner() {
             let mut buffer: &mut [u8] = &mut buffer;
+            if eof || offset >= self.size.load(Ordering::Relaxed) {
+                buffer.fill(0);
+                continue;
+            }
             while !buffer.is_empty() {
-                let len = if offset >= self.size.load(Ordering::Relaxed) {
+                let len = self.file.write().seek_read(buffer, offset)?;
+                if len == 0 {
                     buffer.fill(0);
-                    buffer.len()
-                } else {
-                    match self.file.write().seek_read(buffer, offset)? {
-                        0 => {
-                            // End of file (file is shorter than `self.size`)
-                            buffer.fill(0);
-                            buffer.len()
-                        }
-                        len => len,
-                    }
-                };
+                    eof = true;
+                    break;
+                }
                 offset = offset
                     .checked_add(len as u64)
                     .ok_or_else(|| io::Error::other("Read offset overflow"))?;
+                actual_len += len as u64;
                 buffer = buffer.split_at_mut(len).1;
             }
         }
-        Ok(())
+        Ok(Some(actual_len))
     }
 
     #[cfg(unix)]
@@ -1391,7 +1401,6 @@ mod tests {
     }
 
     /// Reading past the actual end of file must work even if `File::size` is larger.
-    #[cfg(windows)]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn read_past_external_truncation() -> io::Result<()> {
         use crate::StorageOpenOptions;
@@ -1406,12 +1415,15 @@ mod tests {
         let _temp_path = TempPath(path.clone());
         std::fs::write(&path, vec![0xabu8; 8192])?;
 
-        let file = File::open(StorageOpenOptions::new().filename(&path)).await?;
+        let mut file = File::open(StorageOpenOptions::new().filename(&path)).await?;
         // Truncate behind `file`'s back, so its cached size is too large
         fs::OpenOptions::new()
             .write(true)
             .open(&path)?
-            .set_len(4096)?;
+            .set_len(5000)?;
+        assert_eq!(file.size()?, 8192);
+        file.req_align = 512;
+        file.mem_align = 512;
 
         // When broken, reading spins forever; abort instead of hanging
         let done = Arc::new(AtomicBool::new(false));
@@ -1426,10 +1438,36 @@ mod tests {
 
         let mut buf = vec![0xffu8; 8192];
         file.read(&mut buf[..], 0).await?;
-        done.store(true, Ordering::Relaxed);
+        assert!(buf[..5000].iter().all(|&byte| byte == 0xab));
+        assert!(buf[5000..].iter().all(|&byte| byte == 0));
 
-        assert!(buf[..4096].iter().all(|&byte| byte == 0xab));
-        assert!(buf[4096..].iter().all(|&byte| byte == 0));
+        for (offset, len, expected_count) in [
+            (0, 8192, 5000),
+            (4095, 1000, 905),
+            (4991, 9, 9),
+            (5001, 100, 0),
+        ] {
+            let mut counted = crate::io_buffers::IoBuffer::new(len, file.mem_align())?;
+            counted.as_mut().into_slice().fill(0xff);
+            let count = file.readv_counted(counted.as_mut().into(), offset).await?;
+            assert_eq!(count, Some(expected_count));
+            let counted = counted.as_ref().into_slice();
+            assert!(counted[..expected_count as usize]
+                .iter()
+                .all(|&byte| byte == 0xab));
+            assert!(counted[expected_count as usize..]
+                .iter()
+                .all(|&byte| byte == 0));
+        }
+        assert_eq!(file.size()?, 8192);
+        let storage: Box<dyn crate::storage::DynStorage> = Box::new(file);
+        let count = storage.readv_counted((&mut buf[..]).into(), 0).await?;
+        assert_eq!(count, Some(5000));
+        let storage: Arc<dyn crate::storage::DynStorage> = Arc::from(storage);
+        let storage = crate::annotated::Annotated::new(storage, 0u32);
+        let count = storage.readv_counted((&mut buf[..]).into(), 0).await?;
+        assert_eq!(count, Some(5000));
+        done.store(true, Ordering::Relaxed);
 
         io::Result::Ok(())
     }

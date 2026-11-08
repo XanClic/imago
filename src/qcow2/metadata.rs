@@ -3,7 +3,7 @@
 use super::allocation::{ClustersToFreeEntry, PendingClusters};
 use super::compressed::CompressedClusterReadGuard;
 use super::types::*;
-use crate::io_buffers::IoBuffer;
+use crate::io_buffers::{IoBuffer, IoVectorMut};
 use crate::macros::numerical_enum;
 use crate::macros::on_disk_struct::{on_disk_struct, OnDiskStruct};
 use crate::misc_helpers::{invalid_data, DropGuard};
@@ -161,7 +161,7 @@ struct V3HeaderBase/BE, no_gaps {
     ///    bit (incompatible feature bit 1) is also set.
     ///
     /// Bits 2-63 are reserved (set to 0).
-    autoclear_features: u64[16],
+    autoclear_features: AtomicU64[16],
 
     /// Describes the width of a reference count block entry (width in bits: `refcount_bits = 1 <<
     /// refcount_order`).  For version 2 images, the order is always assumed to be 4 (i.e.
@@ -179,7 +179,7 @@ impl Default for V3HeaderBase {
         V3HeaderBase {
             incompatible_features: 0,
             compatible_features: 0,
-            autoclear_features: 0,
+            autoclear_features: 0.into(),
             refcount_order: 4,
             header_length: (V2Header::ON_DISK_SIZE + V3HeaderBase::ON_DISK_SIZE) as u32,
         }
@@ -321,30 +321,61 @@ pub(super) struct Header {
 
     /// Whether an external data file is required.
     external_data_file: bool,
+
+    /// In-memory only: metadata publication failed or a cached write-back was cancelled.
+    publication_failed: AtomicBool,
+
+    /// Serialize mutable header publications, including aligned RMW writes.
+    pub(super) publication_lock: Mutex<()>,
 }
 
 #[maybe_async]
 impl Header {
-    /// Load the qcow2 header from disk.
-    ///
-    /// If `writable` is false, do not perform any modifications (e.g. clearing auto-clear bits).
-    pub async fn load<S: Storage>(image: &S, writable: bool) -> io::Result<Self> {
+    /// Reject further operations unless the caller disarms this publication guard.
+    #[must_use]
+    pub(super) fn publication_guard(&self) -> DropGuard<impl FnOnce() + '_> {
+        DropGuard::new(|| self.publication_failed.store(true, Ordering::Release))
+    }
+
+    /// Reject this instance after an uncertain publication; reopening does not repair the disk.
+    pub fn ensure_healthy(&self) -> io::Result<()> {
+        if self.publication_failed.load(Ordering::Acquire) {
+            Err(io::Error::other(
+                "Metadata publication failed or was cancelled; close and verify the image before reopening",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Load the qcow2 header without modifying the image.
+    pub async fn load<S: Storage>(image: &S, require_self_contained: bool) -> io::Result<Self> {
         // TODO: More sanity checks.
         let mut header_buf = vec![0u8; V2Header::ON_DISK_SIZE];
-        image.read(header_buf.as_mut_slice(), 0).await?;
+        read_exact(image, "v2 header", header_buf.as_mut_slice().into(), 0).await?;
 
         let header: V2Header = decode_binary(&header_buf)?;
         if header.magic != MAGIC {
             return Err(invalid_data("Not a qcow2 file"));
+        }
+        if header.crypt_method != 0 {
+            return Err(invalid_data(format!(
+                "qcow2 encryption method {} is not supported",
+                header.crypt_method
+            )));
         }
 
         let v3header_base = if header.version == 2 {
             V3HeaderBase::default()
         } else if header.version == 3 {
             let mut header_buf = vec![0u8; V3HeaderBase::ON_DISK_SIZE];
-            image
-                .read(header_buf.as_mut_slice(), V2Header::ON_DISK_SIZE as u64)
-                .await?;
+            read_exact(
+                image,
+                "v3 header",
+                header_buf.as_mut_slice().into(),
+                V2Header::ON_DISK_SIZE as u64,
+            )
+            .await?;
             decode_binary(&header_buf)?
         } else {
             return Err(invalid_data(format!(
@@ -380,9 +411,13 @@ impl Header {
         } else {
             let mut unknown_header_fields =
                 vec![0u8; v3header_base.header_length as usize - min_header_size];
-            image
-                .read(&mut unknown_header_fields, min_header_size as u64)
-                .await?;
+            read_exact(
+                image,
+                "header fields",
+                unknown_header_fields.as_mut_slice().into(),
+                min_header_size as u64,
+            )
+            .await?;
             unknown_header_fields
         };
 
@@ -390,6 +425,18 @@ impl Header {
         l1_offset
             .checked_cluster(header.cluster_bits)
             .ok_or_else(|| invalid_data(format!("Unaligned L1 table: {l1_offset}")))?;
+
+        let l1_entries = header.l1_size.load(Ordering::Relaxed) as usize;
+        let required_l1_entries = header
+            .size
+            .load(Ordering::Relaxed)
+            .div_ceil(1u64 << (2 * header.cluster_bits - 3));
+        if l1_entries > L1Table::MAX_ENTRIES || (l1_entries as u64) < required_l1_entries {
+            return Err(invalid_data(format!(
+                "Invalid L1 table size: {l1_entries} entries, need at least {required_l1_entries} and permit at most {}",
+                L1Table::MAX_ENTRIES,
+            )));
+        }
 
         let rt_offset = HostOffset(header.refcount_table_offset.load(Ordering::Relaxed));
         rt_offset
@@ -428,7 +475,13 @@ impl Header {
             }
 
             let mut backing_buf = vec![0; length as usize];
-            image.read(&mut backing_buf, offset).await?;
+            read_exact(
+                image,
+                "backing file name",
+                (&mut backing_buf).into(),
+                offset,
+            )
+            .await?;
 
             Some(
                 String::from_utf8(backing_buf)
@@ -449,7 +502,13 @@ impl Header {
                 }
 
                 let mut ext_hdr_buf = vec![0; HeaderExtensionHeader::ON_DISK_SIZE];
-                image.read(&mut ext_hdr_buf, ext_offset).await?;
+                read_exact(
+                    image,
+                    "extension header",
+                    (&mut ext_hdr_buf).into(),
+                    ext_offset,
+                )
+                .await?;
 
                 ext_offset += HeaderExtensionHeader::ON_DISK_SIZE as u64;
 
@@ -462,7 +521,7 @@ impl Header {
                 }
 
                 let mut ext_data = vec![0; ext_hdr.length as usize];
-                image.read(&mut ext_data, ext_offset).await?;
+                read_exact(image, "extension data", (&mut ext_data).into(), ext_offset).await?;
 
                 ext_offset += (ext_hdr.length as u64).next_multiple_of(8);
 
@@ -506,26 +565,21 @@ impl Header {
         }
 
         let mut incompatible_features = v3header_base.incompatible_features;
-        let autoclear_features = v3header_base.autoclear_features;
 
         let external_data_file =
             incompatible_features & IncompatibleFeatures::ExternalDataFile as u64 != 0;
         incompatible_features &= !(IncompatibleFeatures::ExternalDataFile as u64);
 
-        let mut header = Header {
+        let header = Header {
             v2: header,
             v3: v3header_base,
             unknown_header_fields,
             backing_filename,
             extensions,
             external_data_file,
+            publication_failed: AtomicBool::new(false),
+            publication_lock: Mutex::default(),
         };
-
-        // No need to clear autoclear features for read-only images
-        if autoclear_features != 0 && writable {
-            header.v3.autoclear_features = 0;
-            header.write(image).await?;
-        }
 
         if incompatible_features != 0 {
             let feats = (0..64)
@@ -545,11 +599,41 @@ impl Header {
             )));
         }
 
+        if require_self_contained {
+            if header.backing_filename.is_some() {
+                return Err(invalid_data("qcow2 backing files are not permitted"));
+            }
+            if header.external_data_file {
+                return Err(invalid_data("qcow2 external data files are not permitted"));
+            }
+        }
+
         Ok(header)
+    }
+
+    /// Invalidate unsupported autoclear features before modifying image contents.
+    pub(super) async fn clear_autoclear_features<S: Storage>(&self, image: &S) -> io::Result<()> {
+        if self.v3.autoclear_features.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+
+        let _lock = self.publication_lock.lock().await;
+        self.ensure_healthy()?;
+        if self.v3.autoclear_features.load(Ordering::Relaxed) != 0 {
+            let mut publication = self.publication_guard();
+            image.write(&[0u8; 8][..], 88).await?;
+            // The cleared bits must be durable before later writes can invalidate the features.
+            image.flush().await?;
+            image.sync().await?;
+            self.v3.autoclear_features.store(0, Ordering::Release);
+            publication.disarm();
+        }
+        Ok(())
     }
 
     /// Write the qcow2 header to disk.
     pub async fn write<S: Storage>(&mut self, image: &S) -> io::Result<()> {
+        self.ensure_healthy()?;
         let header_len = if self.v2.version > 2 {
             let len =
                 self.v2.on_disk_size() + self.v3.on_disk_size() + self.unknown_header_fields.len();
@@ -676,7 +760,7 @@ impl Header {
             v3: V3HeaderBase {
                 incompatible_features,
                 compatible_features: 0,
-                autoclear_features: 0,
+                autoclear_features: 0.into(),
                 refcount_order,
                 header_length: 0, // will be set by `Self::write()`
             },
@@ -684,6 +768,8 @@ impl Header {
             backing_filename,
             extensions,
             external_data_file: has_external_data_file,
+            publication_failed: AtomicBool::new(false),
+            publication_lock: Mutex::default(),
         }
     }
 
@@ -719,7 +805,13 @@ impl Header {
         check_field!(v2.snapshots_offset)?; // TODO: Should be mutable
         check_field!(v3.incompatible_features)?; // TODO: Should be mutable
         check_field!(v3.compatible_features)?; // TODO: Should be mutable
-        check_field!(v3.autoclear_features)?; // TODO: Should be mutable
+        if self.v3.autoclear_features.load(Ordering::Relaxed)
+            != new_header.v3.autoclear_features.load(Ordering::Relaxed)
+        {
+            return Err(io::Error::other(
+                "Incompatible autoclear feature modification",
+            ));
+        }
         check_field!(v3.refcount_order)?;
         // header length is OK to ignore (as long as it’s valid)
 
@@ -1016,8 +1108,14 @@ impl HeaderExtension {
                     HeaderExtension::BackingFileFormat(fmt)
                 }
                 HeaderExtensionType::FeatureNameTable => {
+                    if !data.len().is_multiple_of(48) {
+                        return Err(invalid_data(format!(
+                            "Invalid feature name table length: {}",
+                            data.len()
+                        )));
+                    }
                     let mut feats = HashMap::new();
-                    for feat in data.chunks(48) {
+                    for feat in data.chunks_exact(48) {
                         let feat_type: FeatureType = match feat[0].try_into() {
                             Ok(ft) => ft,
                             Err(_) => continue, // skip unrecognized entries
@@ -1480,7 +1578,7 @@ impl L2Entry {
     /// references.
     ///
     /// `external_data_file` must be true when using an external data file.
-    fn allocation(
+    pub(super) fn allocation(
         &self,
         cluster_bits: u32,
         external_data_file: bool,
@@ -2394,7 +2492,7 @@ impl RefBlock {
 
         let mut raw_data =
             IoBuffer::new(cluster_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
-        image.read(&mut raw_data, offset.0).await?;
+        read_exact(image, "refcount block", (&mut raw_data).into(), offset.0).await?;
 
         Ok(RefBlock {
             cluster: Some(cluster),
@@ -2921,7 +3019,7 @@ pub trait Table: Sized {
         let byte_size = entries * size_of::<u64>();
         let mut buffer = IoBuffer::new(byte_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
-        image.read(&mut buffer, offset.0).await?;
+        read_exact(image, Self::NAME, (&mut buffer).into(), offset.0).await?;
 
         // Safe because `u64` is a plain type, and the alignment fits
         let raw_table = unsafe { buffer.as_ref().into_typed_slice::<u64>() };
@@ -3033,6 +3131,35 @@ pub trait Table: Sized {
             .write(&buffer, offset.0 + (first_index * size_of::<u64>()) as u64)
             .await
     }
+}
+
+/// Read metadata without accepting known short reads.
+#[maybe_async]
+async fn read_exact<S: Storage>(
+    image: &S,
+    name: &str,
+    bufv: IoVectorMut<'_>,
+    offset: u64,
+) -> io::Result<()> {
+    let requested = bufv.len();
+    if requested != 0 {
+        let size = image.size()?;
+        if offset.checked_add(requested).is_none_or(|end| end > size) {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Qcow2 {name} range {offset:#x} + {requested:#x} exceeds storage size {size:#x}"),
+            ));
+        }
+    }
+    if let Some(actual) = image.readv_counted(bufv, offset).await? {
+        if actual < requested {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Short qcow2 {name} read at {offset:#x}: {actual} < {requested}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check whether the given table offset/size is valid.
@@ -3152,5 +3279,53 @@ mod tests {
             .filter(|b| **b != uninitialized)
             .count();
         assert_eq!(clobbered, 0, "bytes after the L1 table were overwritten");
+    }
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn header_validation_preserves_image() -> io::Result<()> {
+        let error =
+            HeaderExtension::deserialize(HeaderExtensionType::FeatureNameTable as u32, vec![0; 47])
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        for (backing, external, encryption, incompatible) in [
+            (Some("base.raw"), None, 0, 0),
+            (None, Some("data.raw"), 0, 0),
+            (None, None, 1, 0),
+            (None, None, 2, 0),
+            (None, None, u32::MAX, 0),
+            (None, None, 0, 1),
+            (None, None, 0, 2),
+            (None, None, 0, 1 << 4),
+            (None, None, 0, 1 << 63),
+        ] {
+            let require_self_contained = backing.is_some() || external.is_some();
+            let state = Arc::new(MemStorageState::default());
+            let image = MemStorage::new(Arc::clone(&state), false);
+            let mut header = Header::new(
+                16,
+                4,
+                backing.map(str::to_owned),
+                None,
+                external.map(str::to_owned),
+            );
+            header.v2.crypt_method = encryption;
+            header.v3.incompatible_features |= incompatible;
+            header
+                .v3
+                .autoclear_features
+                .store(1 << 63, Ordering::Relaxed);
+            header.write(&image).await?;
+            let original = state.data.lock().clone();
+            if require_self_contained {
+                Header::load(&image, false).await?;
+            }
+            let error = Header::load(&image, require_self_contained)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(*state.data.lock(), original);
+        }
+        Ok(())
     }
 }
