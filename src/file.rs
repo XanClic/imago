@@ -321,6 +321,24 @@ impl Storage for File {
         #[allow(clippy::readonly_write_lock)]
         let file = self.file.write();
         if end > self.size.load(Ordering::Relaxed) {
+            #[cfg(target_os = "linux")]
+            if self.req_align == 1 && self.mem_align == 1 {
+                let offset = (end - 1).try_into().map_err(io::Error::other)?;
+                let zero = 0u8;
+                let buffer = libc::iovec {
+                    iov_base: std::ptr::from_ref(&zero).cast_mut().cast(),
+                    iov_len: 1,
+                };
+                // Safe: The file is locked and the one-byte buffer remains valid until return.
+                let written =
+                    while_eintr(|| unsafe { libc::pwritev(file.as_raw_fd(), &buffer, 1, offset) })?;
+                if written == 0 {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+            } else {
+                file.set_len(end)?;
+            }
+            #[cfg(not(target_os = "linux"))]
             file.set_len(end)?;
             self.size.fetch_max(end, Ordering::Relaxed);
         }
@@ -504,16 +522,14 @@ impl File {
                 writable,
             )
         } else {
-            // Buffered I/O has no request/memory alignment (page cache).
-            // Write-zeroes/discard still need the filesystem block size when
-            // writable; read-only files never issue those operations.
-            #[cfg(unix)]
+            // Linux buffered I/O also supports byte ranges for zeroing and hole punching.
+            #[cfg(all(unix, not(target_os = "linux")))]
             let (zero_align, discard_align) = if writable {
                 Self::get_fs_zero_discard_align(&file)
             } else {
                 (1, 1)
             };
-            #[cfg(not(unix))]
+            #[cfg(any(target_os = "linux", not(unix)))]
             let (zero_align, discard_align) = (1, 1);
             (1, 1, zero_align, discard_align)
         };
@@ -1184,7 +1200,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{cmp, env, fs, io};
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
         let path = test_dir().join(format!(
@@ -1202,7 +1218,7 @@ mod tests {
             .open(&path)
             .unwrap();
         let storage = File::try_from(host).unwrap();
-        let zero_result = storage.discard_to_zero_os_specific(4096, 4096).await;
+        let zero_result = storage.discard_to_zero_os_specific(13, 8192 - 26).await;
         drop(storage);
 
         let contents = fs::read(&path);
@@ -1216,9 +1232,10 @@ mod tests {
         }
         zero_result.unwrap();
         let contents = contents.unwrap();
-        assert_eq!(contents[4095], 0x5a);
-        assert!(contents[4096..8192].iter().all(|byte| *byte == 0));
-        assert_eq!(contents[8192], 0x5a);
+        assert!(contents[..13].iter().all(|byte| *byte == 0x5a));
+        assert!(contents[13..8179].iter().all(|byte| *byte == 0));
+        assert!(contents[8179..].iter().all(|byte| *byte == 0x5a));
+        assert_eq!(contents.len(), 12288);
     }
 
     #[cfg(windows)]
@@ -1264,6 +1281,9 @@ mod tests {
             storage.discard_align,
         );
         let len = fs::metadata(&path).unwrap().len();
+        #[cfg(target_os = "linux")]
+        let expected_fs_align = (1, 1);
+        #[cfg(not(target_os = "linux"))]
         let expected_fs_align = {
             let probe = fs::File::open(&path).unwrap();
             super::File::get_fs_zero_discard_align(&probe)

@@ -46,7 +46,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 default = ["async"]
 # async-drop = []
 async = ["dep:tokio", "dep:async-trait", "dep:futures"]
-sync = ["maybe-async/is_sync", "parking_lot/arc_lock"]
+sync = ["maybe-async/is_sync", "parking_lot/arc_lock", "parking_lot/send_guard"]
 sync-wrappers = ["async", "tokio/rt"]
 vm-memory = ["dep:vm-memory"]
 
