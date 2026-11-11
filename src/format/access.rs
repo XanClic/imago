@@ -46,6 +46,9 @@ pub enum Mapping<'a, S: Storage + 'static> {
         /// Offset in `storage` where this data is stored.
         offset: u64,
 
+        /// Whether a known short storage read must return [`io::ErrorKind::UnexpectedEof`].
+        read_exact: bool,
+
         /// Whether this mapping may be written to.
         ///
         /// If `true`, you can directly write to `offset` on `storage` to change the disk image’s
@@ -202,8 +205,23 @@ impl<S: Storage + 'static> FormatAccess<S> {
             Mapping::Raw {
                 storage,
                 offset,
+                read_exact,
                 writable: _,
-            } => storage.readv(bufv, offset).await,
+            } => {
+                if !read_exact {
+                    return storage.readv(bufv, offset).await;
+                }
+                let requested = bufv.len();
+                if let Some(actual) = storage.readv_counted(bufv, offset).await? {
+                    if actual < requested {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("Short mapped read at {offset:#x}: {actual} < {requested}"),
+                        ));
+                    }
+                }
+                Ok(())
+            }
 
             Mapping::Zero { explicit: _ } | Mapping::Eof {} => {
                 bufv.fill(0);
@@ -270,12 +288,14 @@ impl<S: Storage + 'static> FormatAccess<S> {
                 ShallowMapping::Raw {
                     storage,
                     offset,
+                    read_exact,
                     writable,
                 } => {
                     return Ok((
                         Mapping::Raw {
                             storage,
                             offset,
+                            read_exact,
                             writable: writable && writable_gate,
                         },
                         length,
@@ -647,6 +667,7 @@ impl<S: Storage + 'static> FormatAccess<S> {
                     storage,
                     offset,
                     writable,
+                    read_exact: _,
                 } => writable.then_some((storage, offset)),
                 // For already zero clusters, we don’t need to do anything
                 ShallowMapping::Zero { explicit: true } => {
@@ -1006,6 +1027,7 @@ impl<S: Storage> Display for Mapping<'_, S> {
             Mapping::Raw {
                 storage,
                 offset,
+                read_exact: _,
                 writable,
             } => {
                 let writable = if *writable { "rw" } else { "ro" };

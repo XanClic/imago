@@ -142,6 +142,14 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         unsafe { self.inner.pure_readv(bufv, offset) }.await
     }
 
+    async unsafe fn pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
+        unsafe { self.inner.pure_readv_counted(bufv, offset) }.await
+    }
+
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
         // Caller guarantees safety
         unsafe { self.inner.pure_writev(bufv, offset) }.await

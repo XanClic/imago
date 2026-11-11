@@ -166,6 +166,22 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
     #[allow(async_fn_in_trait)] // No need for Send
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()>;
 
+    /// Read with EOF zero-fill, returning the actual prefix read before zero-fill if known.
+    ///
+    /// `None` means the backend cannot distinguish actual data from EOF zero-fill.
+    ///
+    /// # Safety
+    /// The alignment and concurrency requirements of [`Self::pure_readv()`] apply.
+    #[allow(async_fn_in_trait)]
+    async unsafe fn pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
+        unsafe { self.pure_readv(bufv, offset).await }?;
+        Ok(None)
+    }
+
     /// Write data from `bufv` to `offset`.
     ///
     /// Writes all data from `bufv`, i.e. will not do short writes.  When reaching the end of file,
@@ -365,6 +381,36 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
     #[cfg(feature = "sync")]
     unsafe fn dyn_pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()>;
 
+    /// Object-safe counted read; the default delegates to the legacy read and returns `None`.
+    ///
+    /// # Safety
+    /// Same considerations as for [`Storage::pure_readv_counted()`] apply.
+    #[cfg(feature = "async")]
+    unsafe fn dyn_pure_readv_counted<'a>(
+        &'a self,
+        bufv: IoVectorMut<'a>,
+        offset: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Option<u64>>> + 'a>> {
+        Box::pin(async move {
+            unsafe { self.dyn_pure_readv(bufv, offset).await }?;
+            Ok(None)
+        })
+    }
+
+    /// Object-safe counted read; the default delegates to the legacy read and returns `None`.
+    ///
+    /// # Safety
+    /// Same considerations as for [`Storage::pure_readv_counted()`] apply.
+    #[cfg(feature = "sync")]
+    unsafe fn dyn_pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
+        unsafe { self.dyn_pure_readv(bufv, offset) }?;
+        Ok(None)
+    }
+
     /// Object-safe wrapper around [`Storage::pure_writev()`].
     ///
     /// # Safety
@@ -554,6 +600,14 @@ impl<S: Storage> Storage for &S {
         unsafe { (*self).pure_readv(bufv, offset).await }
     }
 
+    async unsafe fn pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
+        unsafe { (*self).pure_readv_counted(bufv, offset).await }
+    }
+
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
         unsafe { (*self).pure_writev(bufv, offset).await }
     }
@@ -636,6 +690,24 @@ impl<S: Storage + 'static> DynStorage for S {
     #[cfg(feature = "sync")]
     unsafe fn dyn_pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         unsafe { <S as Storage>::pure_readv(self, bufv, offset) }
+    }
+
+    #[cfg(feature = "async")]
+    unsafe fn dyn_pure_readv_counted<'a>(
+        &'a self,
+        bufv: IoVectorMut<'a>,
+        offset: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Option<u64>>> + 'a>> {
+        Box::pin(unsafe { <S as Storage>::pure_readv_counted(self, bufv, offset) })
+    }
+
+    #[cfg(feature = "sync")]
+    unsafe fn dyn_pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
+        unsafe { <S as Storage>::pure_readv_counted(self, bufv, offset) }
     }
 
     #[cfg(feature = "async")]
@@ -799,6 +871,14 @@ impl Storage for Box<dyn DynStorage> {
         unsafe { self.as_ref().dyn_pure_readv(bufv, offset).await }
     }
 
+    async unsafe fn pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
+        unsafe { self.as_ref().dyn_pure_readv_counted(bufv, offset).await }
+    }
+
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
         unsafe { self.as_ref().dyn_pure_writev(bufv, offset).await }
     }
@@ -886,6 +966,14 @@ impl Storage for Arc<dyn DynStorage> {
 
     async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
         unsafe { self.as_ref().dyn_pure_readv(bufv, offset) }.await
+    }
+
+    async unsafe fn pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
+        unsafe { self.as_ref().dyn_pure_readv_counted(bufv, offset) }.await
     }
 
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {

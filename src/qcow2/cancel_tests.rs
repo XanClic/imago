@@ -8,24 +8,12 @@ use super::*;
 use crate::test::mem_storage::{MemStorage, MemStorageState};
 use crate::{DenyImplicitOpenGate, Mapping};
 use futures::FutureExt;
-use std::future::Future;
 use std::sync::atomic::Ordering;
-use std::task::{Context, Poll};
+use std::task::Poll;
 
 /// Create a 512-byte-cluster image of the given size on a [`MemStorage`] with the given state.
 async fn create_image(state: &Arc<MemStorageState>, size: u64) -> FormatAccess<MemStorage> {
-    let qcow2 = Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(state), false))
-        .cluster_size(512)
-        .size(size)
-        .create_open(DenyImplicitOpenGate::default(), |image| {
-            Ok(Qcow2::<MemStorage>::builder(image)
-                .backing(None)
-                .write(true))
-        })
-        .await
-        .unwrap();
-
-    FormatAccess::new(qcow2)
+    FormatAccess::new(crate::test::mem_storage::create_image(state, size).await)
 }
 
 /// Return the host offset `offset` is mapped to; panic if it is not mapped to raw data.
@@ -77,54 +65,92 @@ async fn test_dropped_write_vs_discard_and_realloc() {
     );
 }
 
-/// A metadata table entry write whose future is dropped while it is still in flight must not
-/// overwrite data in a cluster that has been freed (by replacing the table) and reallocated in the
-/// meantime.
-///
-/// Here, the table is the L1 table: Dropping a guest write while its L1 entry write is in flight
-/// releases the L1 table lock, so growing the image can then replace the L1 table, freeing the old
-/// one.
+/// Cancelling a physical discard must retain ownership until its late I/O has completed.
+#[tokio::test]
+async fn test_cancelled_physical_discard_keeps_clusters_owned() -> io::Result<()> {
+    for version in [2u32, 3] {
+        let state = Arc::new(MemStorageState::default());
+        let image = create_image(&state, 64 * 1024).await;
+        image.flush().await?;
+        drop(image);
+        state.data.lock()[4..8].copy_from_slice(&version.to_be_bytes());
+        let image = open_image(&state).await;
+
+        image.write(&[0x11u8; 1024][..], 0).await?;
+        image.flush().await?;
+        image.sync().await?;
+        let old_offset = host_offset(&image, 0).await;
+        assert_eq!(host_offset(&image, 512).await, old_offset + 512);
+        let cluster = old_offset / 512;
+        let reftable = read_u64(&state, 48);
+        let refblock = read_u64(&state, reftable + (cluster / 256) * 8);
+        let refcount_offset = (refblock + (cluster % 256) * 2) as usize;
+        assert!(
+            cluster % 256 < 255,
+            "fixture must keep the run in one refblock"
+        );
+
+        state.hold_discards.store(true, Ordering::Relaxed);
+        // Only metadata flushes run concurrently; no data access holds a discarded mapping.
+        let mut discard = Box::pin(unsafe { image.discard_to_zero_unsafe(0, 1024) });
+        assert!(crate::test::mem_storage::poll_once(discard.as_mut()).is_pending());
+        assert_eq!(*state.held_discards.lock(), [(old_offset, 1024)]);
+        // A concurrent flush must observe both final references while discard is pending.
+        image.flush().await?;
+        assert_eq!(
+            &state.data.lock()[refcount_offset..refcount_offset + 4],
+            &[0, 1, 0, 1]
+        );
+        drop(discard);
+        state.hold_discards.store(false, Ordering::Relaxed);
+
+        let new_data = [0x33u8; 1024];
+        image.write(&new_data[..], 1024).await?;
+        for guest_offset in [1024, 1536] {
+            let new_offset = host_offset(&image, guest_offset).await;
+            assert!(new_offset < old_offset || new_offset >= old_offset + 1024);
+        }
+        image.flush().await?;
+        image.sync().await?;
+        MemStorage::new(Arc::clone(&state), false)
+            .settle_writes()
+            .await?;
+        assert!(state.held_discards.lock().is_empty());
+        assert_eq!(*state.discarded.lock(), [(old_offset, 1024)]);
+        image.sync().await?;
+        drop(image);
+
+        let reopened = open_image(&state).await;
+        let mut actual = [0xa5u8; 2048];
+        reopened.read(&mut actual[..], 0).await?;
+        assert_eq!(&actual[..1024], &[0u8; 1024]);
+        assert_eq!(&actual[1024..], &new_data);
+        reopened.flush().await?;
+    }
+    Ok(())
+}
+
+/// A dropped L1 entry write must prevent growth and reuse while a late write can still land.
 #[tokio::test]
 async fn test_dropped_l1_entry_write_vs_l1_growth_and_realloc() {
     let state = Arc::new(MemStorageState::default());
     let mut image = create_image(&state, 64 * 1024).await;
-
-    // L1 table offset from the image header
-    let l1_offset = u64::from_be_bytes(state.data.lock()[40..48].try_into().unwrap());
-    assert_ne!(l1_offset, 0);
-
-    // Issue a write to guest cluster 0, which allocates an L2 table, and drop its future while its
-    // L1 entry write is still in flight
-    *state.hold_range.lock() = Some(l1_offset..(l1_offset + 512));
+    let l1_offset = read_u64(&state, 40);
+    *state.hold_range.lock() = Some(l1_offset..l1_offset + 512);
     state.hold_writes.store(true, Ordering::Relaxed);
-    assert!(image.write(&[0x22u8; 512][..], 0).now_or_never().is_none());
+    let mut write = Box::pin(image.write(&[0x22u8; 512][..], 0));
+    assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
     assert_eq!(state.held.lock().len(), 1);
+    drop(write);
     state.hold_writes.store(false, Ordering::Relaxed);
     *state.hold_range.lock() = None;
-
-    // Grow the L1 table beyond its first cluster (64 entries of 32 KiB each), freeing the old one
     image
         .resize(4 * 1024 * 1024, PreallocateMode::None)
         .await
-        .unwrap();
-
-    // Allocate guest cluster 1 (whose L2 table exists already), which must reuse the old L1
-    // table’s cluster for this test to be meaningful
-    let new_data = [0x33u8; 512];
-    image.write(&new_data[..], 512).await.unwrap();
-    assert_eq!(host_offset(&image, 512).await, l1_offset);
-
-    // Now the dropped L1 entry write completes (unless it has already been settled before)
+        .unwrap_err();
+    image.write(&[0x33u8; 512][..], 512).await.unwrap_err();
     state.complete_held_writes();
-
-    let mut buf = [0u8; 512];
-    image.read(&mut buf[..], 512).await.unwrap();
-    assert!(
-        buf == new_data,
-        "Expected {:#04x} bytes, read {:#04x} bytes",
-        new_data[0],
-        buf[0],
-    );
+    image.flush().await.unwrap_err();
 }
 
 /// Return the cluster-aligned host offset (assuming a cluster size of 512) of the first held
@@ -146,10 +172,9 @@ async fn test_cancelled_cow_frees_cluster() {
     // Partially write guest cluster 1, so the rest of it must be COW-ed into the new cluster, and
     // drop the future while that write is in flight
     state.hold_writes.store(true, Ordering::Relaxed);
-    assert!(image
-        .write(&[0x22u8; 256][..], 512)
-        .now_or_never()
-        .is_none());
+    let mut write = Box::pin(image.write(&[0x22u8; 256][..], 512));
+    assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
+    drop(write);
     state.hold_writes.store(false, Ordering::Relaxed);
     let cancelled_cluster = first_held_cluster(&state);
 
@@ -193,6 +218,66 @@ async fn test_failed_cow_frees_cluster() {
     assert_eq!(host_offset(&image, 1024).await, failed_cluster);
 }
 
+/// If the data write of a write that allocates a cluster fails, the guest cluster must keep its
+/// previous mapping, and the new cluster must be freed.
+#[tokio::test]
+async fn test_failed_write_keeps_mapping() {
+    let state = Arc::new(MemStorageState::default());
+    let image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0 (so the L2 table exists)
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+
+    // Fully overwrite guest cluster 1, and let the data write fail
+    state.fail_next_write.store(true, Ordering::Relaxed);
+    image.write(&[0x22u8; 512][..], 512).await.unwrap_err();
+    let failed_cluster = {
+        let failed = state.failed.lock();
+        assert_eq!(failed.len(), 1, "Expected exactly one failed write");
+        failed[0] & !511
+    };
+
+    // Guest cluster 1 must not be mapped
+    if let Mapping::Raw { offset, .. } = image.get_mapping(512, 512).await.unwrap().0 {
+        panic!("Failed write left a mapping to host offset {offset:#x}");
+    }
+
+    // Flushing frees the cluster from the failed write, so the next allocation can reuse it
+    image.flush().await.unwrap();
+    image.write(&[0x33u8; 512][..], 1024).await.unwrap();
+    assert_eq!(host_offset(&image, 1024).await, failed_cluster);
+}
+
+/// If a write that allocates a cluster is dropped while its data write is in flight, the guest
+/// cluster must keep its previous mapping, and the new cluster must be freed.
+#[tokio::test]
+async fn test_dropped_write_keeps_mapping() {
+    let state = Arc::new(MemStorageState::default());
+    let image = create_image(&state, 64 * 1024).await;
+
+    // Allocate guest cluster 0 (so the L2 table exists)
+    image.write(&[0x11u8; 512][..], 0).await.unwrap();
+
+    // Fully overwrite guest cluster 1, and drop the future while the data write is in flight
+    state.hold_writes.store(true, Ordering::Relaxed);
+    let mut write = Box::pin(image.write(&[0x22u8; 512][..], 512));
+    assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
+    drop(write);
+    state.hold_writes.store(false, Ordering::Relaxed);
+    let dropped_cluster = first_held_cluster(&state);
+
+    // Guest cluster 1 must not be mapped
+    if let Mapping::Raw { offset, .. } = image.get_mapping(512, 512).await.unwrap().0 {
+        panic!("Dropped write left a mapping to host offset {offset:#x}");
+    }
+
+    // Flushing frees the cluster from the dropped write (after settling its writes), so the next
+    // allocation can reuse it
+    image.flush().await.unwrap();
+    image.write(&[0x33u8; 512][..], 1024).await.unwrap();
+    assert_eq!(host_offset(&image, 1024).await, dropped_cluster);
+}
+
 /// Open the image on a [`MemStorage`] with the given state.
 async fn open_image(state: &Arc<MemStorageState>) -> FormatAccess<MemStorage> {
     let qcow2 = Qcow2::<MemStorage>::builder(MemStorage::new(Arc::clone(state), false))
@@ -203,6 +288,51 @@ async fn open_image(state: &Arc<MemStorageState>) -> FormatAccess<MemStorage> {
         .unwrap();
 
     FormatAccess::new(qcow2)
+}
+
+#[tokio::test]
+async fn test_cancelled_resize_rejects_retry() -> io::Result<()> {
+    for (new_size, late_write, expected_size) in [
+        (1536, false, 2048),
+        (1536, true, 1536),
+        (2560, false, 2048),
+        (2560, true, 2048),
+    ] {
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = crate::test::mem_storage::create_image(&state, 2048).await;
+        let metadata = Arc::clone(&qcow2.metadata);
+        let mut image = FormatAccess::new(qcow2);
+        image.write(&[0x5au8; 512][..], 0).await?;
+        image.flush().await?;
+        *state.hold_range.lock() = Some(0..72);
+        state.hold_writes.store(late_write, Ordering::Relaxed);
+        let blocker = if late_write {
+            None
+        } else {
+            Some(metadata.strong_write_blocker(0..72).await)
+        };
+        assert!(image
+            .resize(new_size, PreallocateMode::None)
+            .now_or_never()
+            .is_none());
+        state.hold_writes.store(false, Ordering::Relaxed);
+        drop(blocker);
+        assert_eq!(image.size(), 2048);
+        image
+            .resize(new_size, PreallocateMode::None)
+            .await
+            .unwrap_err();
+        image.sync().await.unwrap_err();
+        state.complete_held_writes();
+        image.flush().await.unwrap_err();
+        drop(image);
+        let reopened = open_image(&state).await;
+        assert_eq!(reopened.size(), expected_size);
+        let mut buf = [0; 512];
+        reopened.read(&mut buf[..], 0).await?;
+        assert_eq!(buf, [0x5a; 512]);
+    }
+    Ok(())
 }
 
 /// Read a big-endian 64-bit value from the storage.
@@ -270,21 +400,18 @@ async fn test_compressed_read_vs_cow() {
         create_compressed_image(&state, guest_offset, &data).await;
     let mut buf = [0u8; 512];
 
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-
     // Start reading the compressed cluster, keeping the read of the compressed data pending
     state.hold_reads.store(true, Ordering::Relaxed);
     let mut read_buf = [0u8; 512];
     let mut read = Box::pin(image.read(&mut read_buf[..], guest_offset));
-    assert!(read.as_mut().poll(&mut cx).is_pending());
+    assert!(crate::test::mem_storage::poll_once(read.as_mut()).is_pending());
     assert_eq!(*state.held_reads.lock(), [compressed_host_offset]);
     state.hold_reads.store(false, Ordering::Relaxed);
 
     // Concurrently overwrite guest cluster 1, replacing the compressed mapping, which frees the
     // compressed data’s host cluster
     let mut cow_write = Box::pin(image.write(&[0x55u8; 512][..], guest_offset));
-    if cow_write.as_mut().poll(&mut cx).is_ready() {
+    if crate::test::mem_storage::poll_once(cow_write.as_mut()).is_ready() {
         // The write did not wait for the read, so the freed host cluster can now be reused
         image.write(&[0x66u8; 512][..], 1024).await.unwrap();
         assert_eq!(host_offset(&image, 1024).await, compressed_host_offset);
@@ -292,7 +419,7 @@ async fn test_compressed_read_vs_cow() {
 
     // Let the read of the compressed data complete
     state.release_reads.store(true, Ordering::Relaxed);
-    let Poll::Ready(result) = read.as_mut().poll(&mut cx) else {
+    let Poll::Ready(result) = crate::test::mem_storage::poll_once(read.as_mut()) else {
         panic!("Read did not complete");
     };
     result.unwrap();
@@ -319,15 +446,12 @@ async fn test_compressed_read_vs_mapping_change() {
     let state = Arc::new(MemStorageState::default());
     let (image, _) = create_compressed_image(&state, guest_offset, &[0x44u8; 512]).await;
 
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-
     // Partially overwrite guest cluster 1, so the compressed data must be COW-ed; keep that write
     // pending on a read while it holds the L2 table’s write lock (the first read it does while
     // holding it is for allocating the new cluster, i.e. loading a refblock)
     state.hold_reads.store(true, Ordering::Relaxed);
     let mut cow_write = Box::pin(image.write(&[0x55u8; 256][..], guest_offset));
-    assert!(cow_write.as_mut().poll(&mut cx).is_pending());
+    assert!(crate::test::mem_storage::poll_once(cow_write.as_mut()).is_pending());
     assert!(!state.held_reads.lock().is_empty());
     state.hold_reads.store(false, Ordering::Relaxed);
 
@@ -335,11 +459,11 @@ async fn test_compressed_read_vs_mapping_change() {
     // must wait for the write
     let mut read_buf = [0u8; 512];
     let mut read = Box::pin(image.read(&mut read_buf[..], guest_offset));
-    assert!(read.as_mut().poll(&mut cx).is_pending());
+    assert!(crate::test::mem_storage::poll_once(read.as_mut()).is_pending());
 
     // Let the write complete, replacing the compressed mapping
     state.release_reads.store(true, Ordering::Relaxed);
-    let Poll::Ready(result) = cow_write.as_mut().poll(&mut cx) else {
+    let Poll::Ready(result) = crate::test::mem_storage::poll_once(cow_write.as_mut()) else {
         panic!("Write did not complete");
     };
     result.unwrap();
@@ -368,18 +492,18 @@ async fn test_read_during_write_to_reused_cluster() {
     let freed_host_offset = host_offset(&image, 0).await;
     image.discard_to_zero(0, 512).await.unwrap();
 
+    // Seed stale data after physical discard to check that the unmapped guest cannot see it.
+    state.data.lock()[freed_host_offset as usize..freed_host_offset as usize + 512].fill(0x11);
+
     // The freed host cluster still holds the old data
     assert_eq!(state.data.lock()[freed_host_offset as usize], 0x11);
-
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
 
     // Fully overwrite guest cluster 1, which must reuse that host cluster for this test to be
     // meaningful, and keep the data write in flight
     *state.hold_range.lock() = Some(freed_host_offset..(freed_host_offset + 512));
     state.delay_writes.store(true, Ordering::Relaxed);
     let mut write = Box::pin(image.write(&[0x22u8; 512][..], 512));
-    assert!(write.as_mut().poll(&mut cx).is_pending());
+    assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
     assert_eq!(*state.delayed_writes.lock(), [freed_host_offset]);
     state.delay_writes.store(false, Ordering::Relaxed);
     *state.hold_range.lock() = None;
@@ -396,7 +520,7 @@ async fn test_read_during_write_to_reused_cluster() {
     // Let the write complete; it must have landed in the reused host cluster, which is now also
     // what guest cluster 1 maps to
     state.release_writes.store(true, Ordering::Relaxed);
-    let Poll::Ready(result) = write.as_mut().poll(&mut cx) else {
+    let Poll::Ready(result) = crate::test::mem_storage::poll_once(write.as_mut()) else {
         panic!("Write did not complete");
     };
     result.unwrap();
@@ -439,15 +563,12 @@ async fn test_read_during_write_to_zeroed_cluster() {
     // The host cluster keeps its allocation and its old content; only its mapping reads as zeroes
     assert_eq!(state.data.lock()[retained_host_offset as usize], 0x11);
 
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-
     // Fully overwrite guest cluster 0, which must reuse the retained host cluster for this test to
     // be meaningful, and keep the data write in flight
     *state.hold_range.lock() = Some(retained_host_offset..(retained_host_offset + 512));
     state.delay_writes.store(true, Ordering::Relaxed);
     let mut write = Box::pin(image.write(&[0x22u8; 512][..], 0));
-    assert!(write.as_mut().poll(&mut cx).is_pending());
+    assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
     assert_eq!(*state.delayed_writes.lock(), [retained_host_offset]);
     state.delay_writes.store(false, Ordering::Relaxed);
     *state.hold_range.lock() = None;
@@ -464,7 +585,7 @@ async fn test_read_during_write_to_zeroed_cluster() {
     // Let the write complete; it must have landed in the retained host cluster, which guest
     // cluster 0 must still map to
     state.release_writes.store(true, Ordering::Relaxed);
-    let Poll::Ready(result) = write.as_mut().poll(&mut cx) else {
+    let Poll::Ready(result) = crate::test::mem_storage::poll_once(write.as_mut()) else {
         panic!("Write did not complete");
     };
     result.unwrap();
@@ -492,67 +613,6 @@ async fn test_read_during_write_to_zeroed_cluster() {
     );
 }
 
-/// If the data write of a write that allocates a cluster fails, the guest cluster must keep its
-/// previous mapping, and the new cluster must be freed.
-#[tokio::test]
-async fn test_failed_write_keeps_mapping() {
-    let state = Arc::new(MemStorageState::default());
-    let image = create_image(&state, 64 * 1024).await;
-
-    // Allocate guest cluster 0 (so the L2 table exists)
-    image.write(&[0x11u8; 512][..], 0).await.unwrap();
-
-    // Fully overwrite guest cluster 1, and let the data write fail
-    state.fail_next_write.store(true, Ordering::Relaxed);
-    image.write(&[0x22u8; 512][..], 512).await.unwrap_err();
-    let failed_cluster = {
-        let failed = state.failed.lock();
-        assert_eq!(failed.len(), 1, "Expected exactly one failed write");
-        failed[0] & !511
-    };
-
-    // Guest cluster 1 must not be mapped
-    if let Mapping::Raw { offset, .. } = image.get_mapping(512, 512).await.unwrap().0 {
-        panic!("Failed write left a mapping to host offset {offset:#x}");
-    }
-
-    // Flushing frees the cluster from the failed write, so the next allocation can reuse it
-    image.flush().await.unwrap();
-    image.write(&[0x33u8; 512][..], 1024).await.unwrap();
-    assert_eq!(host_offset(&image, 1024).await, failed_cluster);
-}
-
-/// If a write that allocates a cluster is dropped while its data write is in flight, the guest
-/// cluster must keep its previous mapping, and the new cluster must be freed.
-#[tokio::test]
-async fn test_dropped_write_keeps_mapping() {
-    let state = Arc::new(MemStorageState::default());
-    let image = create_image(&state, 64 * 1024).await;
-
-    // Allocate guest cluster 0 (so the L2 table exists)
-    image.write(&[0x11u8; 512][..], 0).await.unwrap();
-
-    // Fully overwrite guest cluster 1, and drop the future while the data write is in flight
-    state.hold_writes.store(true, Ordering::Relaxed);
-    assert!(image
-        .write(&[0x22u8; 512][..], 512)
-        .now_or_never()
-        .is_none());
-    state.hold_writes.store(false, Ordering::Relaxed);
-    let dropped_cluster = first_held_cluster(&state);
-
-    // Guest cluster 1 must not be mapped
-    if let Mapping::Raw { offset, .. } = image.get_mapping(512, 512).await.unwrap().0 {
-        panic!("Dropped write left a mapping to host offset {offset:#x}");
-    }
-
-    // Flushing frees the cluster from the dropped write (after settling its writes), so the next
-    // allocation can reuse it
-    image.flush().await.unwrap();
-    image.write(&[0x33u8; 512][..], 1024).await.unwrap();
-    assert_eq!(host_offset(&image, 1024).await, dropped_cluster);
-}
-
 /// Two concurrent writes into different parts of the same unallocated cluster must both end up in
 /// it.
 #[tokio::test]
@@ -567,22 +627,19 @@ async fn test_concurrent_writes_to_unallocated_cluster() {
     let host = host_offset(&image, 512).await;
     image.discard_to_zero(512, 512).await.unwrap();
 
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-
     // Write the first half of guest cluster 1, delaying the data write (but not the write that
     // fills the second half of the new cluster)
     *state.hold_range.lock() = Some(host..(host + 256));
-    state.delay_writes.store(true, Ordering::Relaxed);
+    state.hold_writes.store(true, Ordering::Relaxed);
     let mut first = Box::pin(image.write(&[0x22u8; 256][..], 512));
-    assert!(first.as_mut().poll(&mut cx).is_pending());
-    assert_eq!(*state.delayed_writes.lock(), [host]);
-    state.delay_writes.store(false, Ordering::Relaxed);
+    assert!(crate::test::mem_storage::poll_once(first.as_mut()).is_pending());
+    assert_eq!(state.held.lock()[0].0, host);
+    state.hold_writes.store(false, Ordering::Relaxed);
     *state.hold_range.lock() = None;
 
     // Concurrently write the second half; this may or may not wait for the first write
     let mut second = Box::pin(image.write(&[0x33u8; 256][..], 512 + 256));
-    let second_done = match second.as_mut().poll(&mut cx) {
+    let second_done = match crate::test::mem_storage::poll_once(second.as_mut()) {
         Poll::Ready(result) => {
             result.unwrap();
             true
@@ -591,8 +648,8 @@ async fn test_concurrent_writes_to_unallocated_cluster() {
     };
 
     // Let the first write complete
-    state.release_writes.store(true, Ordering::Relaxed);
-    let Poll::Ready(result) = first.as_mut().poll(&mut cx) else {
+    state.release_held_writes();
+    let Poll::Ready(result) = crate::test::mem_storage::poll_once(first.as_mut()) else {
         panic!("First write did not complete");
     };
     result.unwrap();
@@ -627,19 +684,12 @@ async fn test_parallel_write_with_several_allocations() {
     image.discard_to_zero(512, 512).await.unwrap();
     image.discard_to_zero(3 * 512, 512).await.unwrap();
 
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-
     // Write guest clusters 4 and 5 in a single request
     let mut write = Box::pin(image.write(&[0x55u8; 2 * 512][..], 4 * 512));
-    let mut result = None;
-    for _ in 0..64 {
-        if let Poll::Ready(r) = write.as_mut().poll(&mut cx) {
-            result = Some(r);
-            break;
-        }
-    }
-    result.expect("Write did not complete").unwrap();
+    let Poll::Ready(result) = crate::test::mem_storage::poll_once(write.as_mut()) else {
+        panic!("Write did not complete");
+    };
+    result.unwrap();
     drop(write);
 
     // This test is only meaningful if that needed two separate allocations

@@ -174,12 +174,17 @@ impl Storage for File {
         self.filename.as_ref().cloned()
     }
 
+    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        unsafe { self.pure_readv_counted(bufv, offset).await }.map(|_| ())
+    }
+
     #[cfg(unix)]
-    async unsafe fn pure_readv(
+    async unsafe fn pure_readv_counted(
         &self,
         mut bufv: IoVectorMut<'_>,
         mut offset: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<u64>> {
+        let mut actual_len = 0;
         while !bufv.is_empty() {
             let iovec = unsafe { bufv.as_iovec() };
             let preadv_offset = offset
@@ -205,36 +210,41 @@ impl Storage for File {
             offset = offset
                 .checked_add(len)
                 .ok_or_else(|| io::Error::other("Read offset overflow"))?;
+            actual_len += len;
         }
 
-        Ok(())
+        Ok(Some(actual_len))
     }
 
     #[cfg(windows)]
-    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, mut offset: u64) -> io::Result<()> {
+    async unsafe fn pure_readv_counted(
+        &self,
+        bufv: IoVectorMut<'_>,
+        mut offset: u64,
+    ) -> io::Result<Option<u64>> {
+        let mut actual_len = 0;
+        let mut eof = false;
         for mut buffer in bufv.into_inner() {
             let mut buffer: &mut [u8] = &mut buffer;
+            if eof || offset >= self.size.load(Ordering::Relaxed) {
+                buffer.fill(0);
+                continue;
+            }
             while !buffer.is_empty() {
-                let len = if offset >= self.size.load(Ordering::Relaxed) {
+                let len = self.file.write().seek_read(buffer, offset)?;
+                if len == 0 {
                     buffer.fill(0);
-                    buffer.len()
-                } else {
-                    match self.file.write().seek_read(buffer, offset)? {
-                        0 => {
-                            // End of file (file is shorter than `self.size`)
-                            buffer.fill(0);
-                            buffer.len()
-                        }
-                        len => len,
-                    }
-                };
+                    eof = true;
+                    break;
+                }
                 offset = offset
                     .checked_add(len as u64)
                     .ok_or_else(|| io::Error::other("Read offset overflow"))?;
+                actual_len += len as u64;
                 buffer = buffer.split_at_mut(len).1;
             }
         }
-        Ok(())
+        Ok(Some(actual_len))
     }
 
     #[cfg(unix)]
@@ -311,6 +321,24 @@ impl Storage for File {
         #[allow(clippy::readonly_write_lock)]
         let file = self.file.write();
         if end > self.size.load(Ordering::Relaxed) {
+            #[cfg(target_os = "linux")]
+            if self.req_align == 1 && self.mem_align == 1 {
+                let offset = (end - 1).try_into().map_err(io::Error::other)?;
+                let zero = 0u8;
+                let buffer = libc::iovec {
+                    iov_base: std::ptr::from_ref(&zero).cast_mut().cast(),
+                    iov_len: 1,
+                };
+                // Safe: The file is locked and the one-byte buffer remains valid until return.
+                let written =
+                    while_eintr(|| unsafe { libc::pwritev(file.as_raw_fd(), &buffer, 1, offset) })?;
+                if written == 0 {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+            } else {
+                file.set_len(end)?;
+            }
+            #[cfg(not(target_os = "linux"))]
             file.set_len(end)?;
             self.size.fetch_max(end, Ordering::Relaxed);
         }
@@ -494,16 +522,14 @@ impl File {
                 writable,
             )
         } else {
-            // Buffered I/O has no request/memory alignment (page cache).
-            // Write-zeroes/discard still need the filesystem block size when
-            // writable; read-only files never issue those operations.
-            #[cfg(unix)]
+            // Linux buffered I/O also supports byte ranges for zeroing and hole punching.
+            #[cfg(all(unix, not(target_os = "linux")))]
             let (zero_align, discard_align) = if writable {
                 Self::get_fs_zero_discard_align(&file)
             } else {
                 (1, 1)
             };
-            #[cfg(not(unix))]
+            #[cfg(any(target_os = "linux", not(unix)))]
             let (zero_align, discard_align) = (1, 1);
             (1, 1, zero_align, discard_align)
         };
@@ -1174,7 +1200,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{cmp, env, fs, io};
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn zero_data_preserves_the_byte_at_the_exclusive_end() {
         let path = test_dir().join(format!(
@@ -1192,7 +1218,7 @@ mod tests {
             .open(&path)
             .unwrap();
         let storage = File::try_from(host).unwrap();
-        let zero_result = storage.discard_to_zero_os_specific(4096, 4096).await;
+        let zero_result = storage.discard_to_zero_os_specific(13, 8192 - 26).await;
         drop(storage);
 
         let contents = fs::read(&path);
@@ -1206,9 +1232,10 @@ mod tests {
         }
         zero_result.unwrap();
         let contents = contents.unwrap();
-        assert_eq!(contents[4095], 0x5a);
-        assert!(contents[4096..8192].iter().all(|byte| *byte == 0));
-        assert_eq!(contents[8192], 0x5a);
+        assert!(contents[..13].iter().all(|byte| *byte == 0x5a));
+        assert!(contents[13..8179].iter().all(|byte| *byte == 0));
+        assert!(contents[8179..].iter().all(|byte| *byte == 0x5a));
+        assert_eq!(contents.len(), 12288);
     }
 
     #[cfg(windows)]
@@ -1254,6 +1281,9 @@ mod tests {
             storage.discard_align,
         );
         let len = fs::metadata(&path).unwrap().len();
+        #[cfg(target_os = "linux")]
+        let expected_fs_align = (1, 1);
+        #[cfg(not(target_os = "linux"))]
         let expected_fs_align = {
             let probe = fs::File::open(&path).unwrap();
             super::File::get_fs_zero_discard_align(&probe)
@@ -1391,7 +1421,6 @@ mod tests {
     }
 
     /// Reading past the actual end of file must work even if `File::size` is larger.
-    #[cfg(windows)]
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
     async fn read_past_external_truncation() -> io::Result<()> {
         use crate::StorageOpenOptions;
@@ -1406,12 +1435,15 @@ mod tests {
         let _temp_path = TempPath(path.clone());
         std::fs::write(&path, vec![0xabu8; 8192])?;
 
-        let file = File::open(StorageOpenOptions::new().filename(&path)).await?;
+        let mut file = File::open(StorageOpenOptions::new().filename(&path)).await?;
         // Truncate behind `file`'s back, so its cached size is too large
         fs::OpenOptions::new()
             .write(true)
             .open(&path)?
-            .set_len(4096)?;
+            .set_len(5000)?;
+        assert_eq!(file.size()?, 8192);
+        file.req_align = 512;
+        file.mem_align = 512;
 
         // When broken, reading spins forever; abort instead of hanging
         let done = Arc::new(AtomicBool::new(false));
@@ -1426,10 +1458,36 @@ mod tests {
 
         let mut buf = vec![0xffu8; 8192];
         file.read(&mut buf[..], 0).await?;
-        done.store(true, Ordering::Relaxed);
+        assert!(buf[..5000].iter().all(|&byte| byte == 0xab));
+        assert!(buf[5000..].iter().all(|&byte| byte == 0));
 
-        assert!(buf[..4096].iter().all(|&byte| byte == 0xab));
-        assert!(buf[4096..].iter().all(|&byte| byte == 0));
+        for (offset, len, expected_count) in [
+            (0, 8192, 5000),
+            (4095, 1000, 905),
+            (4991, 9, 9),
+            (5001, 100, 0),
+        ] {
+            let mut counted = crate::io_buffers::IoBuffer::new(len, file.mem_align())?;
+            counted.as_mut().into_slice().fill(0xff);
+            let count = file.readv_counted(counted.as_mut().into(), offset).await?;
+            assert_eq!(count, Some(expected_count));
+            let counted = counted.as_ref().into_slice();
+            assert!(counted[..expected_count as usize]
+                .iter()
+                .all(|&byte| byte == 0xab));
+            assert!(counted[expected_count as usize..]
+                .iter()
+                .all(|&byte| byte == 0));
+        }
+        assert_eq!(file.size()?, 8192);
+        let storage: Box<dyn crate::storage::DynStorage> = Box::new(file);
+        let count = storage.readv_counted((&mut buf[..]).into(), 0).await?;
+        assert_eq!(count, Some(5000));
+        let storage: Arc<dyn crate::storage::DynStorage> = Arc::from(storage);
+        let storage = crate::annotated::Annotated::new(storage, 0u32);
+        let count = storage.readv_counted((&mut buf[..]).into(), 0).await?;
+        assert_eq!(count, Some(5000));
+        done.store(true, Ordering::Relaxed);
 
         io::Result::Ok(())
     }

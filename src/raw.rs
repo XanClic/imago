@@ -152,6 +152,7 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
             ShallowMapping::Raw {
                 storage: &self.inner,
                 offset,
+                read_exact: false,
                 writable: true,
             },
             std::cmp::min(max_length, remaining),

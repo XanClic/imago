@@ -403,6 +403,8 @@ pub trait FormatDriverInstance: Any + Debug + Display + Send + Sync {
 /// Dropping this object without committing it discards any prepared mapping change.
 ///
 /// Until this object is committed or dropped, any other I/O on the image may wait for it.
+///
+/// This mapping is [`Send`] in both sync and async builds and can be moved between threads.
 #[must_use = "prepared mappings must be committed to complete the write operation"]
 pub struct PreparedDataMapping<'a, S: Storage + 'static> {
     /// Storage object to write the data to.
@@ -416,7 +418,7 @@ pub struct PreparedDataMapping<'a, S: Storage + 'static> {
 
     /// Driver-specific state required to commit this mapping; `None` if nothing needs to be
     /// committed.
-    state: Option<Box<dyn Any>>,
+    state: Option<Box<dyn Any + Send>>,
 }
 
 impl<'a, S: Storage + 'static> PreparedDataMapping<'a, S> {
@@ -435,7 +437,8 @@ impl<'a, S: Storage + 'static> PreparedDataMapping<'a, S> {
     /// Create a prepared mapping that must be committed, using the driver-specific `state`.
     ///
     /// For use by format drivers.  Dropping `state` must discard the prepared mapping.
-    pub fn to_commit(storage: &'a S, offset: u64, length: u64, state: Box<dyn Any>) -> Self {
+    /// The state must be [`Send`] because it may be committed or dropped on another thread.
+    pub fn to_commit(storage: &'a S, offset: u64, length: u64, state: Box<dyn Any + Send>) -> Self {
         PreparedDataMapping {
             storage,
             offset,
@@ -474,7 +477,7 @@ impl<'a, S: Storage + 'static> PreparedDataMapping<'a, S> {
     /// Take the driver-specific state, if any.
     ///
     /// For use by format drivers.
-    pub fn into_state(self) -> Option<Box<dyn Any>> {
+    pub fn into_state(self) -> Option<Box<dyn Any + Send>> {
         self.state
     }
 
@@ -510,6 +513,9 @@ pub enum ShallowMapping<'a, S: Storage + 'static> {
 
         /// Offset in `storage` where this data is stored.
         offset: u64,
+
+        /// Whether a known short storage read must return [`io::ErrorKind::UnexpectedEof`].
+        read_exact: bool,
 
         /// Whether this mapping may be written to.
         ///

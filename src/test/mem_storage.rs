@@ -1,8 +1,10 @@
 //! In-memory storage driver for tests.
 
 use crate::io_buffers::{IoVector, IoVectorMut};
+use crate::qcow2::Qcow2;
 use crate::storage::drivers::CommonStorageHelper;
 use crate::storage::{PreallocateMode, Storage};
+use crate::{DenyImplicitOpenGate, FormatCreateBuilder, FormatDriverBuilder};
 use parking_lot::Mutex;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -15,11 +17,49 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::{Context, Poll, Waker};
 
+#[maybe_async::maybe_async]
+pub(crate) async fn create_image(state: &Arc<MemStorageState>, size: u64) -> Qcow2<MemStorage> {
+    Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(state), false))
+        .cluster_size(512)
+        .size(size)
+        .create_open(DenyImplicitOpenGate::default(), |image| {
+            Ok(Qcow2::<MemStorage>::builder(image)
+                .backing(None)
+                .write(true))
+        })
+        .await
+        .unwrap()
+}
+
+/// Poll once without Tokio's cooperative yield obscuring the injected I/O stop.
+#[cfg(feature = "async")]
+pub(crate) fn poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    use std::future::Future;
+    let waker = futures::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    std::pin::pin!(tokio::task::unconstrained(future)).poll(&mut context)
+}
+
+/// Storage calls recorded by the durability tests.
+#[derive(Debug)]
+pub enum StorageEvent {
+    /// A write accepted by the storage, which may still be volatile.
+    Write(u64, Vec<u8>),
+    /// A barrier making all preceding writes durable.
+    Sync,
+}
+
 /// State shared between a [`MemStorage`] object and the test.
 #[derive(Debug, Default)]
 pub struct MemStorageState {
     /// Storage contents.
     pub data: Mutex<Vec<u8>>,
+
+    /// Optional I/O trace. Disabled by default to avoid retaining test write payloads.
+    pub events: Mutex<Option<Vec<StorageEvent>>>,
+
+    /// Writes awaiting flush, modeling a storage driver with internal buffers.
+    pub buffered_events: Mutex<Vec<StorageEvent>>,
 
     /// While set, writes on `hold_range` are not performed immediately, but entered into `held`.
     #[cfg(feature = "async")]
@@ -43,7 +83,7 @@ pub struct MemStorageState {
     #[cfg(feature = "async")]
     pub delayed_writes: Mutex<Vec<u64>>,
 
-    /// Allows delayed writes to complete.
+    /// Allows held and delayed writes to complete.
     #[cfg(feature = "async")]
     pub release_writes: AtomicBool,
 
@@ -51,9 +91,33 @@ pub struct MemStorageState {
     #[cfg(feature = "async")]
     pub held_write_wakers: Mutex<Vec<Waker>>,
 
+    /// If set, the next durability barrier fails without making writes durable.
+    pub fail_next_sync: AtomicBool,
+
+    /// Pause one sync before recording its durability barrier.
+    #[cfg(feature = "async")]
+    pub hold_next_sync: AtomicBool,
+    #[cfg(feature = "async")]
+    pub release_sync: AtomicBool,
+
+    /// Fail the next physical discard before changing storage.
+    pub fail_next_discard: AtomicBool,
+
+    /// Physical discard ranges, for ownership and recovery checks.
+    pub discarded: Mutex<Vec<(u64, u64)>>,
+
+    /// Keep physical discards pending for cancellation checks.
+    #[cfg(feature = "async")]
+    pub hold_discards: AtomicBool,
+    #[cfg(feature = "async")]
+    pub held_discards: Mutex<Vec<(u64, u64)>>,
+
     /// If set, the next write fails (and its offset is entered into `failed`), independently of
     /// `hold_range`.
     pub fail_next_write: AtomicBool,
+
+    /// If set, the next write at this offset fails, leaving other writes unaffected.
+    pub fail_write_offset: Mutex<Option<u64>>,
 
     /// Offsets of writes that have failed.
     pub failed: Mutex<Vec<u64>>,
@@ -94,6 +158,12 @@ impl MemStorageState {
             .is_none_or(|range| offset < range.end && offset + len > range.start)
     }
 
+    pub fn read_u64(&self, offset: u64) -> u64 {
+        let data = self.data.lock();
+        let offset = offset as usize;
+        u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
+    }
+
     /// Write `buf` to `offset`, growing the storage if necessary.
     pub fn write(&self, offset: u64, buf: &[u8]) {
         let start = offset as usize;
@@ -103,6 +173,16 @@ impl MemStorageState {
             data.resize(end, 0);
         }
         data[start..end].copy_from_slice(buf);
+        if self.events.lock().is_some() {
+            self.buffered_events
+                .lock()
+                .push(StorageEvent::Write(offset, buf.to_vec()));
+        }
+    }
+
+    fn discard(&self, offset: u64, length: u64) {
+        self.discarded.lock().push((offset, length));
+        self.write(offset, &vec![0; length as usize]);
     }
 
     /// Perform all held writes, even if their futures have been dropped.
@@ -205,7 +285,15 @@ impl Storage for MemStorage {
         Ok(self.state.data.lock().len() as u64)
     }
 
-    async unsafe fn pure_readv(&self, mut bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+    async unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        unsafe { self.pure_readv_counted(bufv, offset).await }.map(|_| ())
+    }
+
+    async unsafe fn pure_readv_counted(
+        &self,
+        mut bufv: IoVectorMut<'_>,
+        offset: u64,
+    ) -> io::Result<Option<u64>> {
         #[cfg(feature = "async")]
         if self.state.hold_reads.load(Ordering::Relaxed) {
             self.state.held_reads.lock().push(offset);
@@ -228,14 +316,23 @@ impl Storage for MemStorage {
             bounce[..copy_len].copy_from_slice(&data[offset..offset + copy_len]);
         }
         bufv.copy_from_slice(&bounce);
-        Ok(())
+        Ok(Some(copy_len as u64))
     }
 
     async unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
         let mut bounce = vec![0u8; bufv.len() as usize];
         bufv.copy_into_slice(&mut bounce);
 
-        if self.state.fail_next_write.swap(false, Ordering::Relaxed) {
+        let fail_offset = {
+            let mut fail_offset = self.state.fail_write_offset.lock();
+            if *fail_offset == Some(offset) {
+                fail_offset.take();
+                true
+            } else {
+                false
+            }
+        };
+        if fail_offset || self.state.fail_next_write.swap(false, Ordering::Relaxed) {
             self.state.failed.lock().push(offset);
             return Err(io::Error::other("Injected write error"));
         }
@@ -243,14 +340,7 @@ impl Storage for MemStorage {
         #[cfg(feature = "async")]
         if self.state.should_delay(offset, bounce.len() as u64) {
             self.state.delayed_writes.lock().push(offset);
-            std::future::poll_fn(|_| {
-                if self.state.release_writes.load(Ordering::Relaxed) {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
+            std::future::poll_fn(|cx| self.state.poll_write_release(cx)).await;
         }
 
         #[cfg(feature = "async")]
@@ -274,17 +364,60 @@ impl Storage for MemStorage {
         Ok(())
     }
 
+    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.state.fail_next_discard.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("injected discard failure"));
+        }
+        #[cfg(feature = "async")]
+        if self.state.hold_discards.load(Ordering::Relaxed) {
+            self.state.held_discards.lock().push((offset, length));
+            // Held discards complete through settle_writes after cancellation.
+            return std::future::pending().await;
+        }
+        self.state.discard(offset, length);
+        Ok(())
+    }
+
     async fn flush(&self) -> io::Result<()> {
+        if let Some(events) = self.state.events.lock().as_mut() {
+            events.append(&mut *self.state.buffered_events.lock());
+        }
         Ok(())
     }
 
     async fn sync(&self) -> io::Result<()> {
+        #[cfg(feature = "async")]
+        if self.state.hold_next_sync.swap(false, Ordering::Relaxed) {
+            std::future::poll_fn(|cx| {
+                let mut wakers = self.state.held_write_wakers.lock();
+                if self.state.release_sync.load(Ordering::Relaxed) {
+                    Poll::Ready(())
+                } else {
+                    wakers.push(cx.waker().clone());
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+        if self.state.fail_next_sync.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("injected sync failure"));
+        }
+        if let Some(events) = self.state.events.lock().as_mut() {
+            events.push(StorageEvent::Sync);
+        }
         Ok(())
     }
 
     async fn settle_writes(&self) -> io::Result<()> {
         #[cfg(feature = "async")]
         self.state.complete_held_writes();
+        #[cfg(feature = "async")]
+        {
+            let discards = mem::take(&mut *self.state.held_discards.lock());
+            for (offset, length) in discards {
+                self.state.discard(offset, length);
+            }
+        }
         Ok(())
     }
 

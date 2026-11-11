@@ -3,7 +3,7 @@
 use super::allocation::{ClustersToFreeEntry, PendingClusters};
 use super::compressed::CompressedClusterReadGuard;
 use super::types::*;
-use crate::io_buffers::IoBuffer;
+use crate::io_buffers::{IoBuffer, IoVectorMut};
 use crate::macros::numerical_enum;
 use crate::macros::on_disk_struct::{on_disk_struct, OnDiskStruct};
 use crate::misc_helpers::{invalid_data, DropGuard};
@@ -161,7 +161,7 @@ struct V3HeaderBase/BE, no_gaps {
     ///    bit (incompatible feature bit 1) is also set.
     ///
     /// Bits 2-63 are reserved (set to 0).
-    autoclear_features: u64[16],
+    autoclear_features: AtomicU64[16],
 
     /// Describes the width of a reference count block entry (width in bits: `refcount_bits = 1 <<
     /// refcount_order`).  For version 2 images, the order is always assumed to be 4 (i.e.
@@ -179,7 +179,7 @@ impl Default for V3HeaderBase {
         V3HeaderBase {
             incompatible_features: 0,
             compatible_features: 0,
-            autoclear_features: 0,
+            autoclear_features: 0.into(),
             refcount_order: 4,
             header_length: (V2Header::ON_DISK_SIZE + V3HeaderBase::ON_DISK_SIZE) as u32,
         }
@@ -321,30 +321,61 @@ pub(super) struct Header {
 
     /// Whether an external data file is required.
     external_data_file: bool,
+
+    /// In-memory only: metadata publication failed or a cached write-back was cancelled.
+    publication_failed: AtomicBool,
+
+    /// Serialize mutable header publications, including aligned RMW writes.
+    pub(super) publication_lock: Mutex<()>,
 }
 
 #[maybe_async]
 impl Header {
-    /// Load the qcow2 header from disk.
-    ///
-    /// If `writable` is false, do not perform any modifications (e.g. clearing auto-clear bits).
-    pub async fn load<S: Storage>(image: &S, writable: bool) -> io::Result<Self> {
+    /// Reject further operations unless the caller disarms this publication guard.
+    #[must_use]
+    pub(super) fn publication_guard(&self) -> DropGuard<impl FnOnce() + '_> {
+        DropGuard::new(|| self.publication_failed.store(true, Ordering::Release))
+    }
+
+    /// Reject this instance after an uncertain publication; reopening does not repair the disk.
+    pub fn ensure_healthy(&self) -> io::Result<()> {
+        if self.publication_failed.load(Ordering::Acquire) {
+            Err(io::Error::other(
+                "Metadata publication failed or was cancelled; close and verify the image before reopening",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Load the qcow2 header without modifying the image.
+    pub async fn load<S: Storage>(image: &S, require_self_contained: bool) -> io::Result<Self> {
         // TODO: More sanity checks.
         let mut header_buf = vec![0u8; V2Header::ON_DISK_SIZE];
-        image.read(header_buf.as_mut_slice(), 0).await?;
+        read_exact(image, "v2 header", header_buf.as_mut_slice().into(), 0).await?;
 
         let header: V2Header = decode_binary(&header_buf)?;
         if header.magic != MAGIC {
             return Err(invalid_data("Not a qcow2 file"));
+        }
+        if header.crypt_method != 0 {
+            return Err(invalid_data(format!(
+                "qcow2 encryption method {} is not supported",
+                header.crypt_method
+            )));
         }
 
         let v3header_base = if header.version == 2 {
             V3HeaderBase::default()
         } else if header.version == 3 {
             let mut header_buf = vec![0u8; V3HeaderBase::ON_DISK_SIZE];
-            image
-                .read(header_buf.as_mut_slice(), V2Header::ON_DISK_SIZE as u64)
-                .await?;
+            read_exact(
+                image,
+                "v3 header",
+                header_buf.as_mut_slice().into(),
+                V2Header::ON_DISK_SIZE as u64,
+            )
+            .await?;
             decode_binary(&header_buf)?
         } else {
             return Err(invalid_data(format!(
@@ -380,9 +411,13 @@ impl Header {
         } else {
             let mut unknown_header_fields =
                 vec![0u8; v3header_base.header_length as usize - min_header_size];
-            image
-                .read(&mut unknown_header_fields, min_header_size as u64)
-                .await?;
+            read_exact(
+                image,
+                "header fields",
+                unknown_header_fields.as_mut_slice().into(),
+                min_header_size as u64,
+            )
+            .await?;
             unknown_header_fields
         };
 
@@ -390,6 +425,18 @@ impl Header {
         l1_offset
             .checked_cluster(header.cluster_bits)
             .ok_or_else(|| invalid_data(format!("Unaligned L1 table: {l1_offset}")))?;
+
+        let l1_entries = header.l1_size.load(Ordering::Relaxed) as usize;
+        let required_l1_entries = header
+            .size
+            .load(Ordering::Relaxed)
+            .div_ceil(1u64 << (2 * header.cluster_bits - 3));
+        if l1_entries > L1Table::MAX_ENTRIES || (l1_entries as u64) < required_l1_entries {
+            return Err(invalid_data(format!(
+                "Invalid L1 table size: {l1_entries} entries, need at least {required_l1_entries} and permit at most {}",
+                L1Table::MAX_ENTRIES,
+            )));
+        }
 
         let rt_offset = HostOffset(header.refcount_table_offset.load(Ordering::Relaxed));
         rt_offset
@@ -428,7 +475,13 @@ impl Header {
             }
 
             let mut backing_buf = vec![0; length as usize];
-            image.read(&mut backing_buf, offset).await?;
+            read_exact(
+                image,
+                "backing file name",
+                (&mut backing_buf).into(),
+                offset,
+            )
+            .await?;
 
             Some(
                 String::from_utf8(backing_buf)
@@ -449,7 +502,13 @@ impl Header {
                 }
 
                 let mut ext_hdr_buf = vec![0; HeaderExtensionHeader::ON_DISK_SIZE];
-                image.read(&mut ext_hdr_buf, ext_offset).await?;
+                read_exact(
+                    image,
+                    "extension header",
+                    (&mut ext_hdr_buf).into(),
+                    ext_offset,
+                )
+                .await?;
 
                 ext_offset += HeaderExtensionHeader::ON_DISK_SIZE as u64;
 
@@ -462,7 +521,7 @@ impl Header {
                 }
 
                 let mut ext_data = vec![0; ext_hdr.length as usize];
-                image.read(&mut ext_data, ext_offset).await?;
+                read_exact(image, "extension data", (&mut ext_data).into(), ext_offset).await?;
 
                 ext_offset += (ext_hdr.length as u64).next_multiple_of(8);
 
@@ -506,26 +565,21 @@ impl Header {
         }
 
         let mut incompatible_features = v3header_base.incompatible_features;
-        let autoclear_features = v3header_base.autoclear_features;
 
         let external_data_file =
             incompatible_features & IncompatibleFeatures::ExternalDataFile as u64 != 0;
         incompatible_features &= !(IncompatibleFeatures::ExternalDataFile as u64);
 
-        let mut header = Header {
+        let header = Header {
             v2: header,
             v3: v3header_base,
             unknown_header_fields,
             backing_filename,
             extensions,
             external_data_file,
+            publication_failed: AtomicBool::new(false),
+            publication_lock: Mutex::default(),
         };
-
-        // No need to clear autoclear features for read-only images
-        if autoclear_features != 0 && writable {
-            header.v3.autoclear_features = 0;
-            header.write(image).await?;
-        }
 
         if incompatible_features != 0 {
             let feats = (0..64)
@@ -545,11 +599,41 @@ impl Header {
             )));
         }
 
+        if require_self_contained {
+            if header.backing_filename.is_some() {
+                return Err(invalid_data("qcow2 backing files are not permitted"));
+            }
+            if header.external_data_file {
+                return Err(invalid_data("qcow2 external data files are not permitted"));
+            }
+        }
+
         Ok(header)
+    }
+
+    /// Invalidate unsupported autoclear features before modifying image contents.
+    pub(super) async fn clear_autoclear_features<S: Storage>(&self, image: &S) -> io::Result<()> {
+        if self.v3.autoclear_features.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+
+        let _lock = self.publication_lock.lock().await;
+        self.ensure_healthy()?;
+        if self.v3.autoclear_features.load(Ordering::Relaxed) != 0 {
+            let mut publication = self.publication_guard();
+            image.write(&[0u8; 8][..], 88).await?;
+            // The cleared bits must be durable before later writes can invalidate the features.
+            image.flush().await?;
+            image.sync().await?;
+            self.v3.autoclear_features.store(0, Ordering::Release);
+            publication.disarm();
+        }
+        Ok(())
     }
 
     /// Write the qcow2 header to disk.
     pub async fn write<S: Storage>(&mut self, image: &S) -> io::Result<()> {
+        self.ensure_healthy()?;
         let header_len = if self.v2.version > 2 {
             let len =
                 self.v2.on_disk_size() + self.v3.on_disk_size() + self.unknown_header_fields.len();
@@ -676,7 +760,7 @@ impl Header {
             v3: V3HeaderBase {
                 incompatible_features,
                 compatible_features: 0,
-                autoclear_features: 0,
+                autoclear_features: 0.into(),
                 refcount_order,
                 header_length: 0, // will be set by `Self::write()`
             },
@@ -684,6 +768,8 @@ impl Header {
             backing_filename,
             extensions,
             external_data_file: has_external_data_file,
+            publication_failed: AtomicBool::new(false),
+            publication_lock: Mutex::default(),
         }
     }
 
@@ -719,7 +805,13 @@ impl Header {
         check_field!(v2.snapshots_offset)?; // TODO: Should be mutable
         check_field!(v3.incompatible_features)?; // TODO: Should be mutable
         check_field!(v3.compatible_features)?; // TODO: Should be mutable
-        check_field!(v3.autoclear_features)?; // TODO: Should be mutable
+        if self.v3.autoclear_features.load(Ordering::Relaxed)
+            != new_header.v3.autoclear_features.load(Ordering::Relaxed)
+        {
+            return Err(io::Error::other(
+                "Incompatible autoclear feature modification",
+            ));
+        }
         check_field!(v3.refcount_order)?;
         // header length is OK to ignore (as long as it’s valid)
 
@@ -977,28 +1069,38 @@ impl Header {
         Ok(result)
     }
 
-    /// Helper for functions that just need to change little bits in the v2 header part.
-    async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
+    /// Write the mutable v2 header fields under the caller's publication lock.
+    pub(super) async fn write_v2_header<S: Storage>(&self, image: &S) -> io::Result<()> {
+        self.ensure_healthy()?;
         let v2_header = encode_binary(&self.v2)?;
-        image.write(&v2_header, 0).await
+        image.write(&v2_header, 0).await?;
+        self.ensure_healthy()
     }
 
-    /// Write the refcount table pointer (offset and size) to disk.
+    /// Write the refcount table pointer (offset and size) under the caller's publication lock.
     pub async fn write_reftable_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
-        // TODO: Just write the reftable offset and size
         self.write_v2_header(image).await
     }
 
-    /// Write the L1 table pointer (offset and size) to disk.
+    /// Write the L1 table pointer (offset and size) under the caller's publication lock.
     pub async fn write_l1_table_pointer<S: Storage>(&self, image: &S) -> io::Result<()> {
-        // TODO: Just write the L1 table offset and size
         self.write_v2_header(image).await
     }
 
-    /// Write the guest disk size to disk.
-    pub async fn write_size<S: Storage>(&self, image: &S) -> io::Result<()> {
-        // TODO: Just write the size
-        self.write_v2_header(image).await
+    /// Publish the guest disk size, rejecting further operations if the write is uncertain.
+    pub async fn write_size<S: Storage>(&self, image: &S, new_size: u64) -> io::Result<()> {
+        self.ensure_healthy()?;
+        let _lock = self.publication_lock.lock().await;
+        self.ensure_healthy()?;
+        let old_size = self.size();
+        let mut publication = DropGuard::new(|| {
+            self.publication_failed.store(true, Ordering::Release);
+            self.set_size(old_size);
+        });
+        self.set_size(new_size);
+        self.write_v2_header(image).await?;
+        publication.disarm();
+        Ok(())
     }
 }
 
@@ -1016,8 +1118,14 @@ impl HeaderExtension {
                     HeaderExtension::BackingFileFormat(fmt)
                 }
                 HeaderExtensionType::FeatureNameTable => {
+                    if !data.len().is_multiple_of(48) {
+                        return Err(invalid_data(format!(
+                            "Invalid feature name table length: {}",
+                            data.len()
+                        )));
+                    }
                     let mut feats = HashMap::new();
-                    for feat in data.chunks(48) {
+                    for feat in data.chunks_exact(48) {
                         let feat_type: FeatureType = match feat[0].try_into() {
                             Ok(ft) => ft,
                             Err(_) => continue, // skip unrecognized entries
@@ -1480,7 +1588,7 @@ impl L2Entry {
     /// references.
     ///
     /// `external_data_file` must be true when using an external data file.
-    fn allocation(
+    pub(super) fn allocation(
         &self,
         cluster_bits: u32,
         external_data_file: bool,
@@ -1745,20 +1853,17 @@ pub(super) struct L2Table {
     /// Whether this table has been modified since it was last written.
     modified: AtomicBool,
 
-    /// Lock for creating `L2TableWriteGuard` (write) and `CompressedClusterReadGuard` (read).
-    ///
-    /// This is an owning (`Arc`-backed) lock, i.e. any access guard will have a strong reference
-    /// to it and can thus be held independently of lifetime concerns, e.g. across a data write
-    /// while a prepared mapping is not yet committed (see `Qcow2::prepare_data_mapping()`).
-    ///
-    /// Consequently, it may be held outside of qcow2 code paths, e.g. while a data write is in
-    /// flight (between preparing and committing a data mapping for it).  Thus, writing this table
-    /// to disk must work without the lock because otherwise flushing the table would deadlock
-    /// against such writes.
+    /// Serializes mapping changes against other writers and compressed readers.
+    /// Prepared mappings retain the owning guard across payload I/O, so writeback must
+    /// use its separate locks to avoid deadlocking with allocation's cache dependencies.
     writer_lock: OwnedRwLock<()>,
 
     /// Serializes writing this table back to disk (see [`L2Table::write_if_modified()`]).
     writeback_lock: Mutex<()>,
+
+    /// Binds a snapshot to the payload dependency set by mapping commits.
+    /// Held only while copying entries or modifying them, never across I/O.
+    payload_dependency: parking_lot::Mutex<bool>,
 }
 
 /// Write guard for an L2 table.
@@ -1788,6 +1893,7 @@ impl L2Table {
             modified: true.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            payload_dependency: Default::default(),
         }
     }
 
@@ -1826,28 +1932,50 @@ impl L2Table {
     /// Write this table to disk if it has been modified since it was last written.
     ///
     /// This is the entry point for writing back a table that is part of the L2 cache; it
-    /// serializes such write-backs against each other via `writeback_lock`.  Writing the table
-    /// clears the modified flag before copying the entries, so without that lock, two concurrent
-    /// write-backs could race such that the one with the older copy writes last, leaving that
-    /// older copy on disk while the table no longer appears modified.  Holding the lock across the
-    /// modified check means that a write-back which has to wait only writes again if something
-    /// changed after the preceding write-back’s copy.
+    /// serializes write-backs via `writeback_lock` so an older snapshot cannot write last.
+    /// Snapshot entries, dirty state and payload dependency are taken under a short lock.
+    /// Later commits remain dirty for another writeback; failed writebacks restore the dependency.
     ///
     /// `cluster` is the cluster this table is expected to belong to; an `assert!()` verifies that
     /// it really is the table’s cluster.
     pub async fn write_if_modified<S: Storage>(
         &self,
         image: &S,
+        data_file: &S,
+        header: &Header,
         cluster: HostCluster,
     ) -> io::Result<()> {
+        header.ensure_healthy()?;
         let _lock = self.writeback_lock.lock().await;
-
-        if !self.is_modified() {
-            return Ok(());
-        }
+        header.ensure_healthy()?;
 
         assert!(self.get_cluster().unwrap() == cluster);
-        self.write(image).await
+        let (buffer, offset, depends_on_payload) = {
+            let mut dependency = self.payload_dependency.lock();
+            if !self.is_modified() {
+                return Ok(());
+            }
+            let (buffer, offset) = self.snapshot(image)?;
+            self.clear_modified();
+            (buffer, offset, std::mem::take(&mut *dependency))
+        };
+        let mut modified = DropGuard::new(|| {
+            let mut dependency = self.payload_dependency.lock();
+            *dependency |= depends_on_payload;
+            self.set_modified();
+        });
+        if depends_on_payload {
+            data_file.flush().await?;
+            data_file.sync().await?;
+        }
+        header.ensure_healthy()?;
+        let mut cancelled = header.publication_guard();
+        let result = image.write(&buffer, offset.0).await;
+        cancelled.disarm();
+        result?;
+        header.ensure_healthy()?;
+        modified.disarm();
+        Ok(())
     }
 }
 
@@ -1898,6 +2026,8 @@ impl L2TableWriteGuard {
             },
             self.table.cluster_bits,
         );
+        let mut dependency = self.table.payload_dependency.lock();
+        *dependency = true;
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
         // `L2TableWriteGuard`).
         let l2e = unsafe { self.table.data[index].swap(new) };
@@ -1906,16 +2036,9 @@ impl L2TableWriteGuard {
             new_allocation.make_persistent();
         }
 
-        let allocation = l2e.allocation(self.table.cluster_bits, self.table.external_data_file);
-        if let Some((a_cluster, a_count)) = allocation {
-            if a_cluster == host_cluster && a_count == ClusterCount(1) {
-                None
-            } else {
-                Some(ClustersToFreeEntry::data(a_cluster, a_count))
-            }
-        } else {
-            None
-        }
+        l2e.allocation(self.table.cluster_bits, self.table.external_data_file)
+            .filter(|&(cluster, count)| cluster != host_cluster || count != ClusterCount(1))
+            .map(|(first_cluster, count)| ClustersToFreeEntry::data(first_cluster, count))
     }
 
     /// Make the given index a zero mapping.
@@ -1941,26 +2064,17 @@ impl L2TableWriteGuard {
                 L2Mapping::DataFile {
                     host_cluster,
                     copied,
-                } => Some((host_cluster, copied)),
-                L2Mapping::Backing { backing_offset: _ } => None,
-                L2Mapping::Zero {
+                }
+                | L2Mapping::Zero {
                     host_cluster: Some(host_cluster),
                     copied,
                 } => Some((host_cluster, copied)),
-                L2Mapping::Zero {
-                    host_cluster: None,
-                    copied: _,
-                } => None,
-                L2Mapping::Compressed {
-                    host_offset: _,
-                    length: _,
-                } => None,
+                _ => None,
             }
         } else {
             None
         };
 
-        let retained = cluster_copied.is_some();
         let new = if let Some((cluster, copied)) = cluster_copied {
             L2Mapping::Zero {
                 host_cluster: Some(cluster),
@@ -1974,12 +2088,13 @@ impl L2TableWriteGuard {
         };
         let new = L2Entry::from_mapping(new, self.table.cluster_bits);
 
+        let _snapshot = self.table.payload_dependency.lock();
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
         // `L2TableWriteGuard`).
         let old = unsafe { self.table.data[index].swap(new) };
         self.table.modified.store(true, Ordering::Relaxed);
 
-        let leaked = if !retained {
+        let leaked = if cluster_copied.is_none() {
             old.allocation(self.table.cluster_bits, self.table.external_data_file)
                 .map(|(first_cluster, count)| ClustersToFreeEntry::data(first_cluster, count))
         } else {
@@ -1996,6 +2111,7 @@ impl L2TableWriteGuard {
     pub fn discard_cluster(&mut self, index: usize) -> Option<ClustersToFreeEntry> {
         let new = L2Entry(0);
 
+        let _snapshot = self.table.payload_dependency.lock();
         // Safe: We set a full valid mapping, and there is only one writer (thanks to
         // `L2TableWriteGuard`).
         let old = unsafe { self.table.data[index].swap(new) };
@@ -2023,6 +2139,7 @@ impl Table for L2Table {
             modified: true.into(),
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            payload_dependency: Default::default(),
         }
     }
 
@@ -2077,6 +2194,7 @@ impl Table for L2Table {
 
 impl Clone for L2Table {
     fn clone(&self) -> Self {
+        let dependency = self.payload_dependency.lock();
         let mut data = Vec::with_capacity(self.data.len());
         for entry in &self.data {
             // None of these can be `copied`
@@ -2094,6 +2212,7 @@ impl Clone for L2Table {
             modified,
             writer_lock: Default::default(),
             writeback_lock: Default::default(),
+            payload_dependency: parking_lot::Mutex::new(*dependency),
         }
     }
 }
@@ -2394,7 +2513,7 @@ impl RefBlock {
 
         let mut raw_data =
             IoBuffer::new(cluster_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
-        image.read(&mut raw_data, offset.0).await?;
+        read_exact(image, "refcount block", (&mut raw_data).into(), offset.0).await?;
 
         Ok(RefBlock {
             cluster: Some(cluster),
@@ -2594,16 +2713,23 @@ impl RefBlock {
     pub async fn write_if_modified<S: Storage>(
         &self,
         image: &S,
+        header: &Header,
         cluster: HostCluster,
     ) -> io::Result<()> {
+        header.ensure_healthy()?;
         let _lock = self.writeback_lock.lock().await;
+        header.ensure_healthy()?;
 
         if !self.is_modified() {
             return Ok(());
         }
 
         assert!(self.get_cluster().unwrap() == cluster);
-        self.write(image).await
+        let mut cancelled = header.publication_guard();
+        let result = self.write(image).await;
+        cancelled.disarm();
+        result?;
+        header.ensure_healthy()
     }
 
     /// Check whether this block has been modified since it was last written.
@@ -2921,7 +3047,7 @@ pub trait Table: Sized {
         let byte_size = entries * size_of::<u64>();
         let mut buffer = IoBuffer::new(byte_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
-        image.read(&mut buffer, offset.0).await?;
+        read_exact(image, Self::NAME, (&mut buffer).into(), offset.0).await?;
 
         // Safe because `u64` is a plain type, and the alignment fits
         let raw_table = unsafe { buffer.as_ref().into_typed_slice::<u64>() };
@@ -2944,6 +3070,17 @@ pub trait Table: Sized {
     ///
     /// Callers must ensure the table is copied, i.e. its refcount is 1.
     async fn write<S: Storage>(&self, image: &S) -> io::Result<()> {
+        self.clear_modified();
+        // Re-set the modified flag if we don’t get to execute the write
+        let mut modified_guard = DropGuard::new(|| self.set_modified());
+        let (buffer, offset) = self.snapshot(image)?;
+        image.write(&buffer, offset.0).await?;
+        modified_guard.disarm();
+        Ok(())
+    }
+
+    /// Copy the table into an aligned write buffer without issuing I/O.
+    fn snapshot<S: Storage>(&self, image: &S) -> io::Result<(IoBuffer, HostOffset)> {
         let offset = self
             .get_offset()
             .ok_or_else(|| io::Error::other("Cannot write qcow2 metadata table, no offset set"))?;
@@ -2960,10 +3097,6 @@ pub trait Table: Sized {
         let byte_size = self.byte_size();
         let mut buffer = IoBuffer::new(byte_size, cmp::max(image.mem_align(), size_of::<u64>()))?;
 
-        self.clear_modified();
-        // Re-set the modified flag if we don’t get to execute the write
-        let mut modified_guard = DropGuard::new(|| self.set_modified());
-
         // Safe because we have just allocated this, and it fits the alignment
         let raw_table = unsafe { buffer.as_mut().into_typed_slice::<u64>() };
         for (i, be_value) in raw_table.iter_mut().enumerate() {
@@ -2971,11 +3104,7 @@ pub trait Table: Sized {
             *be_value = self.get_ref(i).map(|e| e.to_plain()).unwrap_or(0).to_be();
         }
 
-        image.write(&buffer, offset.0).await?;
-        // Write executed, disarm guard, flag can remaing cleared
-        modified_guard.disarm();
-
-        Ok(())
+        Ok((buffer, offset))
     }
 
     /// Write at least the given single (modified) entry to the image file.
@@ -3035,6 +3164,35 @@ pub trait Table: Sized {
     }
 }
 
+/// Read metadata without accepting known short reads.
+#[maybe_async]
+async fn read_exact<S: Storage>(
+    image: &S,
+    name: &str,
+    bufv: IoVectorMut<'_>,
+    offset: u64,
+) -> io::Result<()> {
+    let requested = bufv.len();
+    if requested != 0 {
+        let size = image.size()?;
+        if offset.checked_add(requested).is_none_or(|end| end > size) {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Qcow2 {name} range {offset:#x} + {requested:#x} exceeds storage size {size:#x}"),
+            ));
+        }
+    }
+    if let Some(actual) = image.readv_counted(bufv, offset).await? {
+        if actual < requested {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Short qcow2 {name} read at {offset:#x}: {actual} < {requested}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check whether the given table offset/size is valid.
 ///
 /// Also works for refcount blocks (with cheating, because their entry size can be less than a
@@ -3087,9 +3245,187 @@ fn decode_binary<T: OnDiskStruct>(slice: &[u8]) -> io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "async")]
+    use crate::test::mem_storage::create_image;
     use crate::test::mem_storage::{MemStorage, MemStorageState};
     use parking_lot::Mutex;
     use std::sync::Arc;
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn l2_writeback_binds_payload_dependency_to_snapshot() -> io::Result<()> {
+        use crate::test::mem_storage::StorageEvent;
+        use crate::FormatAccess;
+        use std::task::Poll;
+
+        for cancel in [false, true] {
+            let state = Arc::new(MemStorageState::default());
+            let qcow2 = create_image(&state, 32768).await;
+            let l2 = qcow2.ensure_l2(GuestOffset(0)).await?;
+            let l2_offset = l2.get_offset().unwrap().0;
+            let caches = Arc::clone(&qcow2.caches);
+            let image = FormatAccess::new(qcow2);
+            image.flush().await?;
+            image.sync().await?;
+            image.write(&[0x11; 512][..], 0).await?;
+            // Prepare the next mapping before flush holds the cache direction lock.
+            state.hold_writes.store(true, Ordering::Relaxed);
+            let mut write = Box::pin(image.write(&[0x33; 512][..], 512));
+            assert!(crate::test::mem_storage::poll_once(write.as_mut()).is_pending());
+            assert_eq!(state.held.lock().len(), 1);
+            state.hold_writes.store(false, Ordering::Relaxed);
+            caches.rb_depends_on_l2().await?;
+
+            state.hold_next_sync.store(true, Ordering::Relaxed);
+            let mut flush = Box::pin(image.flush());
+            assert!(crate::test::mem_storage::poll_once(flush.as_mut()).is_pending());
+            assert!(
+                !l2.is_modified(),
+                "writeback must snapshot before its payload barrier"
+            );
+            state.release_held_writes();
+            let Poll::Ready(result) = crate::test::mem_storage::poll_once(write.as_mut()) else {
+                panic!("commit waited for writeback's payload barrier");
+            };
+            result.unwrap();
+            drop(write);
+            assert!(l2.is_modified());
+            state.release_sync.store(true, Ordering::Relaxed);
+            flush.await?;
+            assert_eq!(
+                &state.data.lock()[l2_offset as usize + 8..l2_offset as usize + 16],
+                &[0; 8],
+                "snapshot included a later commit"
+            );
+            assert!(l2.is_modified(), "later commit lost its dirty state");
+
+            *state.events.lock() = Some(Vec::new());
+            if cancel {
+                state.release_sync.store(false, Ordering::Relaxed);
+                state.hold_next_sync.store(true, Ordering::Relaxed);
+                let mut flush = Box::pin(image.flush());
+                assert!(crate::test::mem_storage::poll_once(flush.as_mut()).is_pending());
+                assert!(!l2.is_modified());
+                drop(flush);
+                state.release_sync.store(true, Ordering::Relaxed);
+            } else {
+                state.fail_next_sync.store(true, Ordering::Relaxed);
+                assert!(image.flush().await.is_err());
+            }
+            assert!(l2.is_modified());
+            assert_eq!(
+                &state.data.lock()[l2_offset as usize + 8..l2_offset as usize + 16],
+                &[0; 8],
+                "failed payload barrier published its mapping"
+            );
+            *state.events.lock() = Some(Vec::new());
+            image.flush().await?;
+            let events = state.events.lock().take().unwrap();
+            let barrier = events
+                .iter()
+                .position(|event| matches!(event, StorageEvent::Sync))
+                .unwrap();
+            let publication = events
+                .iter()
+                .position(|event| {
+                    matches!(event,
+                StorageEvent::Write(offset, _) if *offset == l2_offset)
+                })
+                .unwrap();
+            assert!(barrier < publication, "retry lost the payload dependency");
+            assert!(!l2.is_modified());
+            image.sync().await?;
+        }
+        Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn autoclear_publication_failure_rejects_retry() -> io::Result<()> {
+        for align in [1, 4096] {
+            for delayed in [false, true] {
+                if delayed && !cfg!(feature = "async") {
+                    continue;
+                }
+                let state = Arc::new(MemStorageState::default());
+                let image = MemStorage::new(Arc::clone(&state), false).with_align(align);
+                let mut header = Header::new(9, 4, None, None, None);
+                header
+                    .v3
+                    .autoclear_features
+                    .store(1 << 63, Ordering::Relaxed);
+                header.write(&image).await?;
+                let write_offset = 88 & !(align as u64 - 1);
+
+                if delayed {
+                    #[cfg(feature = "async")]
+                    {
+                        state.hold_writes.store(true, Ordering::Relaxed);
+                        *state.hold_range.lock() = Some(88..96);
+                        let mut clear = Box::pin(header.clear_autoclear_features(&image));
+                        assert!(crate::test::mem_storage::poll_once(clear.as_mut()).is_pending());
+                        drop(clear);
+                        state.hold_writes.store(false, Ordering::Relaxed);
+                    }
+                } else {
+                    *state.fail_write_offset.lock() = Some(write_offset);
+                    header.clear_autoclear_features(&image).await.unwrap_err();
+                }
+                header.clear_autoclear_features(&image).await.unwrap_err();
+                header.write_size(&image, 512).await.unwrap_err();
+                #[cfg(feature = "async")]
+                state.complete_held_writes();
+                header.ensure_healthy().unwrap_err();
+                let reopened = Header::load(&image, false).await?;
+                assert_eq!(reopened.size(), 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn header_validation_preserves_image() -> io::Result<()> {
+        let error =
+            HeaderExtension::deserialize(HeaderExtensionType::FeatureNameTable as u32, vec![0; 47])
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        for (backing, external, encryption, incompatible) in [
+            (Some("base.raw"), None, 0, 0),
+            (None, Some("data.raw"), 0, 0),
+            (None, None, 1, 0),
+            (None, None, 0, 1),
+            (None, None, 0, 1 << 63),
+        ] {
+            let require_self_contained = backing.is_some() || external.is_some();
+            let state = Arc::new(MemStorageState::default());
+            let image = MemStorage::new(Arc::clone(&state), false);
+            let mut header = Header::new(
+                16,
+                4,
+                backing.map(str::to_owned),
+                None,
+                external.map(str::to_owned),
+            );
+            header.v2.crypt_method = encryption;
+            header.v3.incompatible_features |= incompatible;
+            header
+                .v3
+                .autoclear_features
+                .store(1 << 63, Ordering::Relaxed);
+            header.write(&image).await?;
+            let original = state.data.lock().clone();
+            if require_self_contained {
+                Header::load(&image, false).await?;
+            }
+            let error = Header::load(&image, require_self_contained)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(*state.data.lock(), original);
+        }
+        Ok(())
+    }
 
     /// Regression test: If the metadata file has alignment requirements larger than the cluster
     /// size, then `write_entry()` must not try to up-align the request to that, because having the

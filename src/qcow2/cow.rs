@@ -80,30 +80,20 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             }));
         };
 
-        self.need_writable()?;
+        self.prepare_write().await?;
 
         // New cluster index, and, if newly allocated, a `PendingClusters` guard
-        let new_cluster: Option<(HostCluster, Option<PendingClusters>)> = if let L2Mapping::Zero {
-            host_cluster: Some(host_cluster),
-            copied: true,
-        } = existing_mapping
-        {
-            if let Some(mandatory_host_cluster) = mandatory_host_cluster {
-                if host_cluster == mandatory_host_cluster {
-                    Some((host_cluster, None))
-                } else {
-                    // Discard existing mapping
-                    self.allocate_data_cluster_at(cluster, Some(mandatory_host_cluster))
-                        .await?
-                        .map(|allocation| (allocation.cluster(), Some(allocation)))
-                }
-            } else {
+        let new_cluster = match existing_mapping {
+            L2Mapping::Zero {
+                host_cluster: Some(host_cluster),
+                copied: true,
+            } if mandatory_host_cluster.is_none_or(|required| required == host_cluster) => {
                 Some((host_cluster, None))
             }
-        } else {
-            self.allocate_data_cluster_at(cluster, mandatory_host_cluster)
+            _ => self
+                .allocate_data_cluster_at(cluster, mandatory_host_cluster)
                 .await?
-                .map(|allocation| (allocation.cluster(), Some(allocation)))
+                .map(|allocation| (allocation.cluster(), Some(allocation))),
         };
 
         let Some((new_cluster, new_allocation)) = new_cluster else {
@@ -221,8 +211,18 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let from_offset = from_cluster.offset(cb);
         let to_offset = to_cluster.offset(cb);
 
-        from.read(&mut buf, from_offset.0 + cow_range.start as u64)
-            .await?;
+        let requested = buf.len() as u64;
+        if let Some(actual) = from
+            .readv_counted((&mut buf).into(), from_offset.0 + cow_range.start as u64)
+            .await?
+        {
+            if actual < requested {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("Short qcow2 COW read: {actual} < {requested}"),
+                ));
+            }
+        }
 
         to.write(&buf, to_offset.0 + cow_range.start as u64).await?;
 
